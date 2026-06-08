@@ -21,7 +21,10 @@ fn main() {
                 tar_gz_sha256 = tar_gz_hash;
             }
             Err(err) => {
-                panic!("compute resource archive sha256 failed: {}", err);
+                eprintln!(
+                    "cargo:warning=compute resource archive sha256 failed: {}",
+                    err
+                );
             }
         }
     }

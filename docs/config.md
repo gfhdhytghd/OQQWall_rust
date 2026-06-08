@@ -1,239 +1,171 @@
-# config.md — OQQWall_RUST 配置规则与加载/传递设计（JSON 优先）
+# config.md - OQQWall_RUST 配置说明
 
-> 本文面向：开发、运维、测试。  
-> 目标：**配置不硬编码**、以 **JSON 文件**为权威来源；同时兼容原版 OQQWall 的配置语义与字段（原版拆成 `oqqwall.config` + `AcountGroupcfg.json`，并在多处脚本/服务端读取）。  
->
-> 配置示例可直接使用文末的 JSON 模板（common + 单组），或从现有部署的 `oqqwall.config` / `AcountGroupcfg.json` 导入。
+本文只记录当前 `OQQWall_RUST` 实际读取并会影响运行行为的配置项。未列出的字段不需要手写；程序或 TUI 可能会在保存时归一化配置文件。
 
----
+## 配置文件
 
-## 1. 原版 OQQWall 的配置来源与语义（作为兼容依据）
+- 默认路径：`./config.json`
+- 覆盖路径：`OQQWALL_CONFIG=/path/to/config.json`
+- 生成配置：`cargo run -p OQQWall_RUST -- oobe`
+- 编辑配置：`cargo run -p OQQWall_RUST -- --tui`
 
-原版主要有两类配置源：
+主程序启动时读取配置文件。配置文件不存在时，交互终端会自动进入 OOBE；非交互环境会退出并提示手动生成配置。
 
-1) **全局配置（KV 文件）**：`oqqwall.config`  
-- `serv.py` 读取 `oqqwall.config`（key=value + #注释），并要求必须有 `napcat_access_token`，原版允许 env 兜底；Rust 版改为每组配置 `napcat_access_token`，并支持 `OQQWALL_NAPCAT_TOKEN` 全局覆盖  
-- `sendcontrol.sh` 也固定把全局配置文件名写为 `oqqwall.config`，并从中读取 `max_attempts_qzone_autologin`、`at_unprived_sender`，且给出默认值与校验逻辑
-
-2) **账号组配置（JSON 文件）**：`AcountGroupcfg.json`  
-- `serv.py` 会加载 `AcountGroupcfg.json`，建立 self_id→组名映射，并提取 `mangroupid` 作为受管群集合  
-- `sendcontrol.sh` 会从 `AcountGroupcfg.json` 里按 receiver 找到组配置，并对 `max_post_stack`、`max_image_number_one_post` 做默认值/数字校验  
-- `sendcontrol.sh` 的定时调度器会读取每个组的 `send_schedule`（HH:MM 列表），在对应分钟触发 `flush_staged_posts`，并保证“当日每个时间点只触发一次 + 同一分钟互斥锁”  
-- `preprocess.sh` 会读取全局 `process_waittime` 与 `force_chromium_no-sandbox`，并从组配置取 `individual_image_in_posts`，且缺省为 true  
-
-> Rust 版：我们不复刻原版的“散落在脚本里 grep/jq”读取方式，而是统一用一个 JSON 作为权威配置；但字段语义、默认值与校验尽量对齐上面这些行为。
-
----
-
-## 2. OQQWall_RUST 推荐的统一 JSON 配置文件
-
-### 2.1 文件名与位置
-- 默认：`./config.json`
-- 环境变量可覆盖：`OQQWALL_CONFIG=...`
-  - 主程序启动时读取该路径（当前版本不解析 `--config` 参数）
-  - 若该路径下配置文件不存在，且当前为交互终端，主程序会自动进入 OOBE 引导生成配置
-  - 若该路径下配置文件不存在，且当前无交互终端（如 systemd/容器），主程序会报错退出并提示手动执行 OOBE
-  - OOBE/TUI 支持 `--config <path>` 写入/编辑指定配置
-
-### 2.2 顶层结构（推荐规范）
-推荐显式 `schema_version` 与 `groups`：
+推荐结构：
 
 ```json
 {
-  "schema_version": 1,
-  "common": { },
+  "common": {},
   "groups": {
-    "MethGroup": { }
-  }
+    "default": {}
+  },
+  "webview_global_admins": []
 }
 ```
 
-### 2.3 顶层结构（兼容简写）
+## 环境变量覆盖
 
-为了兼容你当前提供的样例（`common` + 组名直接作为顶层键），允许：
+| 环境变量 | 覆盖目标 | 说明 |
+| --- | --- | --- |
+| `OQQWALL_CONFIG` | 配置文件路径 | 默认 `config.json` |
+| `OQQWALL_NAPCAT_BASE_URL` | NapCat base url | 覆盖所有组的 `napcat_base_url` |
+| `OQQWALL_NAPCAT_TOKEN` | NapCat access token | 覆盖所有组的 `napcat_access_token` |
+| `OQQWALL_API_TOKEN` | `common.web_api.root_token` | 覆盖 Web API root token |
+| `OQQWALL_PROCESS_WAITTIME_MS` | 全局默认投稿聚合窗口 | 单位是毫秒，优先于 `common.process_waittime_sec`；组内 `process_waittime_sec` 仍可覆盖 |
+| `OQQWALL_MAX_CACHE_MB` | `common.max_cache_mb` | 图片/blob 内存缓存上限 |
+| `OQQWALL_DATA_DIR` | 运行数据目录 | 默认 `data`，影响日志、遥测、本地 blob 等 |
 
-```json
-{
-  "common": { },
-  "MethGroup": { },
-  "AnotherGroup": { }
-}
+## common
+
+`common` 是全局默认值。组内同名发送参数会覆盖全局默认值。
+
+| Key | 类型 | 默认值 | 作用 |
+| --- | --- | --- | --- |
+| `process_waittime_sec` | number/string | `20` | 投稿聚合等待时间，单位秒 |
+| `min_interval_ms` | number/string | `0` | 同组发送的最小间隔，单位毫秒 |
+| `max_image_number_one_post` | number/string | `30` | 单条说说最大图片数，组内可覆盖 |
+| `send_timeout_ms` | number/string | `300000` | 单次发送超时，单位毫秒 |
+| `send_max_attempts` | number/string | `3` | 发送失败最大尝试次数 |
+| `tz_offset_minutes` | number/string | `0` | 时区偏移分钟数，中国大陆通常为 `480` |
+| `max_cache_mb` | number/string | `256` | 图片/blob 内存缓存上限 |
+| `napcat_base_url` | string | 无 | 所有组默认 NapCat 反向 WS base url |
+| `napcat_access_token` | string | 无 | 所有组默认 NapCat access token |
+| `at_unprived_sender` | bool/string/number | `false` | 发件时是否 @ 非匿名且空间不可访问的投稿人 |
+| `friend_request_window_sec` | number/string | `300` | 好友申请去重/限频窗口，组内可覆盖 |
+| `friend_add_message` | string | 无 | 通过好友申请后自动发送的默认文本，组内可覆盖 |
+
+### Web API
+
+`common.web_api` 控制 `/v1/*` HTTP API。开启时必须提供长度至少 32 的 root token，否则 API 不会启动。
+
+| Key | 类型 | 默认值 | 作用 |
+| --- | --- | --- | --- |
+| `web_api.enabled` | bool/string/number | `false` | 是否启用 `/v1/*` API |
+| `web_api.port` | number/string | `10923` | API 监听端口，监听地址为 `0.0.0.0` |
+| `web_api.root_token` | string | 无 | root token，建议用 `OQQWALL_API_TOKEN` 注入 |
+
+### WebView
+
+`common.webview` 控制内置审核前端。开启时必须配置至少一个 `webview_global_admins` 或组内 `webview_admins`，否则 WebView 不会启动。
+
+| Key | 类型 | 默认值 | 作用 |
+| --- | --- | --- | --- |
+| `webview.enabled` | bool/string/number | `false` | 是否启用内置 WebView 审核前端 |
+| `webview.host` | string | `0.0.0.0` | WebView 绑定地址，例如 `127.0.0.1` 或 `0.0.0.0` |
+| `webview.port` | number/string | `10924` | WebView 监听端口 |
+| `webview.session_ttl_sec` | number/string | `43200` | 登录会话有效期，范围会钳制到 300 秒至 7 天 |
+
+### Telemetry
+
+`common.telemetry` 控制投稿遥测与训练样本本地缓存/上传。上传 endpoint 和 token 为程序内置固定值，不通过配置文件暴露。
+
+| Key | 类型 | 默认值 | 作用 |
+| --- | --- | --- | --- |
+| `telemetry.enabled` | bool/string/number | `true` | 是否在审核完成后生成训练样本 |
+| `telemetry.local_dir` | string | `telemetry` | 本地遥测目录，相对 `OQQWALL_DATA_DIR` 解析 |
+| `telemetry.upload_enabled` | bool/string/number | `true` | 是否启用批量上传 |
+| `telemetry.upload_interval_sec` | number/string | `30` | 上传轮询间隔，范围会钳制到 1..86400 秒 |
+| `telemetry.max_append_messages` | number/string | `2` | `append_offtopic` 负样本最多追加消息数，范围会钳制到 1..10 |
+
+## groups
+
+`groups` 是账号组配置。每个 key 是逻辑组名；每个组必须能解析出审核群、账号列表和 NapCat base url。
+
+| Key | 类型 | 默认值 | 作用 |
+| --- | --- | --- | --- |
+| `mangroupid` | string/number | 必填 | 审核群 ID |
+| `accounts` | array/string | 必填 | QQ 账号列表，首项为主账号；运行时要求非空且均为数字 |
+| `napcat_base_url` | string | 继承 `common` | 本组 NapCat 反向 WS base url |
+| `napcat_access_token` | string | 继承 `common` | 本组 NapCat access token |
+| `process_waittime_sec` | number/string | 继承 `common` | 本组投稿聚合等待时间，单位秒 |
+| `min_interval_ms` | number/string | 继承 `common` | 本组发送最小间隔，单位毫秒 |
+| `max_post_stack` | number/string | `1` | 暂存区上限；`1` 表示通过后直接进入发送流程 |
+| `max_image_number_one_post` | number/string | 继承 `common` | 本组单条说说最大图片数 |
+| `send_timeout_ms` | number/string | 继承 `common` | 本组发送超时，单位毫秒 |
+| `send_max_attempts` | number/string | 继承 `common` | 本组发送失败最大尝试次数 |
+| `send_schedule` | array[string] | `[]` | 每日定时 flush，格式 `HH:MM` |
+| `individual_image_in_posts` | bool/string/number | `true` | 发送时是否附带原图 |
+| `watermark_text` | string | 无 | 渲染图水印文本，空值不绘制 |
+| `friend_request_window_sec` | number/string | 继承 `common` | 本组好友申请去重/限频窗口 |
+| `friend_add_message` | string | 继承 `common` | 本组通过好友申请后自动发送的文本 |
+| `quick_replies` | object | `{}` | 快捷回复，格式为 `{ "指令": "回复文本" }` |
+| `review_shortcuts` | object | `{}` | 审核快捷指令，格式为 `{ "指令": "步骤 DSL" }` |
+| `global_shortcuts` | object | `{}` | 全局快捷指令，格式为 `{ "指令": "步骤 DSL" }` |
+| `webview_admins` | array | `[]` | 本组 WebView 管理员账号 |
+
+NapCat 反向 WS 的完整 URL 是：
+
+```text
+ws://<napcat_base_url>/<QQ号>
 ```
 
-规则：如果存在 `groups` 字段，则只读 `groups`；否则把除 `common`、`schema_version` 外的顶层对象都视为 group。
+例如 `napcat_base_url = "127.0.0.1:3001/oqqwall/ws"` 且账号为 `3995477265`，则 NapCat 中填写：
 
----
+```text
+ws://127.0.0.1:3001/oqqwall/ws/3995477265
+```
 
-## 3. common（全局配置）字段说明
+`send_schedule` 命中本地时间分钟时会触发本组暂存内容 flush；同一日期同一时间点只触发一次。
 
-> 原版 TUI 给出全局配置键的提示集合（TOOLTIPS）以及固定顺序（ORDER）
-> Rust 版可以“按这个集合为主”，并允许未来扩展字段（未知字段保留在 `extra`）。
+## WebView 管理员
 
-### 3.1 字段表
+全局管理员写在顶层 `webview_global_admins`，可访问所有组。组管理员写在 `groups.<id>.webview_admins`，只访问对应组。
 
-| JSON Key (snake_case)        |     类型 |                默认 | 当前支持状态             | 原版语义/参考                                               |
-| ---------------------------- | -----: | ----------------: | ------------------ | ----------------------------------------------------- |
-| manage_napcat_internal       |   bool |             false | 不再支持               | 是否由系统内部管理 NapCat/QQ（原版有同名配置提示）                        |
-| renewcookies_use_napcat      |   bool |              true | 未支持               | 续 cookies 逻辑使用 NapCat 版本/非 NapCat 版本（原版提示）            |
-| max_attempts_qzone_autologin |    u32 |                 3 | 未支持               | sendcontrol 默认 3 次并校验数字                               |
-| friend_request_window_sec    |    u32 |               300 | 已支持               | 好友请求/私聊抑制窗口（原版 TUI 提示）                                |
-| web_api.enabled              |   bool |             false | 已支持               | 是否启用对外 HTTP 审核 API（替代旧 `use_web_review`）                            |
-| web_api.port                 |    u16 |             10923 | 已支持               | HTTP API 监听端口（默认 `0.0.0.0:10923`，替代旧 `web_review_port`）              |
-| web_api.root_token           | string |                "" | 已支持               | API root token（建议 32+ 位；可被环境变量覆盖，替代旧 `api_token`）               |
-| webview.enabled              |   bool |             false | 已支持               | 是否启用内置 WebView 审核前端（账号密码登录）                                     |
-| webview.host                 | string |         `0.0.0.0` | 已支持               | WebView 监听主机（可设为 `127.0.0.1` 仅本机访问）                                |
-| webview.port                 |    u16 |             10924 | 已支持               | WebView 服务监听端口（默认 `0.0.0.0:10924`）                                      |
-| webview.session_ttl_sec      |    i64 |             43200 | 已支持               | WebView 会话有效期（秒，默认 12h）                                                |
-| telemetry.enabled            |   bool |              true | 已支持               | 是否启用投稿遥测（监听审核结果并生成训练样本）                                    |
-| telemetry.local_dir          | string |       `telemetry` | 已支持               | 本地遥测目录（相对 `OQQWALL_DATA_DIR`，默认 `data/telemetry`）                    |
-| telemetry.upload_enabled     |   bool |              true | 已支持               | 是否启用 HTTP 批量上传                                                            |
-| telemetry.upload_interval_sec|    u64 |                30 | 已支持               | 上传轮询间隔（秒，范围 1..86400）                                                  |
-| telemetry.upload_batch_size  |  usize |                20 | 已支持（固定 20）     | 每批上传样本数，当前实现钳制为 20                                                 |
-| telemetry.max_append_messages|  usize |                 2 | 已支持               | `append_offtopic` 负样本最多拼接消息数（范围 1..10）                             |
-| napcat_base_url              | string |                "" | 已支持               | 作为默认 NapCat 反向 WS base url（推荐，优先级最高）                        |
-| napcat_access_token          | string |                "" | 已支持               | 作为默认 NapCat token（可被 `OQQWALL_NAPCAT_TOKEN` 覆盖）             |
-| tz_offset_minutes            |    i32 |                 0 | 已支持               | 时区偏移（分钟，用于 schedule/defer 计算）                           |
-| min_interval_ms              |    u32 |                 0 | 已支持               | 发送最小间隔（毫秒）                                             |
-| max_image_number_one_post    |    u32 |                30 | 已支持               | 单条最大图片数；超限会拆分发送，并触发暂存区 flush                       |
-| send_timeout_ms              |    u32 |            300000 | 已支持               | 发送超时（毫秒）                                               |
-| send_max_attempts            |    u32 |                 3 | 已支持               | 发送失败最大重试次数                                             |
-| max_cache_mb                 |    u32 |               256 | 已支持               | 内存图片缓存上限（MB），超限时优先淘汰大文件缓存                          |
-| process_waittime_sec         |    u32 |                20 | 已支持               | 原版 `preprocess.sh` 读取该值（秒）                           |
+管理员条目：
 
-### 3.2 环境变量覆盖优先级（推荐）
+| Key | 类型 | 说明 |
+| --- | --- | --- |
+| `username` | string | 登录用户名 |
+| `password` | string | 登录密码；推荐写 `sha256:<hex64>` |
 
-* `OQQWALL_NAPCAT_TOKEN` > `groups.<id>.napcat_access_token`（全局覆盖所有组）
-* `OQQWALL_NAPCAT_BASE_URL` > `groups.<id>.napcat_base_url`（全局覆盖所有组）
-* `OQQWALL_API_TOKEN` > `common.web_api.root_token`（覆盖 HTTP API root token）
+如果配置里写入明文密码，程序加载时会改写为 `sha256:` 哈希。
 
-兼容迁移说明（启动时自动改写）：
-* `common.use_web_review` -> `common.web_api.enabled`
-* `common.web_review_port` -> `common.web_api.port`
-* `common.api_token` / `common.token` -> `common.web_api.root_token`
+## 快捷指令
 
-遥测上传的 endpoint / token 为程序内置固定值，不支持通过 `config.json` 或环境变量修改。
-* `groups.<id>.admins` -> `groups.<id>.webview_admins`
+`review_shortcuts` / `global_shortcuts` 的 value 是步骤 DSL：
 
----
+- 步骤用 `|` 或换行分隔，例如 `匿 | 是`、`拒 | 拉黑 广告`。
+- 指令名不能为空，不能包含空白，不能命名为 `原始`。
+- `quick_replies` 的指令名不能与内置审核指令冲突。
+- `review_shortcuts` 不能与 `quick_replies` 重名。
+- 审核快捷指令支持 `{args}`、`{review_code}`、`{sender_id}`、`{group_id}`。
+- 全局快捷指令支持 `{args}`、`{group_id}`。
+- 快捷指令可以覆盖同作用域内置指令；群内输入 `原始 <指令>` 可调用被覆盖的内置指令。
 
-## 4. groups（账号组配置）字段说明
-
-> 当前实现以 `accounts` 为账号列表来源；其中 `accounts[0]` 是主账号。兼容读取旧字段 `mainqqid/minorqqid` 与别名 `acount`，启动时会自动迁移并写回为 `accounts`。
-
-### 4.1 字段表（每个 group 对象）
-
-| JSON Key                  |                         类型 | 默认/规则            | 当前支持状态                 | 原版行为/参考                                                         |
-| ------------------------- | -------------------------: | ---------------- | ---------------------- | --------------------------------------------------------------- |
-| mangroupid                |                     string | 必填               | 已支持                   | 审核群 ID：审核指令/回复仅在该群处理；其他群消息会被忽略                           |
-| napcat_base_url           |                     string | 必填               | 已支持                   | 本组 NapCat 反向 WS base url（推荐）                                  |
-| napcat_access_token       |                     string | 必填（可 env 覆盖）   | 已支持                   | 本组 NapCat token；可用 `OQQWALL_NAPCAT_TOKEN` 覆盖                 |
-| accounts                  |              array[string] | 必填（至少 1 个；首项为主账号） | 已支持                   | 账号列表，按顺序作为主号/替补优先级；审核相关群消息仅由当前有效主账号发送，主号离线按顺序替补 |
-| max_post_stack            |                        int | 默认 1；只允许正整数（1 表示单条直接发送，>1 启用暂存堆栈） | 已支持                   | sendcontrol 对此字段做默认值与数字校验                                       |
-| max_image_number_one_post |                        int | 默认 30；只允许正整数     | 已支持                   | 单条最大图片数；超限会拆分发送，并触发暂存区 flush                       |
-| individual_image_in_posts |                       bool | 默认 true          | 已支持                   | true=发送渲染图+原图，false=仅发送渲染图                                   |
-| at_unprived_sender           | at_unprived_sender           |   bool |             false | 已支持               | 发件时是否 @ 非匿名的投稿人（sendcontrol 读取此 key）                |
-| send_schedule             |             array["HH:MM"] | 默认空（不启用定时 flush） | 已支持                   | sendcontrol scheduler 从该字段读出 HH:MM 列表并按分钟触发 flush；同一时间点当日只触发一次  |
-| watermark_text            |                     string | 默认 ""            | 已支持                   | 用于渲染水印文本（空字符串不绘制水印）                                    |
-| friend_add_message        |                     string | 默认 ""            | 已支持                   | 用于自动通过好友申请后发送文本（你样例包含）                                        |
-| quick_replies             |     object{string->string} | 默认 {}            | 已支持                   | 用于快捷回复（键和值均为非空字符串，且键不能与审核指令冲突）              |
-| review_shortcuts         |     object{string->string} | 默认 {}            | 已支持                   | 审核快捷指令映射；步骤 DSL 用 `|`/换行分隔，可覆盖内置审核指令，且不能与 `quick_replies` 重名 |
-| global_shortcuts         |     object{string->string} | 默认 {}            | 已支持                   | 全局快捷指令映射；步骤 DSL 用 `|`/换行分隔，可覆盖内置全局指令                        |
-| webview_admins           | array[{username,password,role}] | 默认 []            | 已支持                   | WebView 组管理员；`role` 缺省为 `group_admin`，密码会归一化为 `sha256:` |
-
-> 反向 WS 连接格式：NapCat 里填写 `ws://<host>/<base_path>/<QQ号>`，其中 `<base_path>` 来自 `napcat_base_url`（示例：`ws://127.0.0.1:3001/oqqwall/ws/456787654`）。
-
-### 4.2 快捷指令 DSL 规则
-
-* `review_shortcuts` / `global_shortcuts` 的 value 都是单行 DSL。
-* 步骤用 `|` 或换行分隔，例如：`匿 | 是`、`拒 | 拉黑 广告`.
-* 快捷指令名不能为空、不能包含空白、不能命名为 `原始`。
-* 审核快捷指令步骤只允许原始内置审核指令；全局快捷指令步骤只允许原始内置全局指令中的可批处理动作。
-* 审核快捷指令支持 `{args}`、`{review_code}`、`{sender_id}`、`{group_id}`。
-* 全局快捷指令支持 `{args}`、`{group_id}`；不支持 `{review_code}` / `{sender_id}`。
-* 快捷指令可以覆盖同作用域内置指令；若要调用被覆盖的内置指令，群内输入时使用 `原始 <指令>`。
-* 快捷指令不会递归调用其他快捷指令；运行时会顺序执行，某一步无效就停止后续步骤。
-### 4.3 send_schedule 的语义（必须写清楚）
-
-* `send_schedule` 是一组 **每日 HH:MM** 时间点（例如 `"15:05"`、`"23:55"`）
-* sendcontrol 的 scheduler 每分钟 tick，一旦当前 `nowHM == HH:MM` 则触发 `flush_staged_posts`，并创建当日 markfile，保证**同日同时间只触发一次**。
-
-Rust 版落地建议：
-
-* scheduler 逻辑放到 `decide_on_tick()`（纯函数）里：当 `nowHM` 命中组 schedule 且当日未触发 → emit `GroupFlushRequested(group, now)`
-* driver 执行 flush 后 emit `GroupFlushed / GroupFlushFailed`，并写“当日已触发”到 state（事件化），替代脚本中的 markfile。
-
----
-
-## 5. 配置读取、校验、归一化（Rust 实现建议）
-
-### 5.1 两阶段配置模型
-
-1. `ConfigRaw`：serde 直接反序列化 JSON（宽松类型：string/bool/number 都能收）
-2. `EffectiveConfig`：归一化后的强类型配置（bool/u32/u16、时间解析、端口解析、派生结构）
-
-**归一化要做的事情：**
-
-* 解析 bool：`"true"/"false"` 与 `true/false` 都接受
-* 解析 int：`"3"` 与 `3` 都接受（你的样例是字符串）
-* 解析 `send_schedule`：`HH:MM` 校验并转换为 `minutes_of_day`（0..1439）
-* 应用默认值（参考原版 defaults：sendcontrol 的默认 max_attempts/max_post_stack/max_image_number 等）
-
-### 5.2 校验失败策略（建议）
-
-* **启动时**：关键字段缺失（如 napcat_base_url、napcat_access_token、mangroupid、accounts）→ 直接报错退出
-* **热更新时**：新配置解析失败 → 保留旧 `EffectiveConfig`，并发出告警/日志
-
----
-
-## 6. 配置“读取与传递”设计（不硬编码、可热更新）
-
-### 6.1 组件：ConfigManager（shell 层）
-
-职责：
-
-* 读取 JSON 文件
-* 归一化 + 校验 → `EffectiveConfig`
-* 提供 `ConfigHandle`：`ArcSwap<EffectiveConfig>`（或 `Arc<RwLock<..>>`，但 ArcSwap 更偏函数式快照）
-* 可选：监控文件变更（notify crate）或支持 `SIGHUP` 触发 reload
-
-### 6.2 与事件系统的集成（推荐）
-
-* 引擎启动时：把 `EffectiveConfig` 注入到 Engine（不进 reducer）
-* 每次 reload 成功后：append 一个 `ConfigApplied { config_version, config_blob }` 事件
-
-  * `config_blob` 可选：把原始 JSON bytes 存入 BlobStore，便于事后审计/重放（与事件溯源理念一致）
-* decider 纯函数签名建议变为：
-
-  * `decide(state, cmd, cfg: &EffectiveConfig) -> Vec<Event>`
-  * `reduce(state, event) -> state'`（cfg 不进 reducer）
-
-> 这样：配置既“不硬编码”，又不会把大 JSON 混进 StateView（避免回放膨胀），同时仍能用事件记录“某时刻应用了什么配置版本”。
-
-### 6.3 drivers 如何拿到配置
-
-* drivers 通过 `ConfigHandle.load()` 获取最新 `Arc<EffectiveConfig>` 快照
-* 对“必须一致的请求”：driver 在处理 `XxxRequested` 事件时，应使用事件内的参数为准（例如 retry_at / not_before），而不是用当前配置重新算——保持可重放一致性。
-
----
-
-## 7. JSON 示例（推荐模板）
-
-你上传的样例 `config.json` 已经符合“common + group”的思路，建议稍微增强为：
+## 示例
 
 ```json
 {
-  "schema_version": 1,
   "common": {
-    "manage_napcat_internal": false,
-    "renewcookies_use_napcat": true,
-    "max_attempts_qzone_autologin": 3,
-    "force_chromium_no_sandbox": false,
-    "at_unprived_sender": true,
+    "process_waittime_sec": 20,
+    "tz_offset_minutes": 480,
+    "max_cache_mb": 256,
+    "at_unprived_sender": false,
     "friend_request_window_sec": 300,
     "web_api": {
-      "enabled": true,
+      "enabled": false,
       "port": 10923,
-      "root_token": "REDACTED"
+      "root_token": ""
     },
     "webview": {
       "enabled": true,
@@ -246,71 +178,43 @@ Rust 版落地建议：
       "local_dir": "telemetry",
       "upload_enabled": true,
       "upload_interval_sec": 30,
-      "upload_batch_size": 20,
       "max_append_messages": 2
-    },
-    "process_waittime_sec": 20
+    }
   },
   "groups": {
-    "MethGroup": {
-      "mangroupid": "993802974",
-      "napcat_base_url": "0.0.0.0:3001/oqqwall/ws",
-      "napcat_access_token": "REDACTED",
+    "default": {
+      "mangroupid": "123456789",
       "accounts": ["3995477265"],
+      "napcat_base_url": "127.0.0.1:3001/oqqwall/ws",
+      "napcat_access_token": "REDACTED",
       "max_post_stack": 1,
-      "max_image_number_one_post": 9,
-      "send_schedule": ["15:05", "23:55"],
-      "friend_add_message": "您的好友申请已通过，请阅读校园墙空间置顶后再投稿（系统自动发送请勿回复）",
+      "max_image_number_one_post": 30,
+      "individual_image_in_posts": true,
+      "send_schedule": ["08:30", "22:10"],
+      "watermark_text": "",
+      "friend_add_message": "",
       "quick_replies": {
         "补充信息": "请补充时间地点"
       },
       "review_shortcuts": {
-        "匿": "匿 | 是",
-        "滚": "拒 | 拉黑 {group_id}"
+        "匿": "匿 | 是"
       },
       "global_shortcuts": {
         "清队列": "删除待处理 | 删除暂存区"
       },
       "webview_admins": [
-        { "username": "3391146750", "password": "sha256:REDACTED", "role": "group_admin" }
+        {
+          "username": "op",
+          "password": "sha256:REDACTED"
+        }
       ]
     }
   },
   "webview_global_admins": [
-    { "username": "root", "password": "sha256:REDACTED", "role": "global_admin" }
+    {
+      "username": "root",
+      "password": "sha256:REDACTED"
+    }
   ]
 }
 ```
-
-> 遥测字段协议与上传包体细节见 `docs/telemetry.md`；独立服务端部署见 `docs/telemetry_collector.md`。
-
----
-
-## 8. 兼容/迁移（可选，但强烈建议）
-
-为了平滑迁移原版部署，建议提供命令：
-
-* `OQQWall_RUST config import --oqqwall-config ./oqqwall.config --group-config ./AcountGroupcfg.json -o ./config.json`
-
-导入规则：
-
-* 读取 KV（原版 `read_config` 语义：去掉 `#` 注释，按 `=` 分割）
-* 读取 `AcountGroupcfg.json` 作为 groups
-* 输出统一 JSON
-
----
-
-## 9. 开发落地 Checklist（让实现不走样）
-
-* [ ] serde 结构：Raw + Effective 两层
-* [ ] 宽松解析：bool/int/string 兼容（样例里大量是 string）
-* [ ] schedule 解析：支持 `HH:MM`，并在 EffectiveConfig 中转成 minutes_of_day
-* [ ] env 覆盖：OQQWALL_NAPCAT_TOKEN 优先（全组覆盖）
-* [ ] config 变更：ConfigApplied 事件 +（可选）config_blob 入 BlobStore
-* [ ] core 不直接读文件、不直接读 env（只接受 `&EffectiveConfig`）
-
----
-
-## 10. 附：原版字段集合（便于对照）
-
-原版 TUI 明确列出了一批全局 key 的说明（tooltip），并列出组 key 的顺序（包含 send_schedule、quick_replies、admins 等）。Rust 版可以把这些作为“兼容字段白名单”的基础。

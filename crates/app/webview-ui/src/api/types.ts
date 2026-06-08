@@ -1,6 +1,8 @@
 export type Role = 'global_admin' | 'group_admin'
 
 export type Stage =
+  | '__active__'
+  | ''
   | 'drafted'
   | 'render_requested'
   | 'rendered'
@@ -33,6 +35,8 @@ export interface PostItem {
   last_error: string | null
   preview_text?: string
   preview_image_url?: string
+  preview_image_urls?: string[]
+  preview_image_count?: number
 }
 
 export interface StatsResponse {
@@ -40,6 +44,30 @@ export interface StatsResponse {
   today_count: number
   total_count: number
   stage_breakdown: Record<string, number>
+  actionable_count: number
+  error_count: number
+  daily_trend: Array<{
+    date: string
+    submitted: number
+    approved: number
+    rejected: number
+  }>
+  hourly_distribution: Array<{
+    hour: number
+    count: number
+  }>
+  avg_review_time_ms: number | null
+}
+
+export interface ListPostsResponse {
+  items: PostItem[]
+  next_cursor: number | null
+  total: number
+}
+
+export interface ListReviewIdsResponse {
+  review_ids: string[]
+  total: number
 }
 
 export interface PostDetail {
@@ -75,6 +103,8 @@ export interface ApiErrorBody {
 }
 
 export const STAGE_LABELS: Record<string, string> = {
+  __active__: '全部活跃',
+  '': '全部',
   drafted: '已接收',
   render_requested: '待渲染',
   rendered: '已渲染',

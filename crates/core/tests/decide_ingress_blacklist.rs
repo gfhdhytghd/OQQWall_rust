@@ -23,6 +23,7 @@ fn ingress_blacklisted_is_ignored() {
             attachments: Vec::new(),
         },
         received_at_ms: 1_000,
+        close_immediately: false,
     };
 
     let events = decide(&state, &Command::Ingress(ingress), &CoreConfig::default());

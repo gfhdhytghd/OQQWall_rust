@@ -86,6 +86,9 @@ pub fn decide_ingress(state: &StateView, cmd: &IngressCommand, config: &CoreConf
 }
 
 fn initial_close_at(state: &StateView, cmd: &IngressCommand, config: &CoreConfig) -> i64 {
+    if cmd.close_immediately {
+        return cmd.received_at_ms;
+    }
     let wait_ms = config.process_waittime_ms(&cmd.group_id);
     let key = SessionKey {
         chat_id: cmd.chat_id.clone(),

@@ -27,7 +27,7 @@
       "napcat_base_url": "0.0.0.0:3001/oqqwall/ws",
       "webview_admins": [
         {
-          "password": "admin147",
+          "password": "sha256:f755464b706ef05b3dc0a82c09718911f057626be00bf47d07132330a7f4b424",
           "role": "group_admin",
           "username": "3391146750"
         }

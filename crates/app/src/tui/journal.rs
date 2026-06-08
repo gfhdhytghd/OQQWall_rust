@@ -1511,11 +1511,17 @@ fn compact_text(text: &str, max_chars: usize) -> String {
 fn draft_preview_text(draft: &Draft) -> String {
     let mut parts = Vec::new();
     for block in &draft.blocks {
-        if let DraftBlock::Paragraph { text } = block {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                parts.push(trimmed);
-            }
+        let text = match block {
+            DraftBlock::Paragraph { text } => text.as_str(),
+            DraftBlock::Reply { preview } => preview.body.as_str(),
+            DraftBlock::Poke => "[戳一戳]",
+            DraftBlock::JsonCard { .. } => "[卡片]",
+            DraftBlock::Forward { .. } => "[合并转发聊天记录]",
+            DraftBlock::Attachment { .. } => "",
+        };
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed);
         }
     }
     parts.join(" ")

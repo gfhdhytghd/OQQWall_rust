@@ -23,6 +23,7 @@ pub struct IngressCommand {
     pub platform_msg_id: String,
     pub message: IngressMessage,
     pub received_at_ms: TimestampMs,
+    pub close_immediately: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

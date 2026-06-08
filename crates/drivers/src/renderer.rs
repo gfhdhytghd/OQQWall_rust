@@ -20,10 +20,11 @@ use oqqwall_rust_core::event::{
     BlobEvent, Event, IngressEvent, MediaEvent, RenderEvent, SendEvent,
 };
 use oqqwall_rust_core::{
-    BlobId, Command, Draft, DraftBlock, IngressId, IngressMessage, MediaKind, MediaReference,
-    PostId, StateView, derive_blob_id,
+    BlobId, Command, Draft, DraftBlock, ForwardItem, IngressId, IngressMessage, MediaKind,
+    MediaReference, PostId, ReplyPreview, StateView, derive_blob_id,
 };
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
+use qrcode::{Color as QrColor, QrCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -97,6 +98,27 @@ impl Default for RendererRuntimeConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderPreviewHeader {
+    pub group_id: String,
+    pub user_id: String,
+    pub post_id_hex: String,
+    pub sender_name: Option<String>,
+    pub is_anonymous: bool,
+}
+
+impl Default for RenderPreviewHeader {
+    fn default() -> Self {
+        Self {
+            group_id: "fixture-group".to_string(),
+            user_id: "fixture-user".to_string(),
+            post_id_hex: "00000000000000000000000000000000".to_string(),
+            sender_name: Some("fixture sender".to_string()),
+            is_anonymous: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct HeaderInfo {
     group_id: String,
@@ -104,6 +126,18 @@ struct HeaderInfo {
     post_id_hex: String,
     sender_name: Option<String>,
     is_anonymous: bool,
+}
+
+impl From<RenderPreviewHeader> for HeaderInfo {
+    fn from(value: RenderPreviewHeader) -> Self {
+        Self {
+            group_id: value.group_id,
+            user_id: value.user_id,
+            post_id_hex: value.post_id_hex,
+            sender_name: value.sender_name,
+            is_anonymous: value.is_anonymous,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +158,24 @@ enum BlockKind {
         meta_line: Option<String>,
         icon_path: Option<&'static str>,
         icon_text: String,
+    },
+    Reply {
+        meta_lines: Vec<String>,
+        body_lines: Vec<String>,
+        missing: bool,
+    },
+    Poke {
+        image: Option<ResolvedImage>,
+    },
+    JsonCard {
+        view: JsonCardView,
+        title_lines: Vec<String>,
+        desc_lines: Vec<String>,
+        footer_line: Option<String>,
+        media: Option<ResolvedImage>,
+    },
+    Forward {
+        items: Vec<ForwardLayoutItem>,
     },
 }
 
@@ -161,6 +213,22 @@ struct ResolvedImage {
     bytes: Option<Arc<[u8]>>,
     width: Option<u32>,
     height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct JsonCardView {
+    view_kind: String,
+    title: String,
+    desc: Option<String>,
+    footer: Option<String>,
+    jump_url: Option<String>,
+    media_source: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ForwardLayoutItem {
+    sender: Option<String>,
+    lines: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +322,296 @@ impl TextMeasurer {
         };
         self.cache.insert(key, width_px);
         width_px
+    }
+}
+
+fn reply_meta_text(preview: &ReplyPreview) -> String {
+    let mut parts = Vec::new();
+    if let Some(meta) = preview
+        .meta
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(meta.to_string());
+    }
+    if let Some(id) = preview
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("id:{}", id));
+    }
+    if preview.missing {
+        parts.push("原消息缺失".to_string());
+    }
+    if parts.is_empty() {
+        "回复".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn parse_json_card_view(raw: &str) -> JsonCardView {
+    let normalized = raw.replace("&#44;", ",").replace("\\/", "/");
+    let value = serde_json::from_str::<Value>(&normalized).ok();
+    if let Some(value) = value.as_ref() {
+        let view_kind = json_field_string(value, &["view", "type", "template"])
+            .unwrap_or_else(|| "json".to_string());
+        if view_kind == "contact" {
+            if let Some(contact) = value.pointer("/meta/contact") {
+                return JsonCardView {
+                    view_kind,
+                    title: json_field_string(contact, &["nickname", "title", "name"])
+                        .unwrap_or_else(|| "联系人".to_string()),
+                    desc: json_field_string(contact, &["contact", "desc", "description"]),
+                    footer: json_field_string(contact, &["tag", "source", "footer"]),
+                    jump_url: json_field_string(contact, &["jumpUrl", "jump_url", "url", "link"])
+                        .or_else(|| contact_uin_url(contact)),
+                    media_source: json_field_string(contact, &["avatar", "icon", "preview"]),
+                };
+            }
+        }
+        if view_kind == "miniapp" {
+            if let Some(miniapp) = value.pointer("/meta/miniapp") {
+                return JsonCardView {
+                    view_kind,
+                    title: json_field_string(miniapp, &["title", "name"])
+                        .unwrap_or_else(|| "小程序卡片".to_string()),
+                    desc: json_field_string(miniapp, &["desc", "description"]),
+                    footer: json_field_string(miniapp, &["source", "tag", "footer"]),
+                    jump_url: json_field_string(
+                        miniapp,
+                        &["jumpUrl", "jump_url", "doc_url", "url", "link"],
+                    ),
+                    media_source: json_field_string(
+                        miniapp,
+                        &["preview", "cover", "image", "sourcelogo", "icon"],
+                    ),
+                };
+            }
+        }
+        if view_kind == "news" {
+            if let Some(news) = value.pointer("/meta/news") {
+                return JsonCardView {
+                    view_kind,
+                    title: json_field_string(news, &["title", "name"])
+                        .unwrap_or_else(|| "分享".to_string()),
+                    desc: json_field_string(news, &["desc", "description"]),
+                    footer: json_field_string(news, &["tag", "source", "footer"]),
+                    jump_url: json_field_string(news, &["jumpUrl", "jump_url", "url", "link"]),
+                    media_source: json_field_string(news, &["preview", "cover", "image", "thumb"]),
+                };
+            }
+        }
+        if let Some(generic) = first_meta_value(value) {
+            return JsonCardView {
+                view_kind,
+                title: json_field_string(generic, &["title", "name"])
+                    .or_else(|| json_field_string(value, &["prompt", "summary"]))
+                    .unwrap_or_else(|| "[卡片]".to_string()),
+                desc: json_field_string(generic, &["desc", "description", "text", "content"]),
+                footer: json_field_string(generic, &["source", "tag", "app", "footer"]),
+                jump_url: json_field_string(
+                    generic,
+                    &["jumpUrl", "jump_url", "url", "targetUrl", "link"],
+                ),
+                media_source: json_field_string(
+                    generic,
+                    &[
+                        "preview",
+                        "image",
+                        "icon",
+                        "cover",
+                        "picture",
+                        "thumbnail",
+                        "img_url",
+                    ],
+                ),
+            };
+        }
+    }
+
+    let title = value
+        .as_ref()
+        .and_then(|value| find_json_string(value, &["title", "nickname", "prompt", "name"]))
+        .unwrap_or_else(|| "[卡片]".to_string());
+    let desc = value
+        .as_ref()
+        .and_then(|value| find_json_string(value, &["desc", "description", "text", "content"]));
+    let footer = value
+        .as_ref()
+        .and_then(|value| find_json_string(value, &["source", "app", "tag", "footer"]));
+    let jump_url = value.as_ref().and_then(|value| {
+        find_json_string(
+            value,
+            &[
+                "url",
+                "jump_url",
+                "jumpUrl",
+                "qqdocurl",
+                "targetUrl",
+                "link",
+            ],
+        )
+    });
+    let media_source = value.as_ref().and_then(|value| {
+        find_json_string(
+            value,
+            &[
+                "preview",
+                "avatar",
+                "image",
+                "icon",
+                "cover",
+                "picture",
+                "thumbnail",
+                "img_url",
+            ],
+        )
+    });
+    let view_kind = value
+        .as_ref()
+        .and_then(|value| json_field_string(value, &["type", "view", "template"]))
+        .unwrap_or_else(|| "json".to_string());
+    JsonCardView {
+        view_kind,
+        title,
+        desc,
+        footer,
+        jump_url,
+        media_source,
+    }
+}
+
+fn json_field_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn first_meta_value(value: &Value) -> Option<&Value> {
+    value
+        .get("meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.values().next())
+}
+
+fn contact_uin_url(contact: &Value) -> Option<String> {
+    let contact_text = json_field_string(contact, &["contact"])?;
+    let uin = contact_text
+        .split(|ch: char| !ch.is_ascii_digit())
+        .find(|part| part.len() >= 5)?;
+    Some(format!("https://mp.qzone.qq.com/u/{}", uin))
+}
+
+fn json_card_uses_vertical_media(view: &JsonCardView) -> bool {
+    view.media_source.is_some() && !matches!(view.view_kind.as_str(), "contact" | "news")
+}
+
+fn find_json_string(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(found) = map
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    return Some(found.to_string());
+                }
+            }
+            for child in map.values() {
+                if let Some(found) = find_json_string(child, keys) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(|item| find_json_string(item, keys)),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn layout_forward_items(
+    items: &[ForwardItem],
+    max_width: u32,
+    font_size: u32,
+    font_weight: u32,
+    measurer: &mut TextMeasurer,
+    emoji_cache: &EmojiRenderCache,
+) -> Vec<ForwardLayoutItem> {
+    items
+        .iter()
+        .take(5)
+        .map(|item| {
+            let summary = forward_item_summary(item);
+            let lines = limit_lines(
+                wrap_text(
+                    &summary,
+                    max_width,
+                    font_size,
+                    font_weight,
+                    measurer,
+                    emoji_cache,
+                ),
+                2,
+                max_width,
+                font_size,
+                font_weight,
+                measurer,
+                emoji_cache,
+            );
+            ForwardLayoutItem {
+                sender: item.sender_name.clone(),
+                lines,
+            }
+        })
+        .collect()
+}
+
+fn forward_item_summary(item: &ForwardItem) -> String {
+    let parts = item
+        .blocks
+        .iter()
+        .map(draft_block_summary)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "[空消息]".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn draft_block_summary(block: &DraftBlock) -> String {
+    match block {
+        DraftBlock::Paragraph { text } => text.trim().to_string(),
+        DraftBlock::Attachment { kind, name, .. } => name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("[{}]", media_label(*kind))),
+        DraftBlock::Reply { preview } => format!("[回复] {}", preview.body.trim()),
+        DraftBlock::Poke => "[戳一戳]".to_string(),
+        DraftBlock::JsonCard { raw } => {
+            let view = parse_json_card_view(raw);
+            format!("[卡片] {}", view.title)
+        }
+        DraftBlock::Forward { items } => format!("[合并转发:{}条]", items.len()),
     }
 }
 
@@ -621,12 +979,12 @@ async fn resolve_forward_draft(
     header: &HeaderInfo,
     _config: &RendererRuntimeConfig,
 ) -> Draft {
-    if !draft_has_forward(draft) {
-        return draft.clone();
+    if !draft_has_forward_reference(draft) {
+        return expand_embedded_forward_draft(draft);
     }
 
     let Some(account_id) = napcat_account_for_group(&header.group_id) else {
-        return draft.clone();
+        return expand_embedded_forward_draft(draft);
     };
 
     let mut context = ForwardContext {
@@ -642,17 +1000,69 @@ async fn resolve_forward_draft(
                 let mut expanded = expand_forward_in_text(text, &mut context, 0).await;
                 blocks.append(&mut expanded);
             }
-            DraftBlock::Attachment { .. } => blocks.push(block.clone()),
+            DraftBlock::Attachment { .. }
+            | DraftBlock::Reply { .. }
+            | DraftBlock::Poke
+            | DraftBlock::JsonCard { .. }
+            | DraftBlock::Forward { .. } => blocks.push(block.clone()),
         }
     }
-    Draft { blocks }
+    expand_embedded_forward_draft(&Draft { blocks })
 }
 
-fn draft_has_forward(draft: &Draft) -> bool {
+fn draft_has_forward_reference(draft: &Draft) -> bool {
     draft.blocks.iter().any(|block| match block {
         DraftBlock::Paragraph { text } => text.contains(FORWARD_PREFIX),
         _ => false,
     })
+}
+
+fn expand_embedded_forward_draft(draft: &Draft) -> Draft {
+    let mut blocks = Vec::new();
+    for block in &draft.blocks {
+        append_block_expanding_forward(block, &mut blocks, 0);
+    }
+    Draft { blocks }
+}
+
+fn append_block_expanding_forward(block: &DraftBlock, blocks: &mut Vec<DraftBlock>, depth: u32) {
+    match block {
+        DraftBlock::Forward { items } => append_forward_items_as_blocks(items, blocks, depth),
+        _ => blocks.push(block.clone()),
+    }
+}
+
+fn append_forward_items_as_blocks(items: &[ForwardItem], blocks: &mut Vec<DraftBlock>, depth: u32) {
+    if depth >= MAX_FORWARD_DEPTH {
+        blocks.push(DraftBlock::Paragraph {
+            text: "[合并转发:层级过深]".to_string(),
+        });
+        return;
+    }
+
+    blocks.push(DraftBlock::Paragraph {
+        text: "合并转发聊天记录".to_string(),
+    });
+    for item in items.iter().take(10) {
+        if let Some(sender) = item
+            .sender_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            blocks.push(DraftBlock::Paragraph {
+                text: format!("{}:", sender),
+            });
+        }
+        for nested in &item.blocks {
+            append_block_expanding_forward(nested, blocks, depth + 1);
+        }
+    }
+    if items.len() > 10 {
+        blocks.push(DraftBlock::Paragraph {
+            text: format!("... {} more forwarded items ...", items.len() - 10),
+        });
+    }
 }
 
 fn forward_placeholder(id: &str) -> String {
@@ -728,7 +1138,10 @@ async fn forward_blocks_for_id(
     context.seen.insert(forward_id.to_string());
 
     let resolved = match fetch_forward_messages(context, forward_id).await {
-        Ok(messages) => forward_messages_to_blocks(&messages, context, depth + 1).await,
+        Ok(messages) => {
+            let items = forward_messages_to_items(&messages, context, depth + 1).await;
+            vec![DraftBlock::Forward { items }]
+        }
         Err(_err) => {
             debug_log!("forward resolve failed: id={} err={}", forward_id, _err);
             vec![DraftBlock::Paragraph {
@@ -761,26 +1174,47 @@ async fn fetch_forward_messages(
     Ok(messages.to_vec())
 }
 
-async fn forward_messages_to_blocks(
+async fn forward_messages_to_items(
     messages: &[Value],
     context: &mut ForwardContext,
     depth: u32,
-) -> Vec<DraftBlock> {
-    let mut blocks = Vec::new();
+) -> Vec<ForwardItem> {
+    let mut items = Vec::new();
     for message in messages {
         let payload = message.get("message").or_else(|| message.get("content"));
         let extracted = extract_message_lite(payload);
-        let mut text_blocks = expand_forward_in_text(&extracted.text, context, depth).await;
-        blocks.append(&mut text_blocks);
+        let mut blocks = expand_forward_in_text(&extracted.text, context, depth).await;
         for attachment in extracted.attachments {
             blocks.push(DraftBlock::Attachment {
                 kind: attachment.kind,
+                name: attachment.name,
                 reference: attachment.reference,
                 size_bytes: attachment.size_bytes,
             });
         }
+        items.push(ForwardItem {
+            sender_name: forward_sender_name(message),
+            blocks,
+        });
     }
-    blocks
+    items
+}
+
+fn forward_sender_name(message: &Value) -> Option<String> {
+    message
+        .get("sender")
+        .and_then(Value::as_object)
+        .and_then(|sender| {
+            sender
+                .get("nickname")
+                .or_else(|| sender.get("card"))
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| message.get("sender_name").and_then(Value::as_str))
+        .or_else(|| message.get("nickname").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn extract_header(state: &StateView, post_id: PostId) -> HeaderInfo {
@@ -950,6 +1384,7 @@ fn render_png(
             }
             DraftBlock::Attachment {
                 kind,
+                name,
                 reference: _,
                 size_bytes,
             } => {
@@ -1003,6 +1438,7 @@ fn render_png(
                         let filename = label_href
                             .as_deref()
                             .and_then(extract_filename)
+                            .or_else(|| name.clone())
                             .unwrap_or_else(|| "Unknown file".to_string());
                         let mut name_lines = wrap_text(
                             &filename,
@@ -1047,7 +1483,11 @@ fn render_png(
                     }
                     _ => {
                         let width = content_width.min(320).max(1);
-                        let height = 90u32;
+                        let height = if matches!(*kind, oqqwall_rust_core::MediaKind::Video) {
+                            (width.saturating_mul(9) / 16).clamp(120, 300)
+                        } else {
+                            90u32
+                        };
                         let text_max_w = width
                             .saturating_sub(card_padding * 2 + card_icon_size + card_icon_gap)
                             .max(1);
@@ -1078,6 +1518,217 @@ fn render_png(
                             },
                         }
                     }
+                }
+            }
+            DraftBlock::Reply { preview } => {
+                let width = content_width.min(320).max(1);
+                let text_max_w = width.saturating_sub(card_padding * 2 + 8).max(1);
+                let meta = reply_meta_text(preview);
+                let mut meta_lines = wrap_text(
+                    &meta,
+                    text_max_w,
+                    meta_size,
+                    font_weight_body,
+                    &mut text_measurer,
+                    &emoji_cache,
+                );
+                meta_lines = limit_lines(
+                    meta_lines,
+                    1,
+                    text_max_w,
+                    meta_size,
+                    font_weight_body,
+                    &mut text_measurer,
+                    &emoji_cache,
+                );
+                let mut body_lines = wrap_text(
+                    &preview.body,
+                    text_max_w,
+                    meta_size,
+                    font_weight_body,
+                    &mut text_measurer,
+                    &emoji_cache,
+                );
+                body_lines = limit_lines(
+                    body_lines,
+                    3,
+                    text_max_w,
+                    meta_size,
+                    font_weight_body,
+                    &mut text_measurer,
+                    &emoji_cache,
+                );
+                let height = card_padding * 2
+                    + meta_lines.len() as u32 * file_meta_height
+                    + file_meta_gap
+                    + body_lines.len() as u32 * card_line_height;
+                BlockLayout {
+                    x: padding,
+                    y: cursor_y,
+                    width,
+                    height,
+                    kind: BlockKind::Reply {
+                        meta_lines,
+                        body_lines,
+                        missing: preview.missing,
+                    },
+                }
+            }
+            DraftBlock::Poke => {
+                let image = resolve_source_to_image("res/poke.png");
+                let (width, height) = image
+                    .as_ref()
+                    .and_then(|img| img.width.zip(img.height))
+                    .map(|(orig_w, orig_h)| {
+                        let max_width = (content_width / 2).max(48);
+                        let max_height = 120u32;
+                        let scale_w = max_width as f32 / orig_w.max(1) as f32;
+                        let scale_h = max_height as f32 / orig_h.max(1) as f32;
+                        let scale = scale_w.min(scale_h).min(1.0);
+                        (
+                            (orig_w as f32 * scale).round().max(1.0) as u32,
+                            (orig_h as f32 * scale).round().max(1.0) as u32,
+                        )
+                    })
+                    .unwrap_or((64, 64));
+                BlockLayout {
+                    x: padding,
+                    y: cursor_y,
+                    width,
+                    height,
+                    kind: BlockKind::Poke { image },
+                }
+            }
+            DraftBlock::JsonCard { raw } => {
+                let view = parse_json_card_view(raw);
+                let width = content_width.min(276).max(1);
+                let qr_space = if view.jump_url.is_some() { 56 } else { 0 };
+                let vertical_media = json_card_uses_vertical_media(&view);
+                let media_space = if !vertical_media && view.media_source.is_some() {
+                    56
+                } else {
+                    0
+                };
+                let text_max_w = width
+                    .saturating_sub(card_padding * 2 + qr_space + media_space)
+                    .max(1);
+                let mut title_lines = wrap_text(
+                    &view.title,
+                    text_max_w,
+                    font_size,
+                    font_weight_title,
+                    &mut text_measurer,
+                    &emoji_cache,
+                );
+                title_lines = limit_lines(
+                    title_lines,
+                    2,
+                    text_max_w,
+                    font_size,
+                    font_weight_title,
+                    &mut text_measurer,
+                    &emoji_cache,
+                );
+                let mut desc_lines = view
+                    .desc
+                    .as_deref()
+                    .map(|desc| {
+                        wrap_text(
+                            desc,
+                            text_max_w,
+                            meta_size,
+                            font_weight_body,
+                            &mut text_measurer,
+                            &emoji_cache,
+                        )
+                    })
+                    .unwrap_or_default();
+                desc_lines = limit_lines(
+                    desc_lines,
+                    2,
+                    text_max_w,
+                    meta_size,
+                    font_weight_body,
+                    &mut text_measurer,
+                    &emoji_cache,
+                );
+                let footer_line = view.footer.as_deref().map(|footer| {
+                    truncate_text(
+                        footer,
+                        text_max_w,
+                        meta_size,
+                        font_weight_body,
+                        &mut text_measurer,
+                        &emoji_cache,
+                    )
+                });
+                let text_height = title_lines.len() as u32 * card_line_height
+                    + desc_lines.len() as u32 * file_meta_height
+                    + footer_line.as_ref().map(|_| file_meta_height).unwrap_or(0);
+                let media = view
+                    .media_source
+                    .as_deref()
+                    .and_then(resolve_source_to_image);
+                let height = if vertical_media {
+                    let header_height = text_height.max(if qr_space > 0 { 48 } else { 0 });
+                    let preview_height = if media.is_some() {
+                        width.saturating_sub(card_padding * 2).min(170).max(72)
+                    } else {
+                        0
+                    };
+                    card_padding * 2
+                        + header_height
+                        + if preview_height > 0 {
+                            card_padding + preview_height
+                        } else {
+                            0
+                        }
+                } else {
+                    let side_height = if qr_space > 0 || media_space > 0 {
+                        48
+                    } else {
+                        0
+                    };
+                    card_padding * 2 + text_height.max(side_height).max(card_line_height)
+                };
+                BlockLayout {
+                    x: padding,
+                    y: cursor_y,
+                    width,
+                    height,
+                    kind: BlockKind::JsonCard {
+                        view,
+                        title_lines,
+                        desc_lines,
+                        footer_line,
+                        media,
+                    },
+                }
+            }
+            DraftBlock::Forward { items } => {
+                let width = content_width.min(340).max(1);
+                let text_max_w = width.saturating_sub(card_padding * 2 + 14).max(1);
+                let layout_items = layout_forward_items(
+                    items,
+                    text_max_w,
+                    meta_size,
+                    font_weight_body,
+                    &mut text_measurer,
+                    &emoji_cache,
+                );
+                let item_lines = layout_items
+                    .iter()
+                    .map(|item| item.lines.len().max(1) as u32)
+                    .sum::<u32>();
+                let height = card_padding * 2 + card_line_height + item_lines * card_line_height;
+                BlockLayout {
+                    x: padding,
+                    y: cursor_y,
+                    width,
+                    height,
+                    kind: BlockKind::Forward {
+                        items: layout_items,
+                    },
                 }
             }
         };
@@ -1125,6 +1776,43 @@ fn render_png(
                     layout.width,
                     layout.height,
                     _name_lines.len()
+                );
+            }
+            BlockKind::Reply { body_lines, .. } => {
+                debug_log!(
+                    "layout block: idx={} kind=reply width={} height={} body_lines={}",
+                    block_idx,
+                    layout.width,
+                    layout.height,
+                    body_lines.len()
+                );
+            }
+            BlockKind::Poke { image } => {
+                let _size = image.as_ref().and_then(|img| img.width.zip(img.height));
+                debug_log!(
+                    "layout block: idx={} kind=poke width={} height={} image_size={:?}",
+                    block_idx,
+                    layout.width,
+                    layout.height,
+                    _size
+                );
+            }
+            BlockKind::JsonCard { view, .. } => {
+                debug_log!(
+                    "layout block: idx={} kind=json_card view={} width={} height={}",
+                    block_idx,
+                    view.view_kind,
+                    layout.width,
+                    layout.height
+                );
+            }
+            BlockKind::Forward { items } => {
+                debug_log!(
+                    "layout block: idx={} kind=forward width={} height={} items={}",
+                    block_idx,
+                    layout.width,
+                    layout.height,
+                    items.len()
                 );
             }
         }
@@ -1509,58 +2197,65 @@ fn render_png(
                     block.height as f32,
                 );
                 let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
-                draw_shadowed_rrect(canvas, rr, 2.0, 0.10);
-
-                let mut card_bg = Paint::default();
-                card_bg.set_color4f(color_white, None);
-                card_bg.set_anti_alias(true);
-                canvas.draw_rrect(rr, &card_bg);
-                let mut card_border = Paint::default();
-                card_border.set_color4f(color_border, None);
-                card_border.set_style(skia_safe::paint::Style::Stroke);
-                card_border.set_stroke_width(1.0);
-                card_border.set_anti_alias(true);
-                canvas.draw_rrect(rr, &card_border);
-
-                let icon_x = block.x + card_padding;
-                let icon_y = block.y + (block.height - card_icon_size) / 2;
                 if matches!(media_kind, oqqwall_rust_core::MediaKind::Video) {
-                    let cx = icon_x + card_icon_size / 2;
-                    let cy = icon_y + card_icon_size / 2;
-                    let mut icon_bg = Paint::default();
-                    icon_bg.set_color4f(color_bg, None);
-                    icon_bg.set_anti_alias(true);
-                    canvas.draw_circle(
-                        (cx as f32, cy as f32),
-                        (card_icon_size / 2) as f32,
-                        &icon_bg,
+                    draw_shadowed_rrect(canvas, rr, 3.0, 0.20);
+
+                    let mut video_bg = Paint::default();
+                    video_bg.set_color4f(color_from_hex(0x262626), None);
+                    video_bg.set_anti_alias(true);
+                    canvas.draw_rrect(rr, &video_bg);
+
+                    let bottom_h = 26.0;
+                    let bottom_rect = Rect::from_xywh(
+                        block.x as f32,
+                        block.y as f32 + block.height as f32 - bottom_h,
+                        block.width as f32,
+                        bottom_h,
                     );
-                    let mut icon_border = Paint::default();
-                    icon_border.set_color4f(color_border, None);
-                    icon_border.set_style(skia_safe::paint::Style::Stroke);
-                    icon_border.set_stroke_width(1.0);
-                    icon_border.set_anti_alias(true);
-                    canvas.draw_circle(
-                        (cx as f32, cy as f32),
-                        (card_icon_size / 2) as f32,
-                        &icon_border,
+                    let mut controls_bg = Paint::default();
+                    controls_bg.set_color4f(Color4f::new(0.0, 0.0, 0.0, 0.25), None);
+                    controls_bg.set_anti_alias(true);
+                    canvas.draw_rect(bottom_rect, &controls_bg);
+
+                    let progress_y = block.y as f32 + block.height as f32 - 13.0;
+                    let mut progress = Paint::default();
+                    progress.set_color4f(Color4f::new(1.0, 1.0, 1.0, 0.35), None);
+                    progress.set_stroke_width(2.0);
+                    progress.set_anti_alias(true);
+                    canvas.draw_line(
+                        (block.x as f32 + 36.0, progress_y),
+                        (block.x as f32 + block.width as f32 - 18.0, progress_y),
+                        &progress,
                     );
 
-                    let tri_x = icon_x + card_icon_size / 3;
-                    let tri_y = icon_y + card_icon_size / 4;
-                    let tri_w = card_icon_size / 2;
-                    let tri_h = card_icon_size / 2;
-                    let mut tri = PathBuilder::new();
-                    tri.move_to((tri_x as f32, tri_y as f32));
-                    tri.line_to((tri_x as f32, (tri_y + tri_h) as f32));
-                    tri.line_to(((tri_x + tri_w) as f32, (tri_y + tri_h / 2) as f32));
-                    tri.close();
-                    let tri = tri.detach();
-                    let mut tri_paint = Paint::default();
-                    tri_paint.set_color4f(color_from_hex(0x007AFF), None);
-                    tri_paint.set_anti_alias(true);
-                    canvas.draw_path(&tri, &tri_paint);
+                    let play_x = block.x as f32 + 18.0;
+                    let play_y = progress_y - 6.0;
+                    let mut play = PathBuilder::new();
+                    play.move_to((play_x, play_y));
+                    play.line_to((play_x, play_y + 12.0));
+                    play.line_to((play_x + 10.0, play_y + 6.0));
+                    play.close();
+                    let play = play.detach();
+                    let mut play_paint = Paint::default();
+                    play_paint.set_color4f(Color4f::new(1.0, 1.0, 1.0, 0.65), None);
+                    play_paint.set_anti_alias(true);
+                    canvas.draw_path(&play, &play_paint);
                 } else {
+                    draw_shadowed_rrect(canvas, rr, 2.0, 0.10);
+
+                    let mut card_bg = Paint::default();
+                    card_bg.set_color4f(color_white, None);
+                    card_bg.set_anti_alias(true);
+                    canvas.draw_rrect(rr, &card_bg);
+                    let mut card_border = Paint::default();
+                    card_border.set_color4f(color_border, None);
+                    card_border.set_style(skia_safe::paint::Style::Stroke);
+                    card_border.set_stroke_width(1.0);
+                    card_border.set_anti_alias(true);
+                    canvas.draw_rrect(rr, &card_border);
+
+                    let icon_x = block.x + card_padding;
+                    let icon_y = block.y + (block.height - card_icon_size) / 2;
                     let icon_rect = Rect::from_xywh(
                         icon_x as f32,
                         icon_y as f32,
@@ -1593,23 +2288,23 @@ fn render_png(
                         let top_y = icon_baseline - metrics.baseline;
                         paragraph.paint(canvas, (icon_x, top_y));
                     }
-                }
 
-                let text_x = block.x + card_padding + card_icon_size + card_icon_gap;
-                let text_y = block.y + card_padding + font_size;
-                for (idx, line) in lines.iter().enumerate() {
-                    let baseline = text_y + card_line_height.saturating_mul(idx as u32);
-                    draw_text_line(
-                        canvas,
-                        &font_collection,
-                        &mut emoji_cache,
-                        line,
-                        text_x as f32,
-                        baseline as f32,
-                        font_size,
-                        font_weight_body,
-                        color_text,
-                    );
+                    let text_x = block.x + card_padding + card_icon_size + card_icon_gap;
+                    let text_y = block.y + card_padding + font_size;
+                    for (idx, line) in lines.iter().enumerate() {
+                        let baseline = text_y + card_line_height.saturating_mul(idx as u32);
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            line,
+                            text_x as f32,
+                            baseline as f32,
+                            font_size,
+                            font_weight_body,
+                            color_text,
+                        );
+                    }
                 }
             }
             BlockKind::FileCard {
@@ -1716,6 +2411,327 @@ fn render_png(
                     );
                 }
             }
+            BlockKind::Reply {
+                meta_lines,
+                body_lines,
+                missing,
+            } => {
+                let rect = Rect::from_xywh(
+                    block.x as f32,
+                    block.y as f32,
+                    block.width as f32,
+                    block.height as f32,
+                );
+                let rr = RRect::new_rect_xy(rect, 4.0, 4.0);
+                let mut bg = Paint::default();
+                bg.set_color4f(color_from_hex(0xFAFAFA), None);
+                bg.set_anti_alias(true);
+                canvas.draw_rrect(rr, &bg);
+                let mut accent = Paint::default();
+                accent.set_color4f(
+                    if missing {
+                        color_from_hex(0xC7C7CC)
+                    } else {
+                        color_border
+                    },
+                    None,
+                );
+                accent.set_anti_alias(true);
+                canvas.draw_rect(
+                    Rect::from_xywh(block.x as f32, block.y as f32, 3.0, block.height as f32),
+                    &accent,
+                );
+                let text_x = block.x + card_padding;
+                let mut baseline = block.y + card_padding + meta_size;
+                for line in meta_lines {
+                    draw_text_line(
+                        canvas,
+                        &font_collection,
+                        &mut emoji_cache,
+                        &line,
+                        text_x as f32,
+                        baseline as f32,
+                        meta_size,
+                        font_weight_body,
+                        color_meta,
+                    );
+                    baseline = baseline.saturating_add(file_meta_height);
+                }
+                baseline = baseline.saturating_add(file_meta_gap + meta_size);
+                for line in body_lines {
+                    draw_text_line(
+                        canvas,
+                        &font_collection,
+                        &mut emoji_cache,
+                        &line,
+                        text_x as f32,
+                        baseline as f32,
+                        meta_size,
+                        font_weight_body,
+                        color_from_hex(0x333333),
+                    );
+                    baseline = baseline.saturating_add(card_line_height);
+                }
+            }
+            BlockKind::Poke { image } => {
+                let rect = Rect::from_xywh(
+                    block.x as f32,
+                    block.y as f32,
+                    block.width as f32,
+                    block.height as f32,
+                );
+                if let Some(img) = image.as_ref().filter(|img| img.has_bytes()) {
+                    if let Some(decoded) = decode_image(img) {
+                        draw_image_cover_rounded(canvas, &decoded, rect, radius_lg as f32);
+                    }
+                } else {
+                    draw_text_line(
+                        canvas,
+                        &font_collection,
+                        &mut emoji_cache,
+                        "[戳一戳]",
+                        block.x as f32,
+                        (block.y + font_size) as f32,
+                        font_size,
+                        font_weight_body,
+                        color_text,
+                    );
+                }
+            }
+            BlockKind::JsonCard {
+                view,
+                title_lines,
+                desc_lines,
+                footer_line,
+                media,
+            } => {
+                let rect = Rect::from_xywh(
+                    block.x as f32,
+                    block.y as f32,
+                    block.width as f32,
+                    block.height as f32,
+                );
+                let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
+                draw_shadowed_rrect(canvas, rr, 2.0, 0.10);
+                let mut card_bg = Paint::default();
+                card_bg.set_color4f(color_white, None);
+                card_bg.set_anti_alias(true);
+                canvas.draw_rrect(rr, &card_bg);
+                let mut border = Paint::default();
+                border.set_color4f(color_border, None);
+                border.set_style(skia_safe::paint::Style::Stroke);
+                border.set_stroke_width(1.0);
+                border.set_anti_alias(true);
+                canvas.draw_rrect(rr, &border);
+
+                let vertical_media = json_card_uses_vertical_media(&view);
+                let side_y = block.y + card_padding;
+                let qr_x = view
+                    .jump_url
+                    .as_ref()
+                    .map(|_| block.x + block.width.saturating_sub(card_padding + 48));
+                if let (Some(url), Some(x)) = (view.jump_url.as_deref(), qr_x) {
+                    draw_qr_code(
+                        canvas,
+                        url,
+                        Rect::from_xywh(x as f32, side_y as f32, 48.0, 48.0),
+                        color_white,
+                        color_text,
+                    );
+                }
+
+                if vertical_media {
+                    let text_x = block.x + card_padding;
+                    let mut baseline = block.y + card_padding + font_size;
+                    for line in title_lines {
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            &line,
+                            text_x as f32,
+                            baseline as f32,
+                            font_size,
+                            font_weight_title,
+                            color_text,
+                        );
+                        baseline = baseline.saturating_add(card_line_height);
+                    }
+                    for line in desc_lines {
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            &line,
+                            text_x as f32,
+                            baseline as f32,
+                            meta_size,
+                            font_weight_body,
+                            color_meta,
+                        );
+                        baseline = baseline.saturating_add(file_meta_height);
+                    }
+                    if let Some(line) = footer_line {
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            &line,
+                            text_x as f32,
+                            baseline as f32,
+                            meta_size,
+                            font_weight_body,
+                            color_muted,
+                        );
+                        baseline = baseline.saturating_add(file_meta_height);
+                    }
+
+                    if let Some(img) = media.as_ref().filter(|img| img.has_bytes()) {
+                        if let Some(decoded) = decode_image(img) {
+                            let preview_y = (block.y + card_padding)
+                                .saturating_add(
+                                    (baseline.saturating_sub(block.y + card_padding))
+                                        .max(if qr_x.is_some() { 48 } else { 0 }),
+                                )
+                                .saturating_add(card_padding);
+                            let preview_h = block
+                                .y
+                                .saturating_add(block.height)
+                                .saturating_sub(card_padding)
+                                .saturating_sub(preview_y)
+                                .max(1);
+                            draw_image_cover_rounded(
+                                canvas,
+                                &decoded,
+                                Rect::from_xywh(
+                                    (block.x + card_padding) as f32,
+                                    preview_y as f32,
+                                    block.width.saturating_sub(card_padding * 2) as f32,
+                                    preview_h as f32,
+                                ),
+                                6.0,
+                            );
+                        }
+                    }
+                } else {
+                    let mut text_x = block.x + card_padding;
+                    if let Some(img) = media.as_ref().filter(|img| img.has_bytes()) {
+                        if let Some(decoded) = decode_image(img) {
+                            draw_image_cover_rounded(
+                                canvas,
+                                &decoded,
+                                Rect::from_xywh(text_x as f32, side_y as f32, 48.0, 48.0),
+                                4.0,
+                            );
+                            text_x = text_x.saturating_add(56);
+                        }
+                    }
+
+                    let mut baseline = block.y + card_padding + font_size;
+                    for line in title_lines {
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            &line,
+                            text_x as f32,
+                            baseline as f32,
+                            font_size,
+                            font_weight_title,
+                            color_text,
+                        );
+                        baseline = baseline.saturating_add(card_line_height);
+                    }
+                    for line in desc_lines {
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            &line,
+                            text_x as f32,
+                            baseline as f32,
+                            meta_size,
+                            font_weight_body,
+                            color_meta,
+                        );
+                        baseline = baseline.saturating_add(file_meta_height);
+                    }
+                    if let Some(line) = footer_line {
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            &line,
+                            text_x as f32,
+                            baseline as f32,
+                            meta_size,
+                            font_weight_body,
+                            color_muted,
+                        );
+                    }
+                }
+            }
+            BlockKind::Forward { items } => {
+                let title = "合并转发聊天记录";
+                let title_y = block.y + card_padding + meta_size;
+                draw_text_line(
+                    canvas,
+                    &font_collection,
+                    &mut emoji_cache,
+                    title,
+                    block.x as f32,
+                    title_y as f32,
+                    meta_size,
+                    font_weight_body,
+                    color_meta,
+                );
+                let left = block.x + 2;
+                let top = title_y + file_meta_gap;
+                let mut accent = Paint::default();
+                accent.set_color4f(color_from_hex(0x71A1CC), None);
+                accent.set_anti_alias(true);
+                canvas.draw_rect(
+                    Rect::from_xywh(
+                        left as f32,
+                        top as f32,
+                        3.0,
+                        block.height.saturating_sub(card_padding + card_line_height) as f32,
+                    ),
+                    &accent,
+                );
+                let text_x = left + card_padding;
+                let mut baseline = top + card_line_height;
+                for item in items {
+                    if let Some(sender) = item.sender.as_ref() {
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            sender,
+                            text_x as f32,
+                            baseline as f32,
+                            meta_size,
+                            font_weight_title,
+                            color_meta,
+                        );
+                        baseline = baseline.saturating_add(card_line_height);
+                    }
+                    for line in item.lines {
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            &line,
+                            text_x as f32,
+                            baseline as f32,
+                            meta_size,
+                            font_weight_body,
+                            color_text,
+                        );
+                        baseline = baseline.saturating_add(card_line_height);
+                    }
+                }
+            }
         }
     }
 
@@ -1743,6 +2759,17 @@ fn render_png(
     Ok(data.as_bytes().to_vec())
 }
 
+pub fn render_preview_png(
+    draft: &Draft,
+    header: RenderPreviewHeader,
+    config: &RendererRuntimeConfig,
+) -> Result<Vec<u8>, String> {
+    let header = HeaderInfo::from(header);
+    let draft = expand_embedded_forward_draft(draft);
+    let image_sources = render_preview_image_sources(&draft);
+    render_png(&draft, &header, &image_sources, config)
+}
+
 fn color_from_hex(hex: u32) -> Color4f {
     let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
     let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
@@ -1763,14 +2790,14 @@ fn draw_watermark_layer(
     let angle = -24f32;
     let font_size = 40u32;
     let font_weight = 400u32;
-    let tile = 480f32;
+    let tile = 320f32;
     let jitter = 10f32;
     let color = Color4f::new(0.0, 0.0, 0.0, opacity);
 
     let mut rng = DeterministicRng::new(watermark_seed(header, text));
     let cols = ((width as f32) / tile).ceil().max(1.0) as i32 + 1;
     let rows = ((height as f32) / tile).ceil().max(1.0) as i32 + 1;
-    let first_cx = width as f32 * 0.5 - ((cols - 1) as f32 * tile) * 0.5;
+    let first_cx = width as f32 * 0.5 - ((cols - 1) as f32 * tile) * 0.5 + 120.0;
     let first_cy = height as f32 * 0.5 - ((rows - 1) as f32 * tile) * 0.5;
 
     for row in 0..rows {
@@ -2160,6 +3187,40 @@ fn draw_shadowed_rrect(canvas: &Canvas, rr: RRect, blur: f32, alpha: f32) {
     }
 }
 
+fn draw_qr_code(canvas: &Canvas, text: &str, dst: Rect, bg: Color4f, fg: Color4f) {
+    let Ok(code) = QrCode::new(text.as_bytes()) else {
+        return;
+    };
+    let mut bg_paint = Paint::default();
+    bg_paint.set_color4f(bg, None);
+    bg_paint.set_anti_alias(true);
+    canvas.draw_rect(dst, &bg_paint);
+
+    let width = code.width().max(1) as f32;
+    let module = (dst.width().min(dst.height()) / width).max(1.0);
+    let qr_size = module * width;
+    let origin_x = dst.x() + (dst.width() - qr_size) * 0.5;
+    let origin_y = dst.y() + (dst.height() - qr_size) * 0.5;
+    let mut fg_paint = Paint::default();
+    fg_paint.set_color4f(fg, None);
+    fg_paint.set_anti_alias(false);
+    for y in 0..code.width() {
+        for x in 0..code.width() {
+            if code[(x, y)] == QrColor::Dark {
+                canvas.draw_rect(
+                    Rect::from_xywh(
+                        origin_x + x as f32 * module,
+                        origin_y + y as f32 * module,
+                        module,
+                        module,
+                    ),
+                    &fg_paint,
+                );
+            }
+        }
+    }
+}
+
 fn draw_text_line(
     canvas: &Canvas,
     font_collection: &FontCollection,
@@ -2393,6 +3454,38 @@ async fn resolve_image_sources(
         },
         used_keys,
     )
+}
+
+fn render_preview_image_sources(draft: &Draft) -> RenderImageSources {
+    let mut image_cache = ImageMemoryCache::default();
+    let mut block_images = vec![None; draft.blocks.len()];
+    let mut block_labels = vec![None; draft.blocks.len()];
+
+    for (idx, block) in draft.blocks.iter().enumerate() {
+        let DraftBlock::Attachment {
+            kind, reference, ..
+        } = block
+        else {
+            continue;
+        };
+        match reference {
+            MediaReference::RemoteUrl { url } if is_renderable_image(*kind) => {
+                if !is_remote_http(url) {
+                    block_images[idx] = image_cache.get_or_load_source(url);
+                }
+            }
+            MediaReference::RemoteUrl { url } => {
+                block_labels[idx] = Some(url.clone());
+            }
+            MediaReference::Blob { .. } => {}
+        }
+    }
+
+    RenderImageSources {
+        avatar: image_cache.get_or_load_source(DEFAULT_AVATAR_PATH),
+        block_images,
+        block_labels,
+    }
 }
 
 fn resolve_media_reference_for_image(

@@ -11,7 +11,10 @@ use oqqwall_rust_core::command::{
     GlobalAction, GlobalActionBatchCommand, GlobalActionCommand, ReviewAction,
     ReviewActionBatchCommand, ReviewActionCommand, ShortcutScope,
 };
-use oqqwall_rust_core::draft::{IngressAttachment, IngressMessage, MediaKind, MediaReference};
+use oqqwall_rust_core::draft::{
+    IngressAttachment, IngressMessage, MediaKind, MediaReference, ReplyPreview, json_card_marker,
+    poke_marker, reply_marker,
+};
 use oqqwall_rust_core::event::{
     BlobEvent, DraftEvent, Event, IngressEvent, InputStatusKind, MediaEvent, ReviewDecision,
     ReviewEvent, ScheduleEvent, SendEvent, SendPriority,
@@ -184,6 +187,19 @@ struct SuppressionEntry {
     expire_at_ms: i64,
 }
 
+#[derive(Debug, Clone)]
+struct BufferedMessage {
+    message: Value,
+}
+
+#[derive(Debug, Clone)]
+struct SubmissionSession {
+    messages: Vec<BufferedMessage>,
+    started_at_ms: i64,
+    group_id: String,
+    confirming: bool,
+}
+
 #[derive(Default)]
 struct NapCatState {
     review_info: HashMap<ReviewId, ReviewInfo>,
@@ -205,6 +221,7 @@ struct NapCatState {
     pending: HashMap<String, PendingAction>,
     friend_req_cache: HashMap<String, i64>,
     friend_suppression: HashMap<String, Vec<SuppressionEntry>>,
+    submission_sessions: HashMap<String, SubmissionSession>,
     blob_paths: HashMap<BlobId, String>,
     next_echo: u64,
 }
@@ -2372,6 +2389,188 @@ async fn parse_inbound_event(
 
     if message_type == "private" {
         let raw_message = value.get("raw_message").and_then(|v| v.as_str());
+        let raw_trimmed = raw_message.unwrap_or("").trim();
+
+        if raw_trimmed == "#开始投稿" {
+            {
+                let mut guard = state.lock().await;
+                guard.submission_sessions.insert(
+                    user_id.clone(),
+                    SubmissionSession {
+                        messages: Vec::new(),
+                        started_at_ms: timestamp_ms,
+                        group_id: runtime.group_id.clone(),
+                        confirming: false,
+                    },
+                );
+            }
+            send_private_text(
+                out_tx,
+                &user_id,
+                "投稿会话已开始，请发送稿件内容。完成后发送 #结束投稿",
+            )
+            .await;
+            return None;
+        }
+
+        {
+            let mut guard = state.lock().await;
+            if guard.submission_sessions.contains_key(&user_id) {
+                if raw_trimmed == "#结束投稿" {
+                    let count = guard
+                        .submission_sessions
+                        .get_mut(&user_id)
+                        .map(|session| {
+                            session.confirming = true;
+                            session.messages.len()
+                        })
+                        .unwrap_or(0);
+                    drop(guard);
+                    send_private_text(
+                        out_tx,
+                        &user_id,
+                        &format!(
+                            "收到共 {} 条消息。\n发送 #确认 提交投稿\n发送 #追加 继续添加内容\n发送 #取消 放弃本次投稿",
+                            count
+                        ),
+                    )
+                    .await;
+                    return None;
+                }
+                if raw_trimmed == "#取消" {
+                    guard.submission_sessions.remove(&user_id);
+                    drop(guard);
+                    send_private_text(out_tx, &user_id, "投稿已取消。").await;
+                    return None;
+                }
+                if raw_trimmed == "#确认" {
+                    let Some(session_meta) = guard.submission_sessions.get(&user_id) else {
+                        return None;
+                    };
+                    if !session_meta.confirming {
+                        drop(guard);
+                        send_private_text(out_tx, &user_id, "请先发送 #结束投稿 再确认。").await;
+                        return None;
+                    }
+                    if session_meta.messages.is_empty() {
+                        guard.submission_sessions.remove(&user_id);
+                        drop(guard);
+                        send_private_text(out_tx, &user_id, "没有可提交的内容。").await;
+                        return None;
+                    }
+
+                    let session = guard
+                        .submission_sessions
+                        .remove(&user_id)
+                        .expect("submission session exists");
+                    let first_msg_id =
+                        value_opt_to_string(session.messages[0].message.get("message_id"))
+                            .unwrap_or_else(|| format!("submission-{}", session.started_at_ms));
+                    let sender_name = extract_sender_name(&session.messages[0].message)
+                        .or_else(|| Some(user_id.clone()));
+                    let chat_id = format!("{}_submission_{}", user_id, session.started_at_ms);
+                    let mut combined_text = String::new();
+                    let mut combined_attachments = Vec::new();
+                    let mut combined_summary = String::new();
+                    for buffered in &session.messages {
+                        let ExtractedMessage {
+                            text,
+                            summary_text,
+                            attachments,
+                        } = extract_message_lite(buffered.message.get("message"));
+                        if !text.trim().is_empty() {
+                            if !combined_text.is_empty() {
+                                combined_text.push_str("\n\n");
+                            }
+                            combined_text.push_str(text.trim());
+                        }
+                        if !summary_text.trim().is_empty() {
+                            if !combined_summary.is_empty() {
+                                combined_summary.push_str("\n\n");
+                            }
+                            combined_summary.push_str(summary_text.trim());
+                        }
+                        combined_attachments.extend(attachments);
+                    }
+                    if combined_summary.is_empty() {
+                        combined_summary = format!("[{} 条投稿消息]", session.messages.len());
+                    }
+                    let ingress_id = derive_ingress_id(&[
+                        self_id.as_bytes(),
+                        chat_id.as_bytes(),
+                        user_id.as_bytes(),
+                        first_msg_id.as_bytes(),
+                    ]);
+                    guard.pending_summary.insert(ingress_id, combined_summary);
+                    let count = session.messages.len();
+                    let group_id = session.group_id;
+                    let started_at_ms = session.started_at_ms;
+                    drop(guard);
+                    send_private_text(
+                        out_tx,
+                        &user_id,
+                        &format!("投稿已提交，共 {} 条消息，请等待审核。", count),
+                    )
+                    .await;
+                    return Some(Command::Ingress(IngressCommand {
+                        profile_id: self_id,
+                        chat_id,
+                        user_id: user_id.clone(),
+                        sender_name,
+                        group_id,
+                        platform_msg_id: first_msg_id,
+                        message: IngressMessage {
+                            text: combined_text,
+                            attachments: combined_attachments,
+                        },
+                        received_at_ms: started_at_ms,
+                        close_immediately: true,
+                    }));
+                }
+                if raw_trimmed == "#追加" {
+                    if let Some(session) = guard.submission_sessions.get_mut(&user_id) {
+                        session.confirming = false;
+                    }
+                    drop(guard);
+                    send_private_text(
+                        out_tx,
+                        &user_id,
+                        "继续投稿，请发送更多内容。完成后发送 #结束投稿",
+                    )
+                    .await;
+                    return None;
+                }
+                if guard
+                    .submission_sessions
+                    .get(&user_id)
+                    .map(|session| session.confirming)
+                    .unwrap_or(false)
+                {
+                    drop(guard);
+                    send_private_text(out_tx, &user_id, "请先发送 #确认、#取消 或 #追加。").await;
+                    return None;
+                }
+                let count = guard
+                    .submission_sessions
+                    .get_mut(&user_id)
+                    .map(|session| {
+                        session.messages.push(BufferedMessage {
+                            message: value.clone(),
+                        });
+                        session.messages.len()
+                    })
+                    .unwrap_or(0);
+                drop(guard);
+                send_private_text(
+                    out_tx,
+                    &user_id,
+                    &format!("已收到第 {} 条消息。继续发送或发送 #结束投稿 完成。", count),
+                )
+                .await;
+                return None;
+            }
+        }
+
         if let Some(raw_message) = raw_message {
             if is_auto_reply_message(raw_message) {
                 debug_log!("napcat inbound ignored private system message");
@@ -2426,6 +2625,7 @@ async fn parse_inbound_event(
             platform_msg_id: message_id,
             message: IngressMessage { text, attachments },
             received_at_ms: timestamp_ms,
+            close_immediately: false,
         }));
     }
 
@@ -2815,10 +3015,7 @@ fn extract_message_chunks<'a>(
                             if let Some(reference) = extract_reference(data) {
                                 attachments.push(IngressAttachment {
                                     kind,
-                                    name: data
-                                        .and_then(|d| d.get("name"))
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string()),
+                                    name: attachment_name_from_data(data),
                                     reference,
                                     size_bytes: extract_attachment_size(data),
                                 });
@@ -2831,14 +3028,11 @@ fn extract_message_chunks<'a>(
                                 attachments.push(IngressAttachment {
                                     kind: match segment_type {
                                         "video" => MediaKind::Video,
-                                        "file" => MediaKind::File,
+                                        "file" => file_segment_kind(data),
                                         "record" => MediaKind::Audio,
                                         _ => MediaKind::Other,
                                     },
-                                    name: data
-                                        .and_then(|d| d.get("name"))
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string()),
+                                    name: attachment_name_from_data(data),
                                     reference,
                                     size_bytes: extract_attachment_size(data),
                                 });
@@ -2989,11 +3183,20 @@ pub(crate) fn extract_message_lite(value: Option<&Value>) -> ExtractedMessage {
                         }
                     }
                     "reply" => {
-                        if let Some(id) = data.and_then(|d| d.get("id")).and_then(value_to_string) {
-                            text.push_str(&format!("[回复:{}]", id));
+                        let id = data.and_then(|d| d.get("id")).and_then(value_to_string);
+                        let body = id
+                            .as_ref()
+                            .map(|id| format!("引用的消息 ID: {}", id))
+                            .unwrap_or_else(|| "引用的消息".to_string());
+                        text.push_str(&reply_marker(&ReplyPreview {
+                            id: id.clone(),
+                            meta: None,
+                            body,
+                            missing: false,
+                        }));
+                        if let Some(id) = id {
                             summary_text.push_str(&format!("[回复:{}]", id));
                         } else {
-                            text.push_str("[回复]");
                             summary_text.push_str("[回复]");
                         }
                     }
@@ -3006,7 +3209,12 @@ pub(crate) fn extract_message_lite(value: Option<&Value>) -> ExtractedMessage {
                         }
                     }
                     "json" => {
-                        text.push_str("[卡片]");
+                        let raw = data
+                            .and_then(|d| d.get("data"))
+                            .and_then(value_to_string)
+                            .or_else(|| data.and_then(|d| serde_json::to_string(d).ok()))
+                            .unwrap_or_default();
+                        text.push_str(&json_card_marker(&raw));
                         summary_text.push_str("[卡片]");
                     }
                     "forward" => {
@@ -3019,7 +3227,7 @@ pub(crate) fn extract_message_lite(value: Option<&Value>) -> ExtractedMessage {
                         }
                     }
                     "poke" => {
-                        text.push_str("[戳一戳]");
+                        text.push_str(poke_marker());
                         summary_text.push_str("[戳一戳]");
                     }
                     "image" => {
@@ -3027,10 +3235,7 @@ pub(crate) fn extract_message_lite(value: Option<&Value>) -> ExtractedMessage {
                         if let Some(reference) = extract_reference(data) {
                             attachments.push(IngressAttachment {
                                 kind,
-                                name: data
-                                    .and_then(|d| d.get("name"))
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string()),
+                                name: attachment_name_from_data(data),
                                 reference,
                                 size_bytes: extract_attachment_size(data),
                             });
@@ -3047,14 +3252,11 @@ pub(crate) fn extract_message_lite(value: Option<&Value>) -> ExtractedMessage {
                             attachments.push(IngressAttachment {
                                 kind: match segment_type {
                                     "video" => MediaKind::Video,
-                                    "file" => MediaKind::File,
+                                    "file" => file_segment_kind(data),
                                     "record" => MediaKind::Audio,
                                     _ => MediaKind::Other,
                                 },
-                                name: data
-                                    .and_then(|d| d.get("name"))
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string()),
+                                name: attachment_name_from_data(data),
                                 reference,
                                 size_bytes: extract_attachment_size(data),
                             });
@@ -3088,6 +3290,51 @@ fn image_sub_type(data: Option<&Value>) -> Option<i64> {
         data.get("sub_type")
             .or_else(|| data.get("subType"))
             .or_else(|| data.get("subtype")),
+    )
+}
+
+fn file_segment_kind(data: Option<&Value>) -> MediaKind {
+    let mime_is_image = data
+        .and_then(|data| data.get("mime").or_else(|| data.get("mime_type")))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .is_some_and(|value| value.starts_with("image/"));
+    if mime_is_image
+        || attachment_name_from_data(data)
+            .as_deref()
+            .is_some_and(is_image_filename)
+    {
+        MediaKind::Image
+    } else {
+        MediaKind::File
+    }
+}
+
+fn attachment_name_from_data(data: Option<&Value>) -> Option<String> {
+    let data = data?;
+    ["name", "file_name", "filename", "file", "path", "url"]
+        .iter()
+        .find_map(|key| data.get(*key).and_then(value_to_string))
+        .map(|value| filename_from_reference(&value))
+        .filter(|value| !value.is_empty())
+}
+
+fn filename_from_reference(value: &str) -> String {
+    let trimmed = value.trim().trim_start_matches("file://");
+    let without_query = trimmed.split('?').next().unwrap_or(trimmed);
+    without_query
+        .rsplit('/')
+        .next()
+        .unwrap_or(without_query)
+        .trim()
+        .to_string()
+}
+
+fn is_image_filename(value: &str) -> bool {
+    let normalized = filename_from_reference(value).to_ascii_lowercase();
+    matches!(
+        normalized.rsplit('.').next(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp")
     )
 }
 
@@ -4455,6 +4702,17 @@ async fn send_group_text(out_tx: &mpsc::Sender<String>, group_id: &str, text: &s
     let _ = out_tx.send(payload.to_string()).await;
 }
 
+async fn send_private_text(out_tx: &mpsc::Sender<String>, user_id: &str, text: &str) {
+    let payload = serde_json::json!({
+        "action": "send_private_msg",
+        "params": {
+            "user_id": json_id(user_id),
+            "message": [{"type": "text", "data": {"text": text}}]
+        }
+    });
+    let _ = out_tx.send(payload.to_string()).await;
+}
+
 fn value_to_string(value: &Value) -> Option<String> {
     match value {
         Value::String(s) => Some(s.clone()),
@@ -4872,6 +5130,34 @@ mod tests {
                 serde_json::json!({"type": "face", "data": {"id": "56"}}),
                 serde_json::json!({"type": "text", "data": {"text": "!"}}),
             ]
+        );
+    }
+
+    #[test]
+    fn file_segment_kind_treats_image_files_as_images() {
+        let image_file = serde_json::json!({
+            "file": "/tmp/photo.png",
+            "file_size": 32
+        });
+        let image_mime = serde_json::json!({
+            "name": "download.bin",
+            "mime": "image/webp"
+        });
+        let text_file = serde_json::json!({
+            "url": "file:///tmp/readme.txt",
+            "file_size": 64
+        });
+
+        assert_eq!(file_segment_kind(Some(&image_file)), MediaKind::Image);
+        assert_eq!(
+            attachment_name_from_data(Some(&image_file)).as_deref(),
+            Some("photo.png")
+        );
+        assert_eq!(file_segment_kind(Some(&image_mime)), MediaKind::Image);
+        assert_eq!(file_segment_kind(Some(&text_file)), MediaKind::File);
+        assert_eq!(
+            attachment_name_from_data(Some(&text_file)).as_deref(),
+            Some("readme.txt")
         );
     }
 

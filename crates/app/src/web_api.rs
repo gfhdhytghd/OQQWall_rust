@@ -16,8 +16,9 @@ use oqqwall_rust_core::event::{BlobEvent, DraftEvent, IngressEvent, MediaEvent, 
 use oqqwall_rust_core::state::PostStage;
 use oqqwall_rust_core::{
     Command, GlobalAction, GlobalActionCommand, Id128, IngressAttachment, IngressCommand,
-    IngressMessage, MediaKind, MediaReference, ReviewAction, ReviewActionCommand, StateView,
-    derive_blob_id, derive_ingress_id, derive_post_id, derive_session_id,
+    IngressMessage, MediaKind, MediaReference, ReplyPreview, ReviewAction, ReviewActionCommand,
+    StateView, build_draft_from_messages, derive_blob_id, derive_ingress_id, derive_post_id,
+    derive_session_id, forward_marker, json_card_marker, poke_marker, reply_marker,
 };
 use oqqwall_rust_drivers::avatar_cache;
 use oqqwall_rust_drivers::napcat::{
@@ -1006,6 +1007,7 @@ async fn create_post(
             platform_msg_id,
             message: normalized_message,
             received_at_ms,
+            close_immediately: false,
         });
     }
     let Some(first_platform_msg_id) = first_platform_msg_id else {
@@ -1300,6 +1302,7 @@ async fn create_rendered_post(
     let draft = oqqwall_rust_core::draft::Draft {
         blocks: vec![oqqwall_rust_core::draft::DraftBlock::Attachment {
             kind: oqqwall_rust_core::draft::MediaKind::Image,
+            name: Some(format!("rendered.{}", ext)),
             reference: oqqwall_rust_core::draft::MediaReference::Blob { blob_id },
             size_bytes: Some(attachment_size),
         }],
@@ -1463,6 +1466,7 @@ async fn get_post(
                         kind,
                         reference,
                         size_bytes,
+                        ..
                     } => {
                         let (reference_type, reference) = match reference {
                             oqqwall_rust_core::draft::MediaReference::RemoteUrl { url } => {
@@ -1479,6 +1483,18 @@ async fn get_post(
                             size_bytes: *size_bytes,
                         }
                     }
+                    oqqwall_rust_core::draft::DraftBlock::Reply { preview } => PostBlock::Text {
+                        text: format!("[回复] {}", preview.body),
+                    },
+                    oqqwall_rust_core::draft::DraftBlock::Poke => PostBlock::Text {
+                        text: "[戳一戳]".to_string(),
+                    },
+                    oqqwall_rust_core::draft::DraftBlock::JsonCard { .. } => PostBlock::Text {
+                        text: "[卡片]".to_string(),
+                    },
+                    oqqwall_rust_core::draft::DraftBlock::Forward { items } => PostBlock::Text {
+                        text: format!("[合并转发:{}条]", items.len()),
+                    },
                 })
                 .collect::<Vec<_>>()
         })
@@ -2565,10 +2581,54 @@ fn value_to_string(value: &Value) -> Option<String> {
 }
 
 fn parse_name(data: Option<&serde_json::Map<String, Value>>) -> Option<String> {
-    data.and_then(|map| map.get("name"))
-        .and_then(value_to_string)
-        .map(|v| v.trim().to_string())
+    let data = data?;
+    ["name", "file_name", "filename", "file", "path", "url"]
+        .iter()
+        .find_map(|key| data.get(*key).and_then(value_to_string))
+        .map(|value| filename_from_reference(&value))
         .filter(|v| !v.is_empty())
+}
+
+fn media_kind_for_segment(
+    segment_type: &str,
+    data: Option<&serde_json::Map<String, Value>>,
+) -> MediaKind {
+    match segment_type {
+        "video" => MediaKind::Video,
+        "record" => MediaKind::Audio,
+        "file" => {
+            let mime_is_image = data
+                .and_then(|map| map.get("mime").or_else(|| map.get("mime_type")))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|value| value.starts_with("image/"));
+            if mime_is_image || parse_name(data).as_deref().is_some_and(is_image_filename) {
+                MediaKind::Image
+            } else {
+                MediaKind::File
+            }
+        }
+        _ => MediaKind::Other,
+    }
+}
+
+fn filename_from_reference(value: &str) -> String {
+    let trimmed = value.trim().trim_start_matches("file://");
+    let without_query = trimmed.split('?').next().unwrap_or(trimmed);
+    without_query
+        .rsplit('/')
+        .next()
+        .unwrap_or(without_query)
+        .trim()
+        .to_string()
+}
+
+fn is_image_filename(value: &str) -> bool {
+    let normalized = filename_from_reference(value).to_ascii_lowercase();
+    matches!(
+        normalized.rsplit('.').next(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp")
+    )
 }
 
 fn normalize_segments(
@@ -2692,12 +2752,7 @@ fn normalize_segments(
                 };
                 match extract_media_reference(data, fallback_mime) {
                     Ok((reference, size_bytes)) => attachments.push(IngressAttachment {
-                        kind: match segment_type {
-                            "video" => MediaKind::Video,
-                            "file" => MediaKind::File,
-                            "record" => MediaKind::Audio,
-                            _ => MediaKind::Other,
-                        },
+                        kind: media_kind_for_segment(segment_type, Some(data)),
                         name: parse_name(Some(data)),
                         reference,
                         size_bytes,
@@ -2717,19 +2772,40 @@ fn normalize_segments(
                 let reply_id = data
                     .and_then(|map| map.get("id"))
                     .and_then(value_to_string)
-                    .unwrap_or_else(|| "unknown".to_string());
-                text.push_str(&format!("[回复:{}]", reply_id));
+                    .filter(|value| !value.trim().is_empty());
+                let body = reply_id
+                    .as_ref()
+                    .map(|id| format!("引用的消息 ID: {}", id))
+                    .unwrap_or_else(|| "引用的消息".to_string());
+                text.push_str(&reply_marker(&ReplyPreview {
+                    id: reply_id,
+                    meta: None,
+                    body,
+                    missing: false,
+                }));
             }
             "forward" => {
-                let forward_id = data.and_then(|map| map.get("id")).and_then(value_to_string);
-                if let Some(forward_id) = forward_id {
+                if let Some(items) = data.and_then(normalize_forward_items) {
+                    text.push_str(&forward_marker(&items));
+                } else if let Some(forward_id) =
+                    data.and_then(|map| map.get("id")).and_then(value_to_string)
+                {
                     text.push_str(&format!("[合并转发:{}]", forward_id));
                 } else {
                     text.push_str("[合并转发]");
                 }
             }
-            "json" => text.push_str("[卡片]"),
-            "poke" => text.push_str("[戳一戳]"),
+            "json" => {
+                let raw = data
+                    .and_then(|map| map.get("data"))
+                    .and_then(value_to_string)
+                    .or_else(|| {
+                        data.and_then(|map| serde_json::to_string(&Value::Object(map.clone())).ok())
+                    })
+                    .unwrap_or_default();
+                text.push_str(&json_card_marker(&raw));
+            }
+            "poke" => text.push_str(poke_marker()),
             other => fold_unknown_segment(
                 normalization,
                 warnings,
@@ -2745,6 +2821,44 @@ fn normalize_segments(
         text: text.trim().to_string(),
         attachments,
     }
+}
+
+fn normalize_forward_items(
+    data: &serde_json::Map<String, Value>,
+) -> Option<Vec<oqqwall_rust_core::ForwardItem>> {
+    let list = data
+        .get("messages")
+        .or_else(|| data.get("content"))
+        .and_then(Value::as_array)?;
+    let mut out = Vec::new();
+    for item in list {
+        let Some(item_obj) = item.as_object() else {
+            continue;
+        };
+        let sender_name = item_obj
+            .get("sender")
+            .and_then(Value::as_object)
+            .and_then(|sender| {
+                sender
+                    .get("nickname")
+                    .or_else(|| sender.get("card"))
+                    .and_then(value_to_string)
+            })
+            .or_else(|| item_obj.get("sender_name").and_then(value_to_string))
+            .or_else(|| item_obj.get("nickname").and_then(value_to_string));
+        let Some(message) = item_obj.get("message").and_then(Value::as_array) else {
+            continue;
+        };
+        let mut normalization = CreatePostNormalization::default();
+        let mut warnings = Vec::new();
+        let ingress = normalize_segments(message, &mut normalization, &mut warnings, 0);
+        let draft = build_draft_from_messages(&[ingress]);
+        out.push(oqqwall_rust_core::ForwardItem {
+            sender_name,
+            blocks: draft.blocks,
+        });
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 fn extract_media_reference(
@@ -3179,6 +3293,39 @@ mod tests {
         assert!(warnings.is_empty());
         assert_eq!(normalization.invalid_segments_folded, 0);
         assert_eq!(normalization.unknown_segments, 0);
+    }
+
+    #[test]
+    fn normalize_segments_treats_image_file_as_image() {
+        let mut normalization = CreatePostNormalization::default();
+        let mut warnings = Vec::new();
+        let message = normalize_segments(
+            &[
+                json!({
+                    "type": "file",
+                    "data": {
+                        "url": "file:///tmp/photo.webp",
+                        "file_size": 32
+                    }
+                }),
+                json!({
+                    "type": "file",
+                    "data": {
+                        "url": "file:///tmp/readme.txt",
+                        "file_size": 64
+                    }
+                }),
+            ],
+            &mut normalization,
+            &mut warnings,
+            0,
+        );
+        assert_eq!(message.attachments.len(), 2);
+        assert_eq!(message.attachments[0].kind, MediaKind::Image);
+        assert_eq!(message.attachments[0].name.as_deref(), Some("photo.webp"));
+        assert_eq!(message.attachments[1].kind, MediaKind::File);
+        assert_eq!(message.attachments[1].name.as_deref(), Some("readme.txt"));
+        assert!(warnings.is_empty());
     }
 
     #[test]

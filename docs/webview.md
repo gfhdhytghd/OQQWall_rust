@@ -94,15 +94,22 @@ WebView 前端目录：`crates/app/webview-ui`
 
 ```bash
 cd crates/app/webview-ui
-npm install
-npm run dev
+bun install
+bun run dev
+```
+
+开发服务器只提供前端资源；`/auth/*` 和 `/api/*` 会代理到内置 WebView 后端，默认目标为
+`http://127.0.0.1:10924`。如果后端端口不同：
+
+```bash
+VITE_WEBVIEW_BACKEND=http://127.0.0.1:<port> bun run dev
 ```
 
 生产构建（生成 dist）：
 
 ```bash
 cd crates/app/webview-ui
-npm run build
+bun run build
 ```
 
 Rust 构建时会读取 `crates/app/webview-ui/dist` 并嵌入二进制（`crates/app/build.rs`）。
@@ -138,5 +145,5 @@ Rust 构建时会读取 `crates/app/webview-ui/dist` 并嵌入二进制（`crate
 - 检查帖子/blob 是否属于当前账号授权组
 
 5. 构建后页面仍旧
-- 重新执行 `npm run build`
+- 重新执行 `bun run build`
 - 重新 `cargo build`，确保新 dist 被重新嵌入

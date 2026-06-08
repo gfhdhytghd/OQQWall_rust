@@ -99,6 +99,9 @@ fn session_due_at_ms(
         .get(&meta.last_ingress_id)
         .map(|meta| meta.received_at_ms)?;
     let wait_ms = config.process_waittime_ms(&meta.key.group_id);
+    if meta.close_at_ms <= last_message_ms {
+        return Some(last_message_ms);
+    }
 
     let Some(input_status) = state.input_status.get(&meta.key) else {
         return Some(last_message_ms.saturating_add(wait_ms.saturating_mul(2)));

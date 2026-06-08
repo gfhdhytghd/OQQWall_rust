@@ -51,6 +51,7 @@ fn tick_closes_session_and_creates_draft() {
             }],
         },
         received_at_ms: 1_000,
+        close_immediately: false,
     };
 
     let mut state = StateView::default();
@@ -92,6 +93,60 @@ fn tick_closes_session_and_creates_draft() {
     assert!(saw_close);
     assert!(saw_draft);
     assert!(saw_render);
+}
+
+#[test]
+fn tick_closes_explicit_immediate_session_without_waiting() {
+    let mut config = CoreConfig::default();
+    config.default_process_waittime_ms = 60_000;
+    config.groups.insert(
+        "group-a".to_string(),
+        GroupConfig {
+            group_id: "group-a".to_string(),
+            ..Default::default()
+        },
+    );
+
+    let ingress = IngressCommand {
+        profile_id: "bot".to_string(),
+        chat_id: "chat".to_string(),
+        user_id: "user".to_string(),
+        sender_name: None,
+        group_id: "group-a".to_string(),
+        platform_msg_id: "msg-1".to_string(),
+        message: IngressMessage {
+            text: "confirmed submission".to_string(),
+            attachments: Vec::new(),
+        },
+        received_at_ms: 1_000,
+        close_immediately: true,
+    };
+
+    let mut state = StateView::default();
+    let events = decide(&state, &Command::Ingress(ingress), &config);
+    for (idx, event) in events.into_iter().enumerate() {
+        state = state.reduce(&wrap(event, idx as u128 + 1));
+    }
+
+    let tick_events = decide(
+        &state,
+        &Command::Tick(TickCommand {
+            now_ms: 1_000,
+            tz_offset_minutes: 0,
+        }),
+        &config,
+    );
+
+    assert!(
+        tick_events
+            .iter()
+            .any(|event| matches!(event, Event::Session(SessionEvent::Closed { .. })))
+    );
+    assert!(
+        tick_events
+            .iter()
+            .any(|event| matches!(event, Event::Draft(DraftEvent::PostDraftCreated { .. })))
+    );
 }
 
 #[test]

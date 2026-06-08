@@ -1752,9 +1752,11 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 name = "oqqwall_rust_core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "blake3",
  "regex",
  "serde",
+ "serde_json",
  "unicode-normalization",
 ]
 
@@ -1768,6 +1770,7 @@ dependencies = [
  "imagesize",
  "oqqwall_rust_core",
  "oqqwall_rust_infra",
+ "qrcode",
  "reqwest",
  "serde",
  "serde_json",
@@ -1993,6 +1996,15 @@ name = "pxfm"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5a041e753da8b807c9255f28de81879c78c876392ff2469cde94799b2896b9d"
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+dependencies = [
+ "image",
+]
 
 [[package]]
 name = "quinn"
