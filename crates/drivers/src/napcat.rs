@@ -17,7 +17,7 @@ use oqqwall_rust_core::draft::{
 };
 use oqqwall_rust_core::event::{
     BlobEvent, DraftEvent, Event, IngressEvent, InputStatusKind, MediaEvent, ReviewDecision,
-    ReviewEvent, ScheduleEvent, SendEvent, SendPriority,
+    ReviewEvent, ReviewSubmitterNoticeKind, ScheduleEvent, SendEvent, SendPriority,
 };
 use oqqwall_rust_core::ids::{BlobId, ExternalCode, IngressId, PostId, ReviewCode, ReviewId};
 use oqqwall_rust_core::{Command, IngressCommand, StateView, derive_blob_id, derive_ingress_id};
@@ -1197,10 +1197,9 @@ async fn build_action_from_event(
             decided_by,
             ..
         }) => {
-            let should_notify_reject = matches!(decision, ReviewDecision::Rejected);
             let should_notify_recall_deleted =
                 matches!(decision, ReviewDecision::Deleted) && decided_by == "system_recall";
-            let (submitter, recall_group_msg) = {
+            let recall_group_msg = {
                 let mut guard = state.lock().await;
                 match decision {
                     ReviewDecision::Approved
@@ -1213,19 +1212,13 @@ async fn build_action_from_event(
                         guard.processed_reviews.remove(&review_id);
                     }
                 }
-                let submitter = if should_notify_reject {
-                    resolve_review_submitter(&guard, review_id)
-                } else {
-                    None
-                };
-                let recall_group_msg = if should_notify_recall_deleted {
+                if should_notify_recall_deleted {
                     guard.review_info.get(&review_id).map(|info| {
                         format!("发件者撤回了#{}的全部内容,已自动删除稿件", info.review_code)
                     })
                 } else {
                     None
-                };
-                (submitter, recall_group_msg)
+                }
             };
             if let Some(text) = recall_group_msg {
                 let target_group_id = runtime
@@ -1241,17 +1234,29 @@ async fn build_action_from_event(
                 });
                 return Some(payload.to_string());
             }
-            if !should_notify_reject {
-                return None;
-            }
+            None
+        }
+        Event::Review(ReviewEvent::ReviewDecisionReasonRecorded { .. }) => None,
+        Event::Review(ReviewEvent::ReviewSubmitterNoticeRequested {
+            review_id,
+            kind,
+            reason,
+        }) => {
+            let submitter = {
+                let guard = state.lock().await;
+                resolve_review_submitter(&guard, review_id)
+            };
             let Some((group_id, user_id)) = submitter else {
-                debug_log!("napcat reject notify skipped: missing submitter info");
+                debug_log!(
+                    "napcat submitter notice skipped: missing submitter info review_id={}",
+                    review_id.0
+                );
                 return None;
             };
             if !group_id.is_empty() && group_id != runtime.group_id {
                 return None;
             }
-            let text = "你的投稿已被拒，请修改后再发送";
+            let text = format_review_submitter_notice(kind, reason.as_deref());
             let payload = serde_json::json!({
                 "action": "send_private_msg",
                 "params": {
@@ -4211,6 +4216,21 @@ fn resolve_review_submitter(state: &NapCatState, review_id: ReviewId) -> Option<
     Some((info.group_id.clone(), user_id))
 }
 
+fn format_review_submitter_notice(kind: ReviewSubmitterNoticeKind, reason: Option<&str>) -> String {
+    let reason = reason
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or("无");
+    match kind {
+        ReviewSubmitterNoticeKind::Rejected => {
+            format!("你的投稿已被拒，请修改后再发送。理由：{}", reason)
+        }
+        ReviewSubmitterNoticeKind::Deleted => {
+            format!("你的投稿已被删除。理由：{}", reason)
+        }
+    }
+}
+
 fn format_list(items: &[String]) -> String {
     if items.is_empty() {
         "无".to_string()
@@ -4842,14 +4862,23 @@ mod tests {
             parse_cmd("123 删", false),
             Some(AuditCommand::Review {
                 review_code: Some(123),
-                action: ParsedReviewAction::Builtin(ReviewAction::Delete),
+                action: ParsedReviewAction::Builtin(ReviewAction::Delete { reason: None }),
             })
         );
         assert_eq!(
             parse_cmd("123 拒", false),
             Some(AuditCommand::Review {
                 review_code: Some(123),
-                action: ParsedReviewAction::Builtin(ReviewAction::Reject),
+                action: ParsedReviewAction::Builtin(ReviewAction::Reject { reason: None }),
+            })
+        );
+        assert_eq!(
+            parse_cmd("123 拒 广告", false),
+            Some(AuditCommand::Review {
+                review_code: Some(123),
+                action: ParsedReviewAction::Builtin(ReviewAction::Reject {
+                    reason: Some("广告".to_string())
+                }),
             })
         );
         assert_eq!(

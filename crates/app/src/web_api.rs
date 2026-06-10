@@ -217,6 +217,7 @@ struct PostDetailResponse {
     post_id: String,
     review_id: Option<String>,
     review_code: Option<u32>,
+    decision_reason: Option<String>,
     group_id: String,
     stage: String,
     external_code: Option<u64>,
@@ -1444,6 +1445,12 @@ async fn get_post(
     let review_code = meta
         .review_id
         .and_then(|id| guard.reviews.get(&id).map(|review| review.review_code));
+    let decision_reason = meta.review_id.and_then(|id| {
+        guard
+            .reviews
+            .get(&id)
+            .and_then(|review| review.decision_reason.clone())
+    });
     let sender_id = guard
         .session_ingress
         .get(&meta.session_id)
@@ -1512,6 +1519,7 @@ async fn get_post(
             post_id: id_to_string(meta.post_id),
             review_id: meta.review_id.map(id_to_string),
             review_code,
+            decision_reason,
             group_id: meta.group_id.clone(),
             stage: stage_to_string(meta.stage),
             external_code: guard.external_code_by_post.get(&meta.post_id).copied(),
@@ -3080,8 +3088,12 @@ fn parse_id128(value: &str) -> Option<Id128> {
 fn parse_review_action(req: &ReviewDecisionRequest) -> Result<ReviewAction, &'static str> {
     match req.action.as_str() {
         "approve" => Ok(ReviewAction::Approve),
-        "reject" => Ok(ReviewAction::Reject),
-        "delete" => Ok(ReviewAction::Delete),
+        "reject" => Ok(ReviewAction::Reject {
+            reason: req.comment.clone(),
+        }),
+        "delete" => Ok(ReviewAction::Delete {
+            reason: req.comment.clone(),
+        }),
         "defer" => Ok(ReviewAction::Defer {
             delay_ms: req.delay_ms.unwrap_or(0),
         }),
@@ -3156,9 +3168,11 @@ fn parse_stage(value: &str) -> Option<PostStage> {
         "sending" => Some(PostStage::Sending),
         "sent" => Some(PostStage::Sent),
         "rejected" => Some(PostStage::Rejected),
+        "deleted" => Some(PostStage::Deleted),
         "skipped" => Some(PostStage::Skipped),
         "manual" => Some(PostStage::Manual),
         "failed" => Some(PostStage::Failed),
+        "withdrawn" => Some(PostStage::Withdrawn),
         _ => None,
     }
 }
@@ -3174,9 +3188,11 @@ fn stage_to_string(stage: PostStage) -> String {
         PostStage::Sending => "sending",
         PostStage::Sent => "sent",
         PostStage::Rejected => "rejected",
+        PostStage::Deleted => "deleted",
         PostStage::Skipped => "skipped",
         PostStage::Manual => "manual",
         PostStage::Failed => "failed",
+        PostStage::Withdrawn => "withdrawn",
     }
     .to_string()
 }
@@ -3223,6 +3239,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::header::AUTHORIZATION;
+    use oqqwall_rust_core::command::ReviewAction;
     use oqqwall_rust_core::event::ReviewDecision;
     use oqqwall_rust_core::state::{BlobMeta, PostMeta, PostStage, RenderMeta, ReviewMeta};
     use serde_json::json;
@@ -3244,6 +3261,11 @@ mod tests {
     fn parse_stage_roundtrip() {
         let value = parse_stage("review_pending").expect("stage");
         assert_eq!(stage_to_string(value), "review_pending");
+        let value = parse_stage("deleted").expect("stage");
+        assert_eq!(stage_to_string(value), "deleted");
+        let value = parse_stage("withdrawn").expect("stage");
+        assert_eq!(stage_to_string(value), "withdrawn");
+        assert!(parse_stage("unknown").is_none());
     }
 
     #[test]
@@ -3590,6 +3612,7 @@ mod tests {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
+                    decision_reason: None,
                     publish_retry_at_ms: None,
                     publish_last_error: None,
                     publish_attempt: 0,
@@ -3664,6 +3687,7 @@ mod tests {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
+                    decision_reason: None,
                     publish_retry_at_ms: None,
                     publish_last_error: None,
                     publish_attempt: 0,
@@ -3739,6 +3763,7 @@ mod tests {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
+                    decision_reason: None,
                     publish_retry_at_ms: None,
                     publish_last_error: None,
                     publish_attempt: 0,
@@ -3818,6 +3843,7 @@ mod tests {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
+                    decision_reason: None,
                     publish_retry_at_ms: None,
                     publish_last_error: None,
                     publish_attempt: 0,
@@ -3919,6 +3945,7 @@ mod tests {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
+                    decision_reason: None,
                     publish_retry_at_ms: None,
                     publish_last_error: None,
                     publish_attempt: 0,
@@ -4042,6 +4069,7 @@ mod tests {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
+                    decision_reason: None,
                     publish_retry_at_ms: None,
                     publish_last_error: None,
                     publish_attempt: 0,
@@ -4138,6 +4166,7 @@ mod tests {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
+                    decision_reason: None,
                     publish_retry_at_ms: None,
                     publish_last_error: None,
                     publish_attempt: 0,
@@ -4211,6 +4240,7 @@ mod tests {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
+                    decision_reason: None,
                     publish_retry_at_ms: None,
                     publish_last_error: None,
                     publish_attempt: 0,
@@ -4377,6 +4407,7 @@ mod tests {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
+                    decision_reason: None,
                     publish_retry_at_ms: None,
                     publish_last_error: None,
                     publish_attempt: 0,
@@ -4400,6 +4431,76 @@ mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn decide_review_preserves_reject_comment_as_reason() {
+        let (state, mut rx, session_id) = build_test_state(Some(vec!["10001"]));
+        let post_id = Id128(72101);
+        let review_id = Id128(72111);
+        {
+            let mut guard = state.state.write().expect("lock");
+            guard.posts.insert(
+                post_id,
+                PostMeta {
+                    post_id,
+                    session_id: Id128(4),
+                    group_id: "10001".to_string(),
+                    stage: PostStage::ReviewPending,
+                    review_id: Some(review_id),
+                    created_at_ms: 13,
+                    is_anonymous: false,
+                    is_safe: true,
+                    last_error: None,
+                },
+            );
+            guard.reviews.insert(
+                review_id,
+                ReviewMeta {
+                    review_id,
+                    post_id,
+                    review_code: 84,
+                    decision: None,
+                    audit_msg_id: None,
+                    delayed_until_ms: None,
+                    needs_republish: false,
+                    decided_by: None,
+                    decided_at_ms: None,
+                    decision_reason: None,
+                    publish_retry_at_ms: None,
+                    publish_last_error: None,
+                    publish_attempt: 0,
+                },
+            );
+        }
+        let response = decide_review(
+            State(state),
+            Path(review_id.0.to_string()),
+            build_headers(&session_id, None),
+            Json(ReviewDecisionRequest {
+                action: "reject".to_string(),
+                comment: Some("  广告  ".to_string()),
+                delay_ms: None,
+                text: None,
+                quick_reply_key: None,
+                target_review_code: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent = rx.try_recv().expect("review cmd");
+        match sent {
+            Command::ReviewAction(cmd) => {
+                assert_eq!(cmd.review_id, Some(review_id));
+                assert!(matches!(
+                    cmd.action,
+                    ReviewAction::Reject { reason } if reason.as_deref() == Some("  广告  ")
+                ));
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
         assert!(rx.try_recv().is_err());
     }
 
@@ -4438,6 +4539,7 @@ mod tests {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
+                    decision_reason: None,
                     publish_retry_at_ms: None,
                     publish_last_error: None,
                     publish_attempt: 0,
@@ -4469,6 +4571,7 @@ mod tests {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
+                    decision_reason: None,
                     publish_retry_at_ms: None,
                     publish_last_error: None,
                     publish_attempt: 0,

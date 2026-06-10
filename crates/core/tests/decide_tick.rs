@@ -270,6 +270,7 @@ fn tick_retries_review_publish_after_failure() {
             needs_republish: false,
             decided_by: None,
             decided_at_ms: None,
+            decision_reason: None,
             publish_retry_at_ms: Some(900),
             publish_last_error: Some("send failed".to_string()),
             publish_attempt: 2,

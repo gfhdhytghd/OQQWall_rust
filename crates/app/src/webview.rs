@@ -173,6 +173,7 @@ struct DailyTrendItem {
     submitted: usize,
     approved: usize,
     rejected: usize,
+    deleted: usize,
 }
 
 #[derive(Serialize)]
@@ -186,6 +187,7 @@ struct PostDetailResponse {
     post_id: String,
     review_id: Option<String>,
     review_code: Option<u32>,
+    decision_reason: Option<String>,
     group_id: String,
     stage: String,
     external_code: Option<u64>,
@@ -474,7 +476,7 @@ async fn webview_get_stats(
     let mut actionable_count = 0;
     let mut error_count = 0;
     let mut stage_breakdown = HashMap::new();
-    let mut daily_trend: HashMap<String, (usize, usize, usize)> = HashMap::new();
+    let mut daily_trend: HashMap<String, (usize, usize, usize, usize)> = HashMap::new();
     let mut hourly_distribution = [0usize; 24];
     let mut total_review_time_ms = 0i64;
     let mut total_reviewed_count = 0usize;
@@ -503,7 +505,7 @@ async fn webview_get_stats(
         *stage_breakdown.entry(stage_str).or_insert(0) += 1;
 
         let date = ms_to_date_string(meta.created_at_ms, state.tz_offset_minutes);
-        let trend = daily_trend.entry(date).or_insert((0, 0, 0));
+        let trend = daily_trend.entry(date).or_insert((0, 0, 0, 0));
         trend.0 += 1;
         let hour = local_hour(meta.created_at_ms, state.tz_offset_minutes);
         hourly_distribution[usize::from(hour)] += 1;
@@ -525,10 +527,11 @@ async fn webview_get_stats(
                             meta.created_at_ms,
                             state.tz_offset_minutes,
                         ))
-                        .or_insert((0, 0, 0));
+                        .or_insert((0, 0, 0, 0));
                     match decision {
                         oqqwall_rust_core::event::ReviewDecision::Approved => trend.1 += 1,
                         oqqwall_rust_core::event::ReviewDecision::Rejected => trend.2 += 1,
+                        oqqwall_rust_core::event::ReviewDecision::Deleted => trend.3 += 1,
                         _ => {}
                     }
                 }
@@ -538,12 +541,15 @@ async fn webview_get_stats(
 
     let mut daily_trend = daily_trend
         .into_iter()
-        .map(|(date, (submitted, approved, rejected))| DailyTrendItem {
-            date,
-            submitted,
-            approved,
-            rejected,
-        })
+        .map(
+            |(date, (submitted, approved, rejected, deleted))| DailyTrendItem {
+                date,
+                submitted,
+                approved,
+                rejected,
+                deleted,
+            },
+        )
         .collect::<Vec<_>>();
     daily_trend.sort_by(|a, b| a.date.cmp(&b.date));
     if daily_trend.len() > 14 {
@@ -900,6 +906,12 @@ async fn webview_get_post(
     let review_code = meta
         .review_id
         .and_then(|id| guard.reviews.get(&id).map(|review| review.review_code));
+    let decision_reason = meta.review_id.and_then(|id| {
+        guard
+            .reviews
+            .get(&id)
+            .and_then(|review| review.decision_reason.clone())
+    });
     let sender_id = guard
         .session_ingress
         .get(&meta.session_id)
@@ -966,6 +978,7 @@ async fn webview_get_post(
             post_id: id_to_string(meta.post_id),
             review_id: meta.review_id.map(id_to_string),
             review_code,
+            decision_reason,
             group_id: meta.group_id.clone(),
             stage: stage_to_string(meta.stage),
             external_code: guard.external_code_by_post.get(&meta.post_id).copied(),
@@ -1444,8 +1457,12 @@ fn post_keyword_matches(
 fn parse_review_action(req: &ReviewDecisionRequest) -> Result<ReviewAction, &'static str> {
     match req.action.as_str() {
         "approve" => Ok(ReviewAction::Approve),
-        "reject" => Ok(ReviewAction::Reject),
-        "delete" => Ok(ReviewAction::Delete),
+        "reject" => Ok(ReviewAction::Reject {
+            reason: req.comment.clone(),
+        }),
+        "delete" => Ok(ReviewAction::Delete {
+            reason: req.comment.clone(),
+        }),
         "defer" => Ok(ReviewAction::Defer {
             delay_ms: req.delay_ms.unwrap_or(0),
         }),
@@ -1558,9 +1575,11 @@ fn parse_stage(value: &str) -> Option<PostStage> {
         "sending" => Some(PostStage::Sending),
         "sent" => Some(PostStage::Sent),
         "rejected" => Some(PostStage::Rejected),
+        "deleted" => Some(PostStage::Deleted),
         "skipped" => Some(PostStage::Skipped),
         "manual" => Some(PostStage::Manual),
         "failed" => Some(PostStage::Failed),
+        "withdrawn" => Some(PostStage::Withdrawn),
         _ => None,
     }
 }
@@ -1568,7 +1587,11 @@ fn parse_stage(value: &str) -> Option<PostStage> {
 fn is_active_stage(stage: PostStage) -> bool {
     !matches!(
         stage,
-        PostStage::Rejected | PostStage::Skipped | PostStage::Failed
+        PostStage::Rejected
+            | PostStage::Deleted
+            | PostStage::Withdrawn
+            | PostStage::Skipped
+            | PostStage::Failed
     )
 }
 
@@ -1583,9 +1606,11 @@ fn stage_to_string(stage: PostStage) -> String {
         PostStage::Sending => "sending",
         PostStage::Sent => "sent",
         PostStage::Rejected => "rejected",
+        PostStage::Deleted => "deleted",
         PostStage::Skipped => "skipped",
         PostStage::Manual => "manual",
         PostStage::Failed => "failed",
+        PostStage::Withdrawn => "withdrawn",
     }
     .to_string()
 }

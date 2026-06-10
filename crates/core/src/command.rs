@@ -57,8 +57,8 @@ pub struct ReviewActionBatchCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewAction {
     Approve,
-    Reject,
-    Delete,
+    Reject { reason: Option<String> },
+    Delete { reason: Option<String> },
     Defer { delay_ms: TimestampMs },
     Skip,
     Immediate,

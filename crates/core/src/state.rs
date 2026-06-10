@@ -53,9 +53,11 @@ pub enum PostStage {
     Sending,
     Sent,
     Rejected,
+    Deleted,
     Skipped,
     Manual,
     Failed,
+    Withdrawn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +100,8 @@ pub struct ReviewMeta {
     pub needs_republish: bool,
     pub decided_by: Option<String>,
     pub decided_at_ms: Option<TimestampMs>,
+    #[serde(default)]
+    pub decision_reason: Option<String>,
     #[serde(default)]
     pub publish_retry_at_ms: Option<TimestampMs>,
     #[serde(default)]

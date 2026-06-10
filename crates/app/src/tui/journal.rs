@@ -1851,9 +1851,35 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                     decided_at_ms
                 ),
             ),
+            ReviewEvent::ReviewDecisionReasonRecorded {
+                review_id,
+                decision,
+                reason,
+            } => (
+                "Review.DecisionReasonRecorded",
+                format!(
+                    "review={} decision={:?} reason_len={}",
+                    short_id(*review_id),
+                    decision,
+                    reason.as_deref().unwrap_or("").len()
+                ),
+            ),
             ReviewEvent::ReviewCommentAdded { review_id, text } => (
                 "Review.CommentAdded",
                 format!("review={} text_len={}", short_id(*review_id), text.len()),
+            ),
+            ReviewEvent::ReviewSubmitterNoticeRequested {
+                review_id,
+                kind,
+                reason,
+            } => (
+                "Review.SubmitterNoticeRequested",
+                format!(
+                    "review={} kind={:?} reason_len={}",
+                    short_id(*review_id),
+                    kind,
+                    reason.as_deref().unwrap_or("").len()
+                ),
             ),
             ReviewEvent::ReviewReplyRequested { review_id, text } => (
                 "Review.ReplyRequested",

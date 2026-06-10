@@ -216,9 +216,19 @@ pub enum ReviewEvent {
         decided_by: String,
         decided_at_ms: TimestampMs,
     },
+    ReviewDecisionReasonRecorded {
+        review_id: ReviewId,
+        decision: ReviewDecision,
+        reason: Option<String>,
+    },
     ReviewCommentAdded {
         review_id: ReviewId,
         text: String,
+    },
+    ReviewSubmitterNoticeRequested {
+        review_id: ReviewId,
+        kind: ReviewSubmitterNoticeKind,
+        reason: Option<String>,
     },
     ReviewReplyRequested {
         review_id: ReviewId,
@@ -284,6 +294,12 @@ pub enum ReviewDecision {
     Rejected,
     Deferred,
     Skipped,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewSubmitterNoticeKind {
+    Rejected,
     Deleted,
 }
 

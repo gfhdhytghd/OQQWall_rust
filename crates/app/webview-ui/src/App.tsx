@@ -86,7 +86,7 @@ type PostQuerySnapshot = {
   onlyActionable: boolean
 }
 
-const ACTIVE_EXCLUDED = new Set(['rejected', 'skipped', 'failed'])
+const ACTIVE_EXCLUDED = new Set(['rejected', 'deleted', 'withdrawn', 'skipped', 'failed'])
 const PAGE_SIZES = [20, 50, 100, 200]
 const STAGE_OPTIONS: Array<SelectOption<Stage>> = [
   { value: '__active__', label: '全部活跃' },
@@ -97,6 +97,8 @@ const STAGE_OPTIONS: Array<SelectOption<Stage>> = [
   { value: 'sending', label: '发送中' },
   { value: 'sent', label: '已发送' },
   { value: 'rejected', label: '已拒绝' },
+  { value: 'deleted', label: '已删除' },
+  { value: 'withdrawn', label: '已撤回' },
   { value: 'skipped', label: '已跳过' },
   { value: 'manual', label: '人工处理' },
   { value: 'failed', label: '失败' },
@@ -660,6 +662,14 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
               {batchAction === 'defer' && (
                 <DelayField value={actionDelay} onChange={setActionDelay} className="delay-field" />
               )}
+              {(batchAction === 'reject' || batchAction === 'delete') && (
+                <Input
+                  className="action-text"
+                  placeholder="统一理由，可留空"
+                  value={actionText}
+                  onChange={(event) => setActionText(event.target.value)}
+                />
+              )}
               <Button size="sm" isDisabled={!selected.length || actionLoading} onClick={runBatch}>
                 {actionLoading ? <Spinner size="sm" /> : <Check size={16} />}
                 批量执行
@@ -955,7 +965,7 @@ function PostCard({
           {post.review_id && (
             <TextArea
               className="post-card-note"
-              placeholder="评论或拒绝/拉黑原因"
+              placeholder="评论或拒绝/删除/拉黑原因"
               value={note}
               onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) => onNoteChange(event.target.value)}
             />
@@ -1191,6 +1201,9 @@ function promptListActionText(action: string) {
     if (!text?.trim()) return null
     return text
   }
+  if (action === 'reject' || action === 'delete') {
+    return window.prompt('可填写原因，留空将直接执行') ?? null
+  }
   if (action === 'blacklist') {
     return window.prompt('可填写拉黑原因，留空将直接拉黑') ?? null
   }
@@ -1269,8 +1282,15 @@ function DetailContent({
     onTextChange('')
   }, [action])
 
-  const needsText = ['comment', 'reply', 'blacklist', 'quick_reply', 'merge'].includes(action)
-  const textPlaceholder = action === 'merge' ? '目标审核编号' : action === 'quick_reply' ? '快捷回复键名' : '内容'
+  const needsText = ['reject', 'delete', 'comment', 'reply', 'blacklist', 'quick_reply', 'merge'].includes(action)
+  const textPlaceholder =
+    action === 'merge'
+      ? '目标审核编号'
+      : action === 'quick_reply'
+        ? '快捷回复键名'
+        : action === 'reject' || action === 'delete' || action === 'blacklist'
+          ? '原因，可留空'
+          : '内容'
 
   if (loading || !detail) {
     return <EmptyPanel icon={<Spinner />} text="正在加载详情" />
@@ -1316,6 +1336,12 @@ function DetailContent({
               <dt>时间</dt>
               <dd>{formatDateTime(detail.created_at_ms)}</dd>
             </div>
+            {detail.decision_reason && (
+              <div>
+                <dt>决策理由</dt>
+                <dd>{detail.decision_reason}</dd>
+              </div>
+            )}
             <div>
               <dt>会话</dt>
               <dd className="mono">{detail.session_id}</dd>
@@ -1353,7 +1379,7 @@ function DetailContent({
               <DelayField value={actionDelay} onChange={onDelayChange} className="delay-field" />
             )}
             {needsText &&
-              (action === 'comment' || action === 'reply' || action === 'blacklist' ? (
+              (action === 'reject' || action === 'delete' || action === 'comment' || action === 'reply' || action === 'blacklist' ? (
                 <TextArea
                   className="action-text"
                   placeholder={textPlaceholder}
@@ -1527,7 +1553,9 @@ function StatsView({ notify }: { notify: (kind: ToastKind, text: string) => void
                   <div>
                     <i style={{ width: `${(item.submitted / maxDaily) * 100}%` }} />
                   </div>
-                  <strong>{item.submitted}</strong>
+                  <strong>
+                    {item.submitted} / 拒{item.rejected} 删{item.deleted}
+                  </strong>
                 </div>
               ))}
             </div>
@@ -1636,7 +1664,7 @@ function StageChip({ stage }: { stage: string }) {
   const color =
     stage === 'review_pending'
       ? 'warning'
-      : stage === 'failed' || stage === 'rejected'
+      : stage === 'failed' || stage === 'rejected' || stage === 'deleted' || stage === 'withdrawn'
         ? 'danger'
         : stage === 'sent'
           ? 'success'
@@ -1791,7 +1819,7 @@ function buildActionPayload(action: string, text: string, delayMs: number) {
   const payload: Record<string, unknown> = { action }
   const trimmed = text.trim()
   if (action === 'defer') payload.delay_ms = delayMs
-  if (action === 'reject' && trimmed) payload.comment = trimmed
+  if ((action === 'reject' || action === 'delete') && trimmed) payload.comment = trimmed
   if (action === 'comment' || action === 'reply') payload.text = trimmed
   if (action === 'blacklist') payload.comment = trimmed
   if (action === 'quick_reply') payload.quick_reply_key = trimmed

@@ -9,7 +9,9 @@ use crate::event::{
     DraftEvent, Event, EventEnvelope, IngressEvent, RenderEvent, ReviewDecision, ReviewEvent,
     ScheduleEvent, SendPriority,
 };
-use crate::ids::{ActorId, ExternalCode, Id128, IngressId, PostId, ReviewCode, ReviewId};
+use crate::ids::{
+    ActorId, ExternalCode, Id128, IngressId, PostId, ReviewCode, ReviewId, TimestampMs,
+};
 use crate::safety::detect_safe;
 use crate::state::StateView;
 
@@ -37,31 +39,31 @@ pub fn decide_review_action(
         ReviewAction::Approve => {
             build_approve_events(state, cmd, config, review_id, post_id, group_id)
         }
-        ReviewAction::Reject => {
-            let mut events = vec![Event::Review(ReviewEvent::ReviewDecisionRecorded {
+        ReviewAction::Reject { reason } => {
+            let mut events = build_terminal_decision_events(
                 review_id,
-                decision: ReviewDecision::Rejected,
-                decided_by: cmd.operator_id.clone(),
-                decided_at_ms: cmd.now_ms,
-            })];
+                ReviewDecision::Rejected,
+                reason,
+                &cmd.operator_id,
+                cmd.now_ms,
+            );
             if state.send_plans.contains_key(&post_id) {
                 events.push(Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id }));
             }
             events
         }
-        ReviewAction::Delete => {
-            let mut events = vec![Event::Review(ReviewEvent::ReviewDecisionRecorded {
+        ReviewAction::Delete { reason } => {
+            let mut events = build_terminal_decision_events(
                 review_id,
-                decision: ReviewDecision::Deleted,
-                decided_by: cmd.operator_id.clone(),
-                decided_at_ms: cmd.now_ms,
-            })];
+                ReviewDecision::Deleted,
+                reason,
+                &cmd.operator_id,
+                cmd.now_ms,
+            );
             if let Some(event) = maybe_assign_external_code(state, &group_id, post_id) {
                 events.push(event);
             }
-            if state.send_plans.contains_key(&post_id) {
-                events.push(Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id }));
-            }
+            events.push(Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id }));
             events
         }
         ReviewAction::Defer { delay_ms } => vec![
@@ -178,6 +180,50 @@ pub fn decide_review_action(
             build_merge_events(state, cmd, review_id, *review_code)
         }
     }
+}
+
+fn build_terminal_decision_events(
+    review_id: ReviewId,
+    decision: ReviewDecision,
+    reason: &Option<String>,
+    decided_by: &str,
+    decided_at_ms: TimestampMs,
+) -> Vec<Event> {
+    let reason = normalize_review_reason(reason);
+    let mut events = vec![
+        Event::Review(ReviewEvent::ReviewDecisionRecorded {
+            review_id,
+            decision,
+            decided_by: decided_by.to_string(),
+            decided_at_ms,
+        }),
+        Event::Review(ReviewEvent::ReviewDecisionReasonRecorded {
+            review_id,
+            decision,
+            reason: reason.clone(),
+        }),
+    ];
+    let notice_kind = match decision {
+        ReviewDecision::Rejected => Some(crate::event::ReviewSubmitterNoticeKind::Rejected),
+        ReviewDecision::Deleted => Some(crate::event::ReviewSubmitterNoticeKind::Deleted),
+        _ => None,
+    };
+    if let Some(kind) = notice_kind {
+        events.push(Event::Review(ReviewEvent::ReviewSubmitterNoticeRequested {
+            review_id,
+            kind,
+            reason,
+        }));
+    }
+    events
+}
+
+fn normalize_review_reason(reason: &Option<String>) -> Option<String> {
+    reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 pub fn decide_review_action_batch(

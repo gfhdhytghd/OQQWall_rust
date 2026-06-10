@@ -4,6 +4,7 @@ use oqqwall_rust_core::event::{
     DraftEvent, Event, IngressEvent, RenderEvent, ReviewDecision, ReviewEvent, ScheduleEvent,
     SendPriority, SessionEvent,
 };
+use oqqwall_rust_core::state::PostStage;
 use oqqwall_rust_core::{
     Command, CoreConfig, Draft, EventEnvelope, Id128, IngressAttachment, StateView,
     derive_review_id,
@@ -193,4 +194,12 @@ fn recall_removing_last_message_marks_deleted_and_cancels_plan() {
         event,
         Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id: id }) if *id == post_id
     )));
+    let mut reduced = state;
+    for (idx, event) in events.into_iter().enumerate() {
+        reduced = reduced.reduce(&wrap(event, 10 + idx as u128));
+    }
+    assert_eq!(
+        reduced.posts.get(&post_id).map(|post| post.stage),
+        Some(PostStage::Deleted)
+    );
 }

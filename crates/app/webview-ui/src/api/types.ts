@@ -12,6 +12,8 @@ export type Stage =
   | 'sending'
   | 'sent'
   | 'rejected'
+  | 'deleted'
+  | 'withdrawn'
   | 'skipped'
   | 'manual'
   | 'failed'
@@ -51,6 +53,7 @@ export interface StatsResponse {
     submitted: number
     approved: number
     rejected: number
+    deleted: number
   }>
   hourly_distribution: Array<{
     hour: number
@@ -74,6 +77,7 @@ export interface PostDetail {
   post_id: string
   review_id: string | null
   review_code: number | null
+  decision_reason: string | null
   group_id: string
   stage: Stage
   external_code: number | null
@@ -114,6 +118,8 @@ export const STAGE_LABELS: Record<string, string> = {
   sending: '发送中',
   sent: '已发送',
   rejected: '已拒绝',
+  deleted: '已删除',
+  withdrawn: '已撤回',
   skipped: '已跳过',
   manual: '人工处理',
   failed: '失败',

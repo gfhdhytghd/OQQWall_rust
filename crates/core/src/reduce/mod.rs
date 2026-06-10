@@ -361,6 +361,7 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
+                    decision_reason: None,
                     publish_retry_at_ms: None,
                     publish_last_error: None,
                     publish_attempt: 0,
@@ -449,6 +450,7 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                 meta.decision = Some(*decision);
                 meta.decided_by = Some(decided_by.clone());
                 meta.decided_at_ms = Some(*decided_at_ms);
+                meta.decision_reason = None;
             }
             if let Some(post_id) = post_id {
                 let stage = match decision {
@@ -456,9 +458,16 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                     crate::event::ReviewDecision::Rejected => PostStage::Rejected,
                     crate::event::ReviewDecision::Deferred => PostStage::ReviewPending,
                     crate::event::ReviewDecision::Skipped => PostStage::Skipped,
-                    crate::event::ReviewDecision::Deleted => PostStage::Rejected,
+                    crate::event::ReviewDecision::Deleted => PostStage::Deleted,
                 };
                 state.update_post_stage(post_id, stage);
+            }
+        }
+        ReviewEvent::ReviewDecisionReasonRecorded {
+            review_id, reason, ..
+        } => {
+            if let Some(meta) = state.reviews.get_mut(review_id) {
+                meta.decision_reason = reason.clone();
             }
         }
         ReviewEvent::ReviewExternalNumberSet {
@@ -527,6 +536,7 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
             }
         }
         ReviewEvent::ReviewCommentAdded { .. }
+        | ReviewEvent::ReviewSubmitterNoticeRequested { .. }
         | ReviewEvent::ReviewReplyRequested { .. }
         | ReviewEvent::ReviewExpandRequested { .. }
         | ReviewEvent::ReviewDisplayRequested { .. }

@@ -990,7 +990,7 @@ a {
 .stage-list div,
 .bar-row {
   display: grid;
-  grid-template-columns: 110px minmax(0, 1fr) 42px;
+  grid-template-columns: 110px minmax(0, 1fr) 116px;
   align-items: center;
   gap: 10px;
 }
@@ -1004,6 +1004,7 @@ a {
 .bar-row strong {
   color: var(--muted);
   font-size: 13px;
+  white-space: nowrap;
 }
 
 .bar-list {
