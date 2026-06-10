@@ -767,6 +767,7 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
                     text: text.clone(),
                     items: items.clone(),
                     withdrawn_posts: Default::default(),
+                    pending_withdrawn_posts: Default::default(),
                 },
             );
             for item in items {
@@ -777,12 +778,28 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
                     .insert(key.clone());
             }
         }
-        SendEvent::QzonePostWithdrawRequested { .. } => {}
+        SendEvent::QzonePostWithdrawRequested {
+            account_id,
+            remote_id,
+            withdrawn_post_ids,
+            ..
+        } => {
+            let key = crate::event::QzonePublicationKey {
+                account_id: account_id.clone(),
+                remote_id: remote_id.clone(),
+            };
+            if let Some(publication) = state.qzone_publications.get_mut(&key) {
+                publication
+                    .pending_withdrawn_posts
+                    .extend(withdrawn_post_ids.iter().copied());
+            }
+        }
         SendEvent::QzonePostWithdrawSucceeded {
             post_id,
             account_id,
             remote_id,
             text,
+            withdrawn_post_ids,
             ..
         } => {
             let key = crate::event::QzonePublicationKey {
@@ -791,16 +808,45 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
             };
             if let Some(publication) = state.qzone_publications.get_mut(&key) {
                 publication.text = text.clone();
-                publication.withdrawn_posts.insert(*post_id);
+                publication
+                    .withdrawn_posts
+                    .extend(withdrawn_post_ids.iter().copied());
+                for withdrawn_post_id in withdrawn_post_ids {
+                    publication
+                        .pending_withdrawn_posts
+                        .remove(withdrawn_post_id);
+                }
             }
             if let Some(meta) = state.posts.get_mut(post_id) {
                 meta.last_error = None;
             }
-            if qzone_post_fully_withdrawn(state, *post_id) {
-                state.update_post_stage(*post_id, PostStage::Withdrawn);
+            for withdrawn_post_id in withdrawn_post_ids {
+                if let Some(meta) = state.posts.get_mut(withdrawn_post_id) {
+                    meta.last_error = None;
+                }
+                if qzone_post_fully_withdrawn(state, *withdrawn_post_id) {
+                    state.update_post_stage(*withdrawn_post_id, PostStage::Withdrawn);
+                }
             }
         }
-        SendEvent::QzonePostWithdrawFailed { post_id, error, .. } => {
+        SendEvent::QzonePostWithdrawFailed {
+            post_id,
+            account_id,
+            remote_id,
+            withdrawn_post_ids,
+            error,
+        } => {
+            let key = crate::event::QzonePublicationKey {
+                account_id: account_id.clone(),
+                remote_id: remote_id.clone(),
+            };
+            if let Some(publication) = state.qzone_publications.get_mut(&key) {
+                for withdrawn_post_id in withdrawn_post_ids {
+                    publication
+                        .pending_withdrawn_posts
+                        .remove(withdrawn_post_id);
+                }
+            }
             if let Some(meta) = state.posts.get_mut(post_id) {
                 meta.last_error = Some(error.clone());
             }

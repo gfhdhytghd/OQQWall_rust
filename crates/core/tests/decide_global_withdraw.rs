@@ -4,8 +4,8 @@ use oqqwall_rust_core::event::{
 };
 use oqqwall_rust_core::state::PostStage;
 use oqqwall_rust_core::{
-    Command, CoreConfig, Draft, DraftBlock, EventEnvelope, GlobalAction, GlobalActionCommand,
-    Id128, StateView,
+    Command, CoreConfig, Draft, DraftBlock, EventEnvelope, GlobalAction, GlobalActionBatchCommand,
+    GlobalActionCommand, Id128, StateView,
 };
 
 fn wrap(event: Event, id: u128) -> EventEnvelope {
@@ -271,6 +271,7 @@ fn withdraw_published_post_requests_qzone_update_and_marks_withdrawn_on_success(
             items: vec![QzonePublicationItem {
                 post_id,
                 external_code,
+                image_offset: 0,
                 image_count: 1,
             }],
         }),
@@ -312,6 +313,7 @@ fn withdraw_published_post_requests_qzone_update_and_marks_withdrawn_on_success(
             account_id: "3995477265".to_string(),
             remote_id: "tid-a".to_string(),
             text: "#220\n#220 [已删除]".to_string(),
+            withdrawn_post_ids: vec![post_id],
             withdrawn_at_ms: 6_000,
         }),
         100,
@@ -319,5 +321,67 @@ fn withdraw_published_post_requests_qzone_update_and_marks_withdrawn_on_success(
     assert_eq!(
         reduced.posts.get(&post_id).map(|meta| meta.stage),
         Some(PostStage::Withdrawn)
+    );
+}
+
+#[test]
+fn batch_withdraw_published_posts_merges_pending_qzone_withdrawals() {
+    let mut state = StateView::default();
+    let post_a = Id128(10);
+    let post_b = Id128(20);
+    let mut next_id = seed_post(&mut state, post_a, Id128(110), 120, "group-a", 220, 1);
+    next_id = seed_post(&mut state, post_b, Id128(120), 121, "group-a", 221, next_id);
+    apply_event(
+        &mut state,
+        Event::Send(SendEvent::QzonePostPublished {
+            group_id: "group-a".to_string(),
+            account_id: "3995477265".to_string(),
+            remote_id: "tid-a".to_string(),
+            text: "#220~#221".to_string(),
+            items: vec![
+                QzonePublicationItem {
+                    post_id: post_a,
+                    external_code: 220,
+                    image_offset: 0,
+                    image_count: 1,
+                },
+                QzonePublicationItem {
+                    post_id: post_b,
+                    external_code: 221,
+                    image_offset: 0,
+                    image_count: 1,
+                },
+            ],
+        }),
+        next_id,
+    );
+
+    let cmd = Command::GlobalActionBatch(GlobalActionBatchCommand {
+        group_id: "group-a".to_string(),
+        actions: vec![
+            GlobalAction::Withdraw { review_code: 120 },
+            GlobalAction::Withdraw { review_code: 121 },
+        ],
+        operator_id: "admin".to_string(),
+        now_ms: 5_000,
+        tz_offset_minutes: 0,
+    });
+
+    let out = oqqwall_rust_core::decide::decide(&state, &cmd, &CoreConfig::default());
+    let requests = out
+        .iter()
+        .filter_map(|event| match event {
+            Event::Send(SendEvent::QzonePostWithdrawRequested {
+                post_id,
+                withdrawn_post_ids,
+                ..
+            }) => Some((*post_id, withdrawn_post_ids.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        requests,
+        vec![(post_a, vec![post_a]), (post_b, vec![post_a, post_b])]
     );
 }

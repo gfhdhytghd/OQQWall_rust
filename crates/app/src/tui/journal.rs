@@ -2160,6 +2160,7 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                 account_id,
                 remote_id,
                 error,
+                ..
             } => (
                 "Send.QzonePostWithdrawFailed",
                 format!(

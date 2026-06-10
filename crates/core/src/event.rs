@@ -351,6 +351,8 @@ pub struct QzonePublicationKey {
 pub struct QzonePublicationItem {
     pub post_id: PostId,
     pub external_code: ExternalCode,
+    #[serde(default)]
+    pub image_offset: usize,
     pub image_count: usize,
 }
 
@@ -413,12 +415,16 @@ pub enum SendEvent {
         account_id: AccountId,
         remote_id: RemotePostId,
         text: String,
+        #[serde(default)]
+        withdrawn_post_ids: Vec<PostId>,
         withdrawn_at_ms: TimestampMs,
     },
     QzonePostWithdrawFailed {
         post_id: PostId,
         account_id: AccountId,
         remote_id: RemotePostId,
+        #[serde(default)]
+        withdrawn_post_ids: Vec<PostId>,
         error: String,
     },
 }

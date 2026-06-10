@@ -322,14 +322,14 @@ fn build_published_withdraw_events(
         if publication.group_id != cmd.group_id {
             continue;
         }
-        if publication.withdrawn_posts.contains(&post_id) {
-            continue;
-        }
         let mut withdrawn = publication
             .withdrawn_posts
-            .iter()
+            .union(&publication.pending_withdrawn_posts)
             .copied()
             .collect::<Vec<_>>();
+        if withdrawn.contains(&post_id) {
+            continue;
+        }
         withdrawn.push(post_id);
         withdrawn.sort_by_key(|id| id.0);
         withdrawn.dedup();

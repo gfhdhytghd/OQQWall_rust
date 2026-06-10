@@ -189,6 +189,8 @@ pub struct QzonePublicationMeta {
     pub items: Vec<QzonePublicationItem>,
     #[serde(default)]
     pub withdrawn_posts: BTreeSet<PostId>,
+    #[serde(default)]
+    pub pending_withdrawn_posts: BTreeSet<PostId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

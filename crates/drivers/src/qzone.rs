@@ -619,17 +619,19 @@ pub fn spawn_qzone_sender(
                             &assets,
                             &blob_paths,
                             &publish_text,
+                            &publication_items,
                             #[cfg(debug_assertions)]
                             emu_state.as_ref(),
                         )
                         .await
                         {
-                            Ok(remote_id) => {
+                            Ok(published_posts) => {
                                 final_account_id = target_account.clone();
+                                let remote_id =
+                                    published_posts.first().map(|post| post.remote_id.clone());
                                 if first_tid.is_none() {
                                     first_tid = remote_id.clone();
                                 }
-                                let published_remote_id = remote_id.clone();
                                 let account_event = SendEvent::SendAccountSucceeded {
                                     post_id,
                                     account_id: target_account.clone(),
@@ -639,15 +641,13 @@ pub fn spawn_qzone_sender(
                                 let _ = cmd_tx
                                     .send(Command::DriverEvent(Event::Send(account_event)))
                                     .await;
-                                if let Some(remote_id) =
-                                    usable_remote_id(published_remote_id.as_deref())
-                                {
+                                for published_post in published_posts {
                                     let event = SendEvent::QzonePostPublished {
                                         group_id: group_id.clone(),
-                                        account_id: target_account,
-                                        remote_id,
+                                        account_id: target_account.clone(),
+                                        remote_id: published_post.remote_id,
                                         text: publish_text.clone(),
-                                        items: publication_items.clone(),
+                                        items: published_post.items,
                                     };
                                     let _ =
                                         cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
@@ -737,12 +737,14 @@ pub fn spawn_qzone_sender(
                             account_id,
                             remote_id,
                             text: updated_text,
+                            withdrawn_post_ids,
                             withdrawn_at_ms: requested_at_ms,
                         },
                         Err(err) => SendEvent::QzonePostWithdrawFailed {
                             post_id,
                             account_id,
                             remote_id,
+                            withdrawn_post_ids,
                             error: format!("[{:?}] {}", err.kind, err.message),
                         },
                     };
@@ -777,8 +779,13 @@ fn select_send_accounts(accounts: Option<&Vec<String>>, fallback_account: &str) 
     out
 }
 
-fn usable_remote_id(remote_id: Option<&str>) -> Option<RemotePostId> {
-    let remote_id = remote_id?.trim();
+struct PublishedQzonePost {
+    remote_id: RemotePostId,
+    items: Vec<QzonePublicationItem>,
+}
+
+fn usable_remote_id(remote_id: &str) -> Option<RemotePostId> {
+    let remote_id = remote_id.trim();
     if remote_id.is_empty() || remote_id == "unknown" {
         None
     } else {
@@ -796,8 +803,9 @@ async fn publish_batch_for_account(
     assets: &[PostAssets],
     blob_paths: &HashMap<BlobId, String>,
     publish_text: &str,
+    publication_items: &[QzonePublicationItem],
     #[cfg(debug_assertions)] emu_state: Option<&Arc<std::sync::Mutex<EmuQzoneState>>>,
-) -> Result<Option<String>, QzoneError> {
+) -> Result<Vec<PublishedQzonePost>, QzoneError> {
     #[cfg(debug_assertions)]
     if runtime.use_virt_qzone {
         let Some(emu_state) = emu_state else {
@@ -822,7 +830,7 @@ async fn publish_batch_for_account(
         for chunk in images.chunks(chunk_size) {
             append_emuqzone_post(emu_state, publish_text.to_string(), chunk.to_vec());
         }
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     let napcat = runtime
@@ -872,12 +880,21 @@ async fn publish_batch_for_account(
     } else {
         images.len().max(1)
     };
-    let mut first_tid: Option<String> = None;
-    for chunk in images.chunks(chunk_size) {
+    let item_chunks = split_publication_items_by_image_chunks(publication_items, chunk_size);
+    if item_chunks.len() != images.chunks(chunk_size).len() {
+        return Err(QzoneError::unknown(format!(
+            "publication item chunks mismatch: items={} image_chunks={}",
+            item_chunks.len(),
+            images.chunks(chunk_size).len()
+        )));
+    }
+
+    let mut published = Vec::new();
+    for (chunk, items) in images.chunks(chunk_size).zip(item_chunks) {
         match client.publish_emotion(publish_text, chunk).await {
             Ok(tid) => {
-                if first_tid.is_none() {
-                    first_tid = Some(tid);
+                if let Some(remote_id) = usable_remote_id(&tid) {
+                    published.push(PublishedQzonePost { remote_id, items });
                 }
             }
             Err(err) => {
@@ -886,7 +903,43 @@ async fn publish_batch_for_account(
             }
         }
     }
-    Ok(first_tid)
+    Ok(published)
+}
+
+fn split_publication_items_by_image_chunks(
+    items: &[QzonePublicationItem],
+    chunk_size: usize,
+) -> Vec<Vec<QzonePublicationItem>> {
+    let chunk_size = chunk_size.max(1);
+    let mut chunks: Vec<Vec<QzonePublicationItem>> = Vec::new();
+    let mut current = Vec::new();
+    let mut current_images = 0usize;
+
+    for item in items {
+        let mut item_offset = 0usize;
+        let mut remaining = item.image_count;
+        while remaining > 0 {
+            if current_images == chunk_size {
+                chunks.push(current);
+                current = Vec::new();
+                current_images = 0;
+            }
+            let available = chunk_size.saturating_sub(current_images).max(1);
+            let take = remaining.min(available);
+            let mut chunk_item = item.clone();
+            chunk_item.image_offset = item.image_offset.saturating_add(item_offset);
+            chunk_item.image_count = take;
+            current.push(chunk_item);
+            current_images = current_images.saturating_add(take);
+            item_offset = item_offset.saturating_add(take);
+            remaining -= take;
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 async fn withdraw_qzone_post_images(
@@ -900,27 +953,10 @@ async fn withdraw_qzone_post_images(
     withdrawn_post_ids: &[PostId],
 ) -> Result<String, QzoneError> {
     let withdrawn = withdrawn_post_ids.iter().copied().collect::<BTreeSet<_>>();
-    let remaining_post_ids = items
-        .iter()
-        .filter_map(|item| (!withdrawn.contains(&item.post_id)).then_some(item.post_id))
-        .collect::<Vec<_>>();
     let updated_text = build_withdrawn_qzone_text(current_text, items, &withdrawn);
 
-    let images = if remaining_post_ids.is_empty() {
-        Vec::new()
-    } else {
-        let include_original_images = runtime
-            .individual_images_by_group
-            .get(group_id)
-            .copied()
-            .unwrap_or(runtime.default_individual_images);
-        let (assets, blob_paths) = {
-            let guard = state.lock().await;
-            let assets = collect_post_assets(&guard, &remaining_post_ids, include_original_images)?;
-            (assets, guard.blob_paths.clone())
-        };
-        collect_batch_images(&assets, &blob_paths).await?
-    };
+    let images =
+        collect_publication_item_images(state, runtime, group_id, items, &withdrawn).await?;
 
     let cookies = match get_cookies(state, account_id).await {
         Ok(cookies) => cookies,
@@ -944,6 +980,73 @@ async fn withdraw_qzone_post_images(
         return Err(err);
     }
     Ok(updated_text)
+}
+
+async fn collect_publication_item_images(
+    state: &Arc<Mutex<QzoneState>>,
+    runtime: &QzoneRuntimeConfig,
+    group_id: &str,
+    items: &[QzonePublicationItem],
+    withdrawn: &BTreeSet<PostId>,
+) -> Result<Vec<Vec<u8>>, QzoneError> {
+    let mut remaining_post_ids = Vec::new();
+    for item in items {
+        if withdrawn.contains(&item.post_id) || remaining_post_ids.contains(&item.post_id) {
+            continue;
+        }
+        remaining_post_ids.push(item.post_id);
+    }
+    if remaining_post_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let include_original_images = runtime
+        .individual_images_by_group
+        .get(group_id)
+        .copied()
+        .unwrap_or(runtime.default_individual_images);
+    let (assets, blob_paths) = {
+        let guard = state.lock().await;
+        let assets = collect_post_assets(&guard, &remaining_post_ids, include_original_images)?;
+        (assets, guard.blob_paths.clone())
+    };
+
+    let mut images_by_post = HashMap::new();
+    for asset in assets {
+        let images = collect_images(
+            &asset.draft,
+            &blob_paths,
+            &asset.preview_blobs,
+            asset.include_original_images,
+        )
+        .await?;
+        images_by_post.insert(asset.post_id, images);
+    }
+
+    let mut out = Vec::new();
+    for item in items {
+        if withdrawn.contains(&item.post_id) {
+            continue;
+        }
+        let Some(images) = images_by_post.get(&item.post_id) else {
+            return Err(QzoneError::unknown(format!(
+                "missing publication item images post_id={}",
+                item.post_id.0
+            )));
+        };
+        let end = item.image_offset.saturating_add(item.image_count);
+        if end > images.len() {
+            return Err(QzoneError::unknown(format!(
+                "publication image range out of bounds post_id={} offset={} count={} available={}",
+                item.post_id.0,
+                item.image_offset,
+                item.image_count,
+                images.len()
+            )));
+        }
+        out.extend(images[item.image_offset..end].iter().cloned());
+    }
+    Ok(out)
 }
 
 fn build_withdrawn_qzone_text(
@@ -1518,6 +1621,7 @@ fn build_qzone_publication_items(
                         .map(|value| *value as ExternalCode)
                 })
                 .unwrap_or(asset.post_id.0 as ExternalCode),
+            image_offset: 0,
             image_count: expected_image_count(asset),
         })
         .collect()
@@ -2922,11 +3026,13 @@ mod tests {
                 QzonePublicationItem {
                     post_id: post_a,
                     external_code: 5,
+                    image_offset: 0,
                     image_count: 1,
                 },
                 QzonePublicationItem {
                     post_id: post_b,
                     external_code: 6,
+                    image_offset: 0,
                     image_count: 1,
                 },
             ],
@@ -2934,6 +3040,66 @@ mod tests {
         );
 
         assert_eq!(text, "#5~#6\n#5 [已删除]\n#6 [已删除]");
+    }
+
+    #[test]
+    fn split_publication_items_preserves_chunk_offsets() {
+        let post_a = Id128(10);
+        let post_b = Id128(20);
+        let chunks = split_publication_items_by_image_chunks(
+            &[
+                QzonePublicationItem {
+                    post_id: post_a,
+                    external_code: 5,
+                    image_offset: 0,
+                    image_count: 3,
+                },
+                QzonePublicationItem {
+                    post_id: post_b,
+                    external_code: 6,
+                    image_offset: 0,
+                    image_count: 2,
+                },
+            ],
+            2,
+        );
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(
+            chunks[0],
+            vec![QzonePublicationItem {
+                post_id: post_a,
+                external_code: 5,
+                image_offset: 0,
+                image_count: 2,
+            }]
+        );
+        assert_eq!(
+            chunks[1],
+            vec![
+                QzonePublicationItem {
+                    post_id: post_a,
+                    external_code: 5,
+                    image_offset: 2,
+                    image_count: 1,
+                },
+                QzonePublicationItem {
+                    post_id: post_b,
+                    external_code: 6,
+                    image_offset: 0,
+                    image_count: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            chunks[2],
+            vec![QzonePublicationItem {
+                post_id: post_b,
+                external_code: 6,
+                image_offset: 1,
+                image_count: 1,
+            }]
+        );
     }
 
     fn make_rgba_pattern(width: u32, height: u32, transparent: bool) -> RgbaImage {
