@@ -802,6 +802,8 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
             withdrawn_post_ids,
             ..
         } => {
+            let effective_withdrawn_post_ids =
+                effective_withdrawn_post_ids(*post_id, withdrawn_post_ids);
             let key = crate::event::QzonePublicationKey {
                 account_id: account_id.clone(),
                 remote_id: remote_id.clone(),
@@ -810,8 +812,8 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
                 publication.text = text.clone();
                 publication
                     .withdrawn_posts
-                    .extend(withdrawn_post_ids.iter().copied());
-                for withdrawn_post_id in withdrawn_post_ids {
+                    .extend(effective_withdrawn_post_ids.iter().copied());
+                for withdrawn_post_id in &effective_withdrawn_post_ids {
                     publication
                         .pending_withdrawn_posts
                         .remove(withdrawn_post_id);
@@ -820,7 +822,7 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
             if let Some(meta) = state.posts.get_mut(post_id) {
                 meta.last_error = None;
             }
-            for withdrawn_post_id in withdrawn_post_ids {
+            for withdrawn_post_id in &effective_withdrawn_post_ids {
                 if let Some(meta) = state.posts.get_mut(withdrawn_post_id) {
                     meta.last_error = None;
                 }
@@ -836,12 +838,14 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
             withdrawn_post_ids,
             error,
         } => {
+            let effective_withdrawn_post_ids =
+                effective_withdrawn_post_ids(*post_id, withdrawn_post_ids);
             let key = crate::event::QzonePublicationKey {
                 account_id: account_id.clone(),
                 remote_id: remote_id.clone(),
             };
             if let Some(publication) = state.qzone_publications.get_mut(&key) {
-                for withdrawn_post_id in withdrawn_post_ids {
+                for withdrawn_post_id in &effective_withdrawn_post_ids {
                     publication
                         .pending_withdrawn_posts
                         .remove(withdrawn_post_id);
@@ -851,6 +855,17 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
                 meta.last_error = Some(error.clone());
             }
         }
+    }
+}
+
+fn effective_withdrawn_post_ids(
+    post_id: crate::ids::PostId,
+    withdrawn_post_ids: &[crate::ids::PostId],
+) -> Vec<crate::ids::PostId> {
+    if withdrawn_post_ids.is_empty() {
+        vec![post_id]
+    } else {
+        withdrawn_post_ids.to_vec()
     }
 }
 

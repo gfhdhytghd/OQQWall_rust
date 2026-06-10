@@ -325,6 +325,85 @@ fn withdraw_published_post_requests_qzone_update_and_marks_withdrawn_on_success(
 }
 
 #[test]
+fn withdraw_success_empty_ids_falls_back_to_post_id_for_old_journal_events() {
+    let mut state = StateView::default();
+    let post_id = Id128(10);
+    let review_id = Id128(110);
+    let review_code = 120;
+    let external_code = 220;
+    let mut next_id = seed_post(
+        &mut state,
+        post_id,
+        review_id,
+        review_code,
+        "group-a",
+        external_code,
+        1,
+    );
+    apply_event(
+        &mut state,
+        Event::Send(SendEvent::QzonePostPublished {
+            group_id: "group-a".to_string(),
+            account_id: "3995477265".to_string(),
+            remote_id: "tid-a".to_string(),
+            text: "#220".to_string(),
+            items: vec![QzonePublicationItem {
+                post_id,
+                external_code,
+                image_offset: 0,
+                image_count: 1,
+            }],
+        }),
+        next_id,
+    );
+    next_id += 1;
+    apply_event(
+        &mut state,
+        Event::Send(SendEvent::QzonePostWithdrawRequested {
+            post_id,
+            group_id: "group-a".to_string(),
+            account_id: "3995477265".to_string(),
+            remote_id: "tid-a".to_string(),
+            text: "#220".to_string(),
+            items: vec![QzonePublicationItem {
+                post_id,
+                external_code,
+                image_offset: 0,
+                image_count: 1,
+            }],
+            withdrawn_post_ids: vec![post_id],
+            requested_at_ms: 5_000,
+        }),
+        next_id,
+    );
+
+    apply_event(
+        &mut state,
+        Event::Send(SendEvent::QzonePostWithdrawSucceeded {
+            post_id,
+            account_id: "3995477265".to_string(),
+            remote_id: "tid-a".to_string(),
+            text: "#220\n#220 [已删除]".to_string(),
+            withdrawn_post_ids: Vec::new(),
+            withdrawn_at_ms: 6_000,
+        }),
+        next_id + 1,
+    );
+
+    assert_eq!(
+        state.posts.get(&post_id).map(|meta| meta.stage),
+        Some(PostStage::Withdrawn)
+    );
+    let publication = state
+        .qzone_publications
+        .values()
+        .next()
+        .expect("publication");
+    assert!(publication.withdrawn_posts.contains(&post_id));
+    assert!(!publication.pending_withdrawn_posts.contains(&post_id));
+}
+
+#[test]
 fn batch_withdraw_published_posts_merges_pending_qzone_withdrawals() {
     let mut state = StateView::default();
     let post_a = Id128(10);

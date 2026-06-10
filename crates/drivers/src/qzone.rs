@@ -793,6 +793,11 @@ fn usable_remote_id(remote_id: &str) -> Option<RemotePostId> {
     }
 }
 
+fn require_remote_id(remote_id: &str) -> Result<RemotePostId, QzoneError> {
+    usable_remote_id(remote_id)
+        .ok_or_else(|| QzoneError::unknown("qzone publish response missing tid"))
+}
+
 async fn publish_batch_for_account(
     state: &Arc<Mutex<QzoneState>>,
     runtime: &QzoneRuntimeConfig,
@@ -893,9 +898,8 @@ async fn publish_batch_for_account(
     for (chunk, items) in images.chunks(chunk_size).zip(item_chunks) {
         match client.publish_emotion(publish_text, chunk).await {
             Ok(tid) => {
-                if let Some(remote_id) = usable_remote_id(&tid) {
-                    published.push(PublishedQzonePost { remote_id, items });
-                }
+                let remote_id = require_remote_id(&tid)?;
+                published.push(PublishedQzonePost { remote_id, items });
             }
             Err(err) => {
                 refresh_cookie_cache(state, account_id).await;
@@ -3100,6 +3104,13 @@ mod tests {
                 image_count: 1,
             }]
         );
+    }
+
+    #[test]
+    fn require_remote_id_rejects_unusable_tid() {
+        assert!(require_remote_id("").is_err());
+        assert!(require_remote_id(" unknown ").is_err());
+        assert_eq!(require_remote_id("tid-a").expect("tid"), "tid-a");
     }
 
     fn make_rgba_pattern(width: u32, height: u32, transparent: bool) -> RgbaImage {
