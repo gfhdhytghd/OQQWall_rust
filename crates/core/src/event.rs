@@ -300,6 +300,7 @@ pub enum ReviewDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewSubmitterNoticeKind {
     Rejected,
+    Deleted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

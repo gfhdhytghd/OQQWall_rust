@@ -492,7 +492,7 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
     try {
       await api(`/api/reviews/${reviewId}/decision`, {
         method: 'POST',
-        body: JSON.stringify(buildActionPayload(action, textOverride ?? actionText, actionDelay)),
+        body: JSON.stringify(buildActionPayload(action, textOverride ?? '', actionDelay)),
       })
       notify('success', `已执行：${ACTION_LABELS[action] ?? action}`)
       setActionText('')
@@ -798,7 +798,7 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
               onRefresh={refreshDetail}
               onTextChange={setActionText}
               onDelayChange={setActionDelay}
-              onAction={(action) => detail?.review_id && runAction(detail.review_id, action)}
+              onAction={(action) => detail?.review_id && runAction(detail.review_id, action, actionText)}
               onPrev={() => detailIndex > 0 && openDetail(visiblePosts[detailIndex - 1].post_id)}
               onNext={() =>
                 detailIndex >= 0 &&
@@ -823,7 +823,7 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
           onRefresh={refreshDetail}
           onTextChange={setActionText}
           onDelayChange={setActionDelay}
-          onAction={(action) => detail?.review_id && runAction(detail.review_id, action)}
+          onAction={(action) => detail?.review_id && runAction(detail.review_id, action, actionText)}
           onPrev={() => detailIndex > 0 && openDetail(visiblePosts[detailIndex - 1].post_id)}
           onNext={() =>
             detailIndex >= 0 &&

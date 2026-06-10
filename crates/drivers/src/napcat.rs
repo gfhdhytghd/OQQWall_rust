@@ -1242,6 +1242,9 @@ async fn build_action_from_event(
             kind,
             reason,
         }) => {
+            if matches!(kind, ReviewSubmitterNoticeKind::Deleted) {
+                return None;
+            }
             let submitter = {
                 let guard = state.lock().await;
                 resolve_review_submitter(&guard, review_id)
@@ -4275,6 +4278,7 @@ fn format_review_submitter_notice(kind: ReviewSubmitterNoticeKind, reason: Optio
         ReviewSubmitterNoticeKind::Rejected => {
             format!("你的投稿已被拒，请修改后再发送。理由：{}", reason)
         }
+        ReviewSubmitterNoticeKind::Deleted => String::new(),
     }
 }
 
