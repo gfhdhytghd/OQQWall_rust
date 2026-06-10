@@ -203,15 +203,10 @@ fn build_terminal_decision_events(
             reason: reason.clone(),
         }),
     ];
-    let notice_kind = match decision {
-        ReviewDecision::Rejected => Some(crate::event::ReviewSubmitterNoticeKind::Rejected),
-        ReviewDecision::Deleted => Some(crate::event::ReviewSubmitterNoticeKind::Deleted),
-        _ => None,
-    };
-    if let Some(kind) = notice_kind {
+    if matches!(decision, ReviewDecision::Rejected) {
         events.push(Event::Review(ReviewEvent::ReviewSubmitterNoticeRequested {
             review_id,
-            kind,
+            kind: crate::event::ReviewSubmitterNoticeKind::Rejected,
             reason,
         }));
     }

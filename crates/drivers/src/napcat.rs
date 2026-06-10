@@ -4275,9 +4275,6 @@ fn format_review_submitter_notice(kind: ReviewSubmitterNoticeKind, reason: Optio
         ReviewSubmitterNoticeKind::Rejected => {
             format!("你的投稿已被拒，请修改后再发送。理由：{}", reason)
         }
-        ReviewSubmitterNoticeKind::Deleted => {
-            format!("你的投稿已被删除。理由：{}", reason)
-        }
     }
 }
 

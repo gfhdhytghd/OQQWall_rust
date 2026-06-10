@@ -358,6 +358,10 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
     return () => window.clearInterval(id)
   }, [autoRefresh, stage, groupId, sortBy, sortOrder, page, pageSize, keyword, onlyError, onlyActionable])
 
+  useEffect(() => {
+    setActionText('')
+  }, [batchAction])
+
   function currentQuery(overrides: Partial<PostQuerySnapshot> = {}): PostQuerySnapshot {
     return {
       stage,
@@ -516,6 +520,7 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
       notify('success', `批量执行完成：${ACTION_LABELS[batchAction] ?? batchAction}`)
       setSelected([])
       setSelectAllTotal(null)
+      setActionText('')
       await loadPosts({ resetSelection: true })
     } catch (error) {
       notify('error', (error as Error).message)
