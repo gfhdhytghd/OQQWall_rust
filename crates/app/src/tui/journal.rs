@@ -2111,6 +2111,65 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                 "Send.GaveUp",
                 format!("post={} reason_len={}", short_id(*post_id), reason.len()),
             ),
+            SendEvent::QzonePostPublished {
+                account_id,
+                remote_id,
+                items,
+                ..
+            } => (
+                "Send.QzonePostPublished",
+                format!(
+                    "account={} remote={} items={}",
+                    account_id,
+                    remote_id,
+                    items.len()
+                ),
+            ),
+            SendEvent::QzonePostWithdrawRequested {
+                post_id,
+                account_id,
+                remote_id,
+                withdrawn_post_ids,
+                ..
+            } => (
+                "Send.QzonePostWithdrawRequested",
+                format!(
+                    "post={} account={} remote={} withdrawn={}",
+                    short_id(*post_id),
+                    account_id,
+                    remote_id,
+                    withdrawn_post_ids.len()
+                ),
+            ),
+            SendEvent::QzonePostWithdrawSucceeded {
+                post_id,
+                account_id,
+                remote_id,
+                ..
+            } => (
+                "Send.QzonePostWithdrawSucceeded",
+                format!(
+                    "post={} account={} remote={}",
+                    short_id(*post_id),
+                    account_id,
+                    remote_id
+                ),
+            ),
+            SendEvent::QzonePostWithdrawFailed {
+                post_id,
+                account_id,
+                remote_id,
+                error,
+            } => (
+                "Send.QzonePostWithdrawFailed",
+                format!(
+                    "post={} account={} remote={} error_len={}",
+                    short_id(*post_id),
+                    account_id,
+                    remote_id,
+                    error.len()
+                ),
+            ),
         },
         Event::Blob(blob) => match blob {
             BlobEvent::BlobRegistered {

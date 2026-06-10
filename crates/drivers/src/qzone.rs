@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Cursor;
@@ -20,11 +20,12 @@ use image::{
 };
 use oqqwall_rust_core::draft::{Draft, DraftBlock, IngressMessage, MediaKind, MediaReference};
 use oqqwall_rust_core::event::{
-    BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, RenderEvent, ReviewEvent,
-    ScheduleEvent, SendEvent, SendPriority,
+    BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, QzonePublicationItem, RenderEvent,
+    ReviewEvent, ScheduleEvent, SendEvent, SendPriority,
 };
 use oqqwall_rust_core::ids::{
-    BlobId, ExternalCode, IngressId, PostId, ReviewCode, ReviewId, TimestampMs,
+    AccountId, BlobId, ExternalCode, IngressId, PostId, RemotePostId, ReviewCode, ReviewId,
+    TimestampMs,
 };
 use oqqwall_rust_core::{Command, StateView, build_draft_from_messages, derive_blob_id};
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
@@ -52,6 +53,8 @@ macro_rules! debug_log {
 
 const EMOTION_PUBLISH_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6";
+const EMOTION_UPDATE_URL: &str =
+    "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_update";
 const UPLOAD_IMAGE_URL: &str = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image";
 const CHROME_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.1.3702.40 Safari/537.36 QBWebViewUA/2 QBWebViewType/1 WKType/1";
 const MAX_UPLOAD_IMAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -555,33 +558,45 @@ pub fn spawn_qzone_sender(
                         );
                         match collect_post_assets(&guard, &batch_posts, include_original_images) {
                             Ok(assets) => {
-                                Ok((batch_posts, assets, guard.blob_paths.clone(), publish_text))
+                                let publication_items = build_qzone_publication_items(
+                                    &assets,
+                                    &guard.external_codes,
+                                    &guard.review_codes,
+                                );
+                                Ok((
+                                    batch_posts,
+                                    assets,
+                                    guard.blob_paths.clone(),
+                                    publish_text,
+                                    publication_items,
+                                ))
                             }
                             Err(err) => Err(err),
                         }
                     };
 
-                    let (batch_posts, assets, blob_paths, publish_text) = match batch_result {
-                        Ok(data) => data,
-                        Err(err) => {
-                            debug_log!(
-                                "qzone send failed: kind={:?} message={}",
-                                err.kind,
-                                err.message
-                            );
-                            let retry_at =
-                                started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
-                            let event = SendEvent::SendFailed {
-                                post_id,
-                                account_id,
-                                attempt: 1,
-                                retry_at_ms: retry_at,
-                                error: format!("[{:?}] {}", err.kind, err.message),
-                            };
-                            let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                            continue;
-                        }
-                    };
+                    let (batch_posts, assets, blob_paths, publish_text, publication_items) =
+                        match batch_result {
+                            Ok(data) => data,
+                            Err(err) => {
+                                debug_log!(
+                                    "qzone send failed: kind={:?} message={}",
+                                    err.kind,
+                                    err.message
+                                );
+                                let retry_at =
+                                    started_at_ms.saturating_add(retry_delay_ms(err.kind, 1));
+                                let event = SendEvent::SendFailed {
+                                    post_id,
+                                    account_id,
+                                    attempt: 1,
+                                    retry_at_ms: retry_at,
+                                    error: format!("[{:?}] {}", err.kind, err.message),
+                                };
+                                let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                                continue;
+                            }
+                        };
                     let attempt = {
                         let mut guard = state.lock().await;
                         let entry = guard.attempts.entry(post_id).or_insert(0);
@@ -614,15 +629,29 @@ pub fn spawn_qzone_sender(
                                 if first_tid.is_none() {
                                     first_tid = remote_id.clone();
                                 }
+                                let published_remote_id = remote_id.clone();
                                 let account_event = SendEvent::SendAccountSucceeded {
                                     post_id,
-                                    account_id: target_account,
+                                    account_id: target_account.clone(),
                                     finished_at_ms: started_at_ms,
                                     remote_id,
                                 };
                                 let _ = cmd_tx
                                     .send(Command::DriverEvent(Event::Send(account_event)))
                                     .await;
+                                if let Some(remote_id) =
+                                    usable_remote_id(published_remote_id.as_deref())
+                                {
+                                    let event = SendEvent::QzonePostPublished {
+                                        group_id: group_id.clone(),
+                                        account_id: target_account,
+                                        remote_id,
+                                        text: publish_text.clone(),
+                                        items: publication_items.clone(),
+                                    };
+                                    let _ =
+                                        cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                                }
                             }
                             Err(err) => {
                                 let failed_account_id = target_account.clone();
@@ -681,6 +710,47 @@ pub fn spawn_qzone_sender(
                         let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
                     }
                 }
+                Event::Send(SendEvent::QzonePostWithdrawRequested {
+                    post_id,
+                    group_id,
+                    account_id,
+                    remote_id,
+                    text,
+                    items,
+                    withdrawn_post_ids,
+                    requested_at_ms,
+                }) => {
+                    let result = withdraw_qzone_post_images(
+                        &state,
+                        &runtime,
+                        &group_id,
+                        &account_id,
+                        &remote_id,
+                        &text,
+                        &items,
+                        &withdrawn_post_ids,
+                    )
+                    .await;
+                    let event = match result {
+                        Ok(updated_text) => SendEvent::QzonePostWithdrawSucceeded {
+                            post_id,
+                            account_id,
+                            remote_id,
+                            text: updated_text,
+                            withdrawn_at_ms: requested_at_ms,
+                        },
+                        Err(err) => SendEvent::QzonePostWithdrawFailed {
+                            post_id,
+                            account_id,
+                            remote_id,
+                            error: format!("[{:?}] {}", err.kind, err.message),
+                        },
+                    };
+                    let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
+                }
+                Event::Send(SendEvent::QzonePostPublished { .. })
+                | Event::Send(SendEvent::QzonePostWithdrawSucceeded { .. })
+                | Event::Send(SendEvent::QzonePostWithdrawFailed { .. }) => {}
                 _ => {}
             }
         }
@@ -705,6 +775,15 @@ fn select_send_accounts(accounts: Option<&Vec<String>>, fallback_account: &str) 
         out.push(fallback_account.to_string());
     }
     out
+}
+
+fn usable_remote_id(remote_id: Option<&str>) -> Option<RemotePostId> {
+    let remote_id = remote_id?.trim();
+    if remote_id.is_empty() || remote_id == "unknown" {
+        None
+    } else {
+        Some(remote_id.to_string())
+    }
 }
 
 async fn publish_batch_for_account(
@@ -808,6 +887,97 @@ async fn publish_batch_for_account(
         }
     }
     Ok(first_tid)
+}
+
+async fn withdraw_qzone_post_images(
+    state: &Arc<Mutex<QzoneState>>,
+    runtime: &QzoneRuntimeConfig,
+    group_id: &str,
+    account_id: &AccountId,
+    remote_id: &RemotePostId,
+    current_text: &str,
+    items: &[QzonePublicationItem],
+    withdrawn_post_ids: &[PostId],
+) -> Result<String, QzoneError> {
+    let withdrawn = withdrawn_post_ids.iter().copied().collect::<BTreeSet<_>>();
+    let remaining_post_ids = items
+        .iter()
+        .filter_map(|item| (!withdrawn.contains(&item.post_id)).then_some(item.post_id))
+        .collect::<Vec<_>>();
+    let updated_text = build_withdrawn_qzone_text(current_text, items, &withdrawn);
+
+    let images = if remaining_post_ids.is_empty() {
+        Vec::new()
+    } else {
+        let include_original_images = runtime
+            .individual_images_by_group
+            .get(group_id)
+            .copied()
+            .unwrap_or(runtime.default_individual_images);
+        let (assets, blob_paths) = {
+            let guard = state.lock().await;
+            let assets = collect_post_assets(&guard, &remaining_post_ids, include_original_images)?;
+            (assets, guard.blob_paths.clone())
+        };
+        collect_batch_images(&assets, &blob_paths).await?
+    };
+
+    let cookies = match get_cookies(state, account_id).await {
+        Ok(cookies) => cookies,
+        Err(err) => {
+            refresh_cookie_cache(state, account_id).await;
+            return Err(err);
+        }
+    };
+    let client = match QzoneClient::from_cookie_map(cookies) {
+        Ok(client) => client,
+        Err(err) => {
+            refresh_cookie_cache(state, account_id).await;
+            return Err(err);
+        }
+    };
+    if let Err(err) = client
+        .update_emotion(remote_id, &updated_text, &images)
+        .await
+    {
+        refresh_cookie_cache(state, account_id).await;
+        return Err(err);
+    }
+    Ok(updated_text)
+}
+
+fn build_withdrawn_qzone_text(
+    current_text: &str,
+    items: &[QzonePublicationItem],
+    withdrawn: &BTreeSet<PostId>,
+) -> String {
+    let mut codes = items
+        .iter()
+        .filter_map(|item| {
+            withdrawn
+                .contains(&item.post_id)
+                .then_some(item.external_code)
+        })
+        .collect::<Vec<_>>();
+    codes.sort_unstable();
+    codes.dedup();
+
+    let mut text = current_text.trim_end().to_string();
+    for code in codes {
+        let marker = format!("#{} [已删除]", code);
+        if text.contains(&marker) {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&marker);
+    }
+    if text.trim().is_empty() {
+        "#0 [已删除]".to_string()
+    } else {
+        text
+    }
 }
 
 #[derive(Clone)]
@@ -976,6 +1146,113 @@ impl QzoneClient {
             .unwrap_or("unknown")
             .to_string();
         Ok(tid)
+    }
+
+    async fn update_emotion(
+        &self,
+        tid: &str,
+        content: &str,
+        images: &[Vec<u8>],
+    ) -> Result<(), QzoneError> {
+        if content.trim().is_empty() {
+            return Err(QzoneError::unknown("qzone update content cannot be empty"));
+        }
+        let cookie_header = build_cookie_header(&self.cookies);
+        let mut form: HashMap<&str, String> = HashMap::new();
+        form.insert("syn_tweet_verson", "1".to_string());
+        form.insert("tid", tid.to_string());
+        form.insert("paramstr", "1".to_string());
+        form.insert("pic_template", "".to_string());
+        form.insert("richtype", "".to_string());
+        form.insert("richval", "".to_string());
+        form.insert("special_url", "".to_string());
+        form.insert("subrichtype", "".to_string());
+        form.insert("con", content.to_string());
+        form.insert("feedversion", "1".to_string());
+        form.insert("ver", "1".to_string());
+        form.insert("ugc_right", "1".to_string());
+        form.insert("to_sign", "0".to_string());
+        form.insert("hostuin", self.uin.to_string());
+        form.insert("code_version", "1".to_string());
+        form.insert("format", "fs".to_string());
+        form.insert(
+            "qzreferrer",
+            format!("https://user.qzone.qq.com/{}", self.uin),
+        );
+
+        if !images.is_empty() {
+            let mut pic_bos = Vec::new();
+            let mut richvals = Vec::new();
+            form.insert("subrichtype", "1".to_string());
+            for image in images {
+                let upload = self.upload_image(image).await?;
+                let (picbo, richval) = get_picbo_and_richval(&upload)?;
+                pic_bos.push(picbo);
+                richvals.push(richval);
+            }
+            form.insert("pic_bo", pic_bos.join("\t"));
+            form.insert("richtype", "1".to_string());
+            form.insert("richval", richvals.join("\t"));
+        }
+
+        debug_log!(
+            "qzone update_emotion: tid={} content_len={} images={}",
+            tid,
+            content.len(),
+            images.len()
+        );
+        let res = self
+            .client
+            .post(EMOTION_UPDATE_URL)
+            .query(&[("g_tk", &self.gtk)])
+            .header("user-agent", CHROME_USER_AGENT)
+            .header("accept", "*/*")
+            .header(
+                "content-type",
+                "application/x-www-form-urlencoded;charset=UTF-8",
+            )
+            .header("referer", format!("https://user.qzone.qq.com/{}", self.uin))
+            .header("origin", "https://user.qzone.qq.com")
+            .header("cookie", cookie_header)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|err| classify_reqwest_error("update emotion request", err))?;
+
+        let status = res.status();
+        let headers = res.headers().clone();
+        let body = match res.text().await {
+            Ok(text) => text,
+            Err(err) => {
+                if !status.is_success() {
+                    let fallback = format!("<read body failed: {}>", err);
+                    debug_log_http_failure("qzone update emotion", status, &headers, &fallback);
+                    return Err(classify_http_status_with_body(
+                        "update emotion http status",
+                        status.as_u16(),
+                        &fallback,
+                    ));
+                }
+                return Err(classify_reqwest_error("update emotion read body", err));
+            }
+        };
+        if !status.is_success() {
+            debug_log_http_failure("qzone update emotion", status, &headers, &body);
+            return Err(classify_http_status_with_body(
+                "update emotion http status",
+                status.as_u16(),
+                &body,
+            ));
+        }
+        let json = parse_proxy_callback_json(&body)
+            .ok_or_else(|| QzoneError::unknown("invalid update response body"))?;
+        if let Ok(_pretty) = serde_json::to_string_pretty(&json) {
+            debug_log!("qzone update response json:\n{}", _pretty);
+        }
+        if let Some(err) = classify_response_error(&json) {
+            return Err(err.with_context("update response"));
+        }
+        Ok(())
     }
 
     async fn upload_image(&self, image: &[u8]) -> Result<Value, QzoneError> {
@@ -1187,6 +1464,7 @@ fn collect_batch_post_ids(
 }
 
 struct PostAssets {
+    post_id: PostId,
     draft: Draft,
     preview_blobs: Vec<BlobId>,
     include_original_images: bool,
@@ -1213,12 +1491,57 @@ fn collect_post_assets(
             )));
         }
         out.push(PostAssets {
+            post_id: *post_id,
             draft,
             preview_blobs,
             include_original_images,
         });
     }
     Ok(out)
+}
+
+fn build_qzone_publication_items(
+    assets: &[PostAssets],
+    external_codes: &HashMap<PostId, ExternalCode>,
+    review_codes: &HashMap<PostId, ReviewCode>,
+) -> Vec<QzonePublicationItem> {
+    assets
+        .iter()
+        .map(|asset| QzonePublicationItem {
+            post_id: asset.post_id,
+            external_code: external_codes
+                .get(&asset.post_id)
+                .copied()
+                .or_else(|| {
+                    review_codes
+                        .get(&asset.post_id)
+                        .map(|value| *value as ExternalCode)
+                })
+                .unwrap_or(asset.post_id.0 as ExternalCode),
+            image_count: expected_image_count(asset),
+        })
+        .collect()
+}
+
+fn expected_image_count(asset: &PostAssets) -> usize {
+    let mut count = asset.preview_blobs.len();
+    if asset.include_original_images {
+        count += asset
+            .draft
+            .blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block,
+                    DraftBlock::Attachment {
+                        kind: MediaKind::Image,
+                        ..
+                    }
+                )
+            })
+            .count();
+    }
+    count
 }
 
 #[cfg(debug_assertions)]
@@ -2079,6 +2402,16 @@ fn classify_response_error(json: &Value) -> Option<QzoneError> {
             return Some(classify_json_response_error(ret, message, json));
         }
     }
+    let code = json.get("code").and_then(|v| v.as_i64());
+    if let Some(code) = code {
+        if code != 0 {
+            let message = json
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("qzone error");
+            return Some(classify_json_response_error(code, message, json));
+        }
+    }
     None
 }
 
@@ -2482,6 +2815,7 @@ fn field_to_string(data: &Value, key: &str) -> Result<String, QzoneError> {
 mod tests {
     use super::*;
     use image::{Delay, Frame as ImageFrame, Rgba, RgbaImage};
+    use oqqwall_rust_core::Id128;
     use serde_json::json;
 
     #[test]
@@ -2562,6 +2896,44 @@ mod tests {
         assert!(err.message.contains("code=10045"));
         assert!(err.message.contains("\"ret\":10045"));
         assert!(err.message.contains("\"reason\":\"quota exceeded\""));
+    }
+
+    #[test]
+    fn classify_response_error_reads_qzone_update_code() {
+        let json = json!({
+            "code": -10005,
+            "message": "您未输入内容，随便写点什么吧",
+            "subcode": -4004
+        });
+
+        let err = classify_response_error(&json).expect("expected update response error");
+        assert!(err.message.contains("未输入内容"));
+        assert!(err.message.contains("code=-10005"));
+    }
+
+    #[test]
+    fn withdrawn_qzone_text_appends_sorted_unique_markers() {
+        let post_a = Id128(10);
+        let post_b = Id128(20);
+        let withdrawn = [post_b, post_a].into_iter().collect::<BTreeSet<_>>();
+        let text = build_withdrawn_qzone_text(
+            "#5~#6\n#5 [已删除]",
+            &[
+                QzonePublicationItem {
+                    post_id: post_a,
+                    external_code: 5,
+                    image_count: 1,
+                },
+                QzonePublicationItem {
+                    post_id: post_b,
+                    external_code: 6,
+                    image_count: 1,
+                },
+            ],
+            &withdrawn,
+        );
+
+        assert_eq!(text, "#5~#6\n#5 [已删除]\n#6 [已删除]");
     }
 
     fn make_rgba_pattern(width: u32, height: u32, transparent: bool) -> RgbaImage {

@@ -1,5 +1,6 @@
 use oqqwall_rust_core::event::{
-    DraftEvent, Event, ReviewDecision, ReviewEvent, ScheduleEvent, SendPriority,
+    DraftEvent, Event, ManualEvent, QzonePublicationItem, ReviewDecision, ReviewEvent,
+    ScheduleEvent, SendEvent, SendPriority,
 };
 use oqqwall_rust_core::state::PostStage;
 use oqqwall_rust_core::{
@@ -215,7 +216,8 @@ fn withdraw_requeues_post_and_rebases_following_external_codes() {
 #[test]
 fn withdraw_ignores_post_not_in_send_queue() {
     let mut state = StateView::default();
-    seed_post(&mut state, Id128(1), Id128(101), 100, "group-a", 101, 1);
+    let post_id = Id128(1);
+    seed_post(&mut state, post_id, Id128(101), 100, "group-a", 101, 1);
 
     let cmd = Command::GlobalAction(GlobalActionCommand {
         group_id: "group-a".to_string(),
@@ -226,5 +228,96 @@ fn withdraw_ignores_post_not_in_send_queue() {
     });
 
     let out = oqqwall_rust_core::decide::decide(&state, &cmd, &CoreConfig::default());
-    assert!(out.is_empty());
+    assert!(matches!(
+        out.as_slice(),
+        [Event::Manual(ManualEvent::ManualInterventionRequired { post_id: id, .. })] if *id == post_id
+    ));
+}
+
+#[test]
+fn withdraw_published_post_requests_qzone_update_and_marks_withdrawn_on_success() {
+    let mut state = StateView::default();
+    let post_id = Id128(10);
+    let review_id = Id128(110);
+    let review_code = 120;
+    let external_code = 220;
+    let mut next_id = seed_post(
+        &mut state,
+        post_id,
+        review_id,
+        review_code,
+        "group-a",
+        external_code,
+        1,
+    );
+    apply_event(
+        &mut state,
+        Event::Send(SendEvent::SendSucceeded {
+            post_id,
+            account_id: "3995477265".to_string(),
+            finished_at_ms: 2,
+            remote_id: Some("tid-a".to_string()),
+        }),
+        next_id,
+    );
+    next_id += 1;
+    apply_event(
+        &mut state,
+        Event::Send(SendEvent::QzonePostPublished {
+            group_id: "group-a".to_string(),
+            account_id: "3995477265".to_string(),
+            remote_id: "tid-a".to_string(),
+            text: "#220".to_string(),
+            items: vec![QzonePublicationItem {
+                post_id,
+                external_code,
+                image_count: 1,
+            }],
+        }),
+        next_id,
+    );
+
+    let cmd = Command::GlobalAction(GlobalActionCommand {
+        group_id: "group-a".to_string(),
+        action: GlobalAction::Withdraw { review_code },
+        operator_id: "admin".to_string(),
+        now_ms: 5_000,
+        tz_offset_minutes: 0,
+    });
+
+    let out = oqqwall_rust_core::decide::decide(&state, &cmd, &CoreConfig::default());
+    assert!(matches!(
+        out.as_slice(),
+        [Event::Send(SendEvent::QzonePostWithdrawRequested {
+            post_id: id,
+            group_id,
+            account_id,
+            remote_id,
+            text,
+            withdrawn_post_ids,
+            ..
+        })] if *id == post_id
+            && group_id == "group-a"
+            && account_id == "3995477265"
+            && remote_id == "tid-a"
+            && text == "#220"
+            && withdrawn_post_ids == &vec![post_id]
+    ));
+
+    let mut reduced = state;
+    apply_event(
+        &mut reduced,
+        Event::Send(SendEvent::QzonePostWithdrawSucceeded {
+            post_id,
+            account_id: "3995477265".to_string(),
+            remote_id: "tid-a".to_string(),
+            text: "#220\n#220 [已删除]".to_string(),
+            withdrawn_at_ms: 6_000,
+        }),
+        100,
+    );
+    assert_eq!(
+        reduced.posts.get(&post_id).map(|meta| meta.stage),
+        Some(PostStage::Withdrawn)
+    );
 }

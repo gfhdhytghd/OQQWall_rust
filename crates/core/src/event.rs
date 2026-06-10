@@ -342,6 +342,19 @@ pub enum GroupFlushReason {
     Manual,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct QzonePublicationKey {
+    pub account_id: AccountId,
+    pub remote_id: RemotePostId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QzonePublicationItem {
+    pub post_id: PostId,
+    pub external_code: ExternalCode,
+    pub image_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendEvent {
     SendStarted {
@@ -378,6 +391,36 @@ pub enum SendEvent {
     SendGaveUp {
         post_id: PostId,
         reason: String,
+    },
+    QzonePostPublished {
+        group_id: GroupId,
+        account_id: AccountId,
+        remote_id: RemotePostId,
+        text: String,
+        items: Vec<QzonePublicationItem>,
+    },
+    QzonePostWithdrawRequested {
+        post_id: PostId,
+        group_id: GroupId,
+        account_id: AccountId,
+        remote_id: RemotePostId,
+        text: String,
+        items: Vec<QzonePublicationItem>,
+        withdrawn_post_ids: Vec<PostId>,
+        requested_at_ms: TimestampMs,
+    },
+    QzonePostWithdrawSucceeded {
+        post_id: PostId,
+        account_id: AccountId,
+        remote_id: RemotePostId,
+        text: String,
+        withdrawn_at_ms: TimestampMs,
+    },
+    QzonePostWithdrawFailed {
+        post_id: PostId,
+        account_id: AccountId,
+        remote_id: RemotePostId,
+        error: String,
     },
 }
 

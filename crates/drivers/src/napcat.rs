@@ -1740,6 +1740,56 @@ async fn build_action_from_event(
             });
             Some(payload.to_string())
         }
+        Event::Send(SendEvent::QzonePostWithdrawSucceeded { post_id, .. }) => {
+            let (group_id, label) = {
+                let guard = state.lock().await;
+                let group_id = guard.post_group.get(&post_id).cloned().unwrap_or_default();
+                let label = post_code_text(&guard, post_id)
+                    .map(|code| format!("#{}", code))
+                    .unwrap_or_else(|| post_label(&guard, post_id));
+                (group_id, label)
+            };
+            if group_id.is_empty() || group_id != runtime.group_id {
+                return None;
+            }
+            let Some(audit_group_id) = runtime.audit_group_id.as_ref() else {
+                return None;
+            };
+            let text = format!("{} 已从空间动态撤回图片", label);
+            let payload = serde_json::json!({
+                "action": "send_group_msg",
+                "params": {
+                    "group_id": json_id(audit_group_id),
+                    "message": message_segments_from_text(&text)
+                }
+            });
+            Some(payload.to_string())
+        }
+        Event::Send(SendEvent::QzonePostWithdrawFailed { post_id, error, .. }) => {
+            let (group_id, label) = {
+                let guard = state.lock().await;
+                let group_id = guard.post_group.get(&post_id).cloned().unwrap_or_default();
+                let label = post_code_text(&guard, post_id)
+                    .map(|code| format!("#{}", code))
+                    .unwrap_or_else(|| post_label(&guard, post_id));
+                (group_id, label)
+            };
+            if group_id.is_empty() || group_id != runtime.group_id {
+                return None;
+            }
+            let Some(audit_group_id) = runtime.audit_group_id.as_ref() else {
+                return None;
+            };
+            let text = format!("{} 空间撤回失败：{}", label, error);
+            let payload = serde_json::json!({
+                "action": "send_group_msg",
+                "params": {
+                    "group_id": json_id(audit_group_id),
+                    "message": message_segments_from_text(&text)
+                }
+            });
+            Some(payload.to_string())
+        }
         Event::Review(ReviewEvent::ReviewPublishRequested { review_id }) => {
             let Some(group_id) = runtime.audit_group_id.as_ref() else {
                 return None;

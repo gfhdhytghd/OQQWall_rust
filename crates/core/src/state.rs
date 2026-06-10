@@ -1,7 +1,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::draft::{Draft, IngressMessage, MediaReference};
-use crate::event::{InputStatusKind, ReviewDecision, SendPriority};
+use crate::event::{
+    InputStatusKind, QzonePublicationItem, QzonePublicationKey, ReviewDecision, SendPriority,
+};
 use crate::ids::{
     AccountId, AuditMsgId, BlobId, EventId, ExternalCode, GroupId, IngressId, PostId, ReviewCode,
     ReviewId, SessionId, TimestampMs,
@@ -179,6 +181,17 @@ pub struct GroupRuntime {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QzonePublicationMeta {
+    pub group_id: GroupId,
+    pub account_id: AccountId,
+    pub remote_id: String,
+    pub text: String,
+    pub items: Vec<QzonePublicationItem>,
+    #[serde(default)]
+    pub withdrawn_posts: BTreeSet<PostId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobMeta {
     pub blob_id: BlobId,
     pub size_bytes: u64,
@@ -227,6 +240,10 @@ pub struct StateView {
 
     pub accounts: HashMap<AccountId, AccountRuntime>,
     pub group_runtime: HashMap<GroupId, GroupRuntime>,
+    #[serde(default)]
+    pub qzone_publications: HashMap<QzonePublicationKey, QzonePublicationMeta>,
+    #[serde(default)]
+    pub qzone_publications_by_post: HashMap<PostId, BTreeSet<QzonePublicationKey>>,
 
     pub blobs: HashMap<BlobId, BlobMeta>,
     pub manual_interventions: HashSet<PostId>,
@@ -264,6 +281,8 @@ impl Default for StateView {
             next_send_seq: 1,
             accounts: HashMap::new(),
             group_runtime: HashMap::new(),
+            qzone_publications: HashMap::new(),
+            qzone_publications_by_post: HashMap::new(),
             blobs: HashMap::new(),
             manual_interventions: HashSet::new(),
         }

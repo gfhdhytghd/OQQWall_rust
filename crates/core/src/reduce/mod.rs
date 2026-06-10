@@ -7,8 +7,8 @@ use crate::event::{
 };
 use crate::state::{
     AccountRuntime, BlobMeta, GroupRuntime, InputStatusMeta, MediaFetchKey, MediaFetchMeta,
-    PostMeta, PostStage, RenderMeta, ReviewMeta, SendDueKey, SendPlan, SendingMeta, SessionKey,
-    SessionMeta, StateView,
+    PostMeta, PostStage, QzonePublicationMeta, RenderMeta, ReviewMeta, SendDueKey, SendPlan,
+    SendingMeta, SessionKey, SessionMeta, StateView,
 };
 
 pub fn reduce(state: &StateView, env: &EventEnvelope) -> StateView {
@@ -747,7 +747,79 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
             }
             state.update_post_stage(*post_id, PostStage::Manual);
         }
+        SendEvent::QzonePostPublished {
+            group_id,
+            account_id,
+            remote_id,
+            text,
+            items,
+        } => {
+            let key = crate::event::QzonePublicationKey {
+                account_id: account_id.clone(),
+                remote_id: remote_id.clone(),
+            };
+            state.qzone_publications.insert(
+                key.clone(),
+                QzonePublicationMeta {
+                    group_id: group_id.clone(),
+                    account_id: account_id.clone(),
+                    remote_id: remote_id.clone(),
+                    text: text.clone(),
+                    items: items.clone(),
+                    withdrawn_posts: Default::default(),
+                },
+            );
+            for item in items {
+                state
+                    .qzone_publications_by_post
+                    .entry(item.post_id)
+                    .or_default()
+                    .insert(key.clone());
+            }
+        }
+        SendEvent::QzonePostWithdrawRequested { .. } => {}
+        SendEvent::QzonePostWithdrawSucceeded {
+            post_id,
+            account_id,
+            remote_id,
+            text,
+            ..
+        } => {
+            let key = crate::event::QzonePublicationKey {
+                account_id: account_id.clone(),
+                remote_id: remote_id.clone(),
+            };
+            if let Some(publication) = state.qzone_publications.get_mut(&key) {
+                publication.text = text.clone();
+                publication.withdrawn_posts.insert(*post_id);
+            }
+            if let Some(meta) = state.posts.get_mut(post_id) {
+                meta.last_error = None;
+            }
+            if qzone_post_fully_withdrawn(state, *post_id) {
+                state.update_post_stage(*post_id, PostStage::Withdrawn);
+            }
+        }
+        SendEvent::QzonePostWithdrawFailed { post_id, error, .. } => {
+            if let Some(meta) = state.posts.get_mut(post_id) {
+                meta.last_error = Some(error.clone());
+            }
+        }
     }
+}
+
+fn qzone_post_fully_withdrawn(state: &StateView, post_id: crate::ids::PostId) -> bool {
+    let Some(publication_keys) = state.qzone_publications_by_post.get(&post_id) else {
+        return false;
+    };
+    !publication_keys.is_empty()
+        && publication_keys.iter().all(|key| {
+            state
+                .qzone_publications
+                .get(key)
+                .map(|publication| publication.withdrawn_posts.contains(&post_id))
+                .unwrap_or(false)
+        })
 }
 
 fn reduce_blob(state: &mut StateView, event: &BlobEvent) {
