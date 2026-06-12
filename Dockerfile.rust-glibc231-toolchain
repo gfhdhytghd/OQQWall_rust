@@ -8,5 +8,6 @@ RUN apt-get update \
         pkg-config \
         libfreetype6-dev \
         libfontconfig1-dev \
+        ffmpeg \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*

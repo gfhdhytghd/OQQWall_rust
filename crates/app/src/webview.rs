@@ -725,15 +725,21 @@ async fn webview_list_posts(
                 })
                 .unwrap_or_default();
 
-            let render_image_url = guard
+            let render_blob_ids = guard
                 .render
                 .get(&meta.post_id)
-                .and_then(|r| r.png_blob)
-                .map(|blob_id| format!("/api/blobs/{}", id_to_string(blob_id)));
-            let mut preview_image_urls = Vec::new();
-            if let Some(url) = render_image_url {
-                preview_image_urls.push(url);
-            }
+                .map(|render| {
+                    if render.png_blobs.is_empty() {
+                        render.png_blob.into_iter().collect::<Vec<_>>()
+                    } else {
+                        render.png_blobs.clone()
+                    }
+                })
+                .unwrap_or_default();
+            let mut preview_image_urls = render_blob_ids
+                .into_iter()
+                .map(|blob_id| format!("/api/blobs/{}", id_to_string(blob_id)))
+                .collect::<Vec<_>>();
             preview_image_urls.extend(draft_image_urls);
             let preview_image_url = preview_image_urls.first().cloned();
             let preview_image_count = preview_image_urls.len();
@@ -969,7 +975,11 @@ async fn webview_get_post(
     let render_png_blob_id = guard
         .render
         .get(&post_id)
-        .and_then(|render| render.png_blob)
+        .and_then(|render| {
+            render
+                .png_blob
+                .or_else(|| render.png_blobs.first().copied())
+        })
         .map(id_to_string);
 
     (
@@ -1301,9 +1311,7 @@ fn can_access_blob(
         if snapshot
             .render
             .get(post_id)
-            .and_then(|meta| meta.png_blob)
-            .map(|id| id == blob_id)
-            .unwrap_or(false)
+            .is_some_and(|meta| meta.png_blob == Some(blob_id) || meta.png_blobs.contains(&blob_id))
         {
             return true;
         }

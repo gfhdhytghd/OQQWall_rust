@@ -1770,6 +1770,10 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                 "Render.PngReady",
                 format!("post={} blob={}", short_id(*post_id), short_id(*blob_id)),
             ),
+            RenderEvent::PngBatchReady { post_id, blob_ids } => (
+                "Render.PngBatchReady",
+                format!("post={} blobs={}", short_id(*post_id), blob_ids.len()),
+            ),
             RenderEvent::RenderFailed {
                 post_id,
                 attempt,

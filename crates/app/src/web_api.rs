@@ -381,12 +381,28 @@ struct CreatePostRequest {
 #[derive(Debug, Deserialize)]
 struct CreateRenderedPostRequest {
     target_account: String,
+    #[serde(default)]
     image_base64: String,
+    #[serde(default)]
     image_mime: String,
+    #[serde(default)]
+    images: Vec<CreateRenderedImageRequest>,
     #[serde(default)]
     sender_id: Option<String>,
     #[serde(default)]
     sender_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateRenderedImageRequest {
+    image_base64: String,
+    image_mime: String,
+}
+
+#[derive(Debug)]
+struct DecodedRenderedImage {
+    bytes: Vec<u8>,
+    ext: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1127,26 +1143,10 @@ async fn create_rendered_post(
         return resp;
     }
 
-    let image_bytes = match decode_required_base64_payload(&req.image_base64) {
-        Ok(bytes) => bytes,
-        Err(reason) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                &format!("image_base64 invalid: {}", reason),
-                request_id,
-            );
-        }
-    };
-    let ext = match normalize_rendered_image_extension(&req.image_mime) {
-        Some(ext) => ext,
-        None => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                "image_mime must be one of image/png,image/jpeg,image/jpg,image/webp",
-                request_id,
-            );
+    let rendered_images = match decode_rendered_images(&req) {
+        Ok(images) => images,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", &message, request_id);
         }
     };
 
@@ -1276,48 +1276,64 @@ async fn create_rendered_post(
         &ingress_bytes,
     ]);
     let post_id = derive_post_id(&[&session_id.to_be_bytes()]);
-    let blob_id = derive_blob_id(&[&post_id.to_be_bytes(), b"rendered"]);
-    let persisted_path = match persist_rendered_blob(blob_id, ext, &image_bytes) {
-        Ok(path) => path,
-        Err(err) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL",
-                &format!("persist rendered image failed: {}", err),
-                request_id,
-            );
-        }
-    };
-
-    let attachment_size = u64::try_from(image_bytes.len()).unwrap_or(u64::MAX);
     let received_at_ms = now_ms();
-    let ingress_message = IngressMessage {
-        text: String::new(),
-        attachments: vec![IngressAttachment {
+    let rendered_image_count = rendered_images.len();
+    let mut blob_ids = Vec::with_capacity(rendered_image_count);
+    let mut ingress_attachments = Vec::with_capacity(rendered_image_count);
+    let mut draft_blocks = Vec::with_capacity(rendered_image_count);
+    let mut driver_events = Vec::with_capacity((rendered_image_count * 2) + 3);
+
+    for (idx, image) in rendered_images.into_iter().enumerate() {
+        let blob_id = rendered_blob_id(post_id, idx);
+        let persisted_path = match persist_rendered_blob(blob_id, image.ext, &image.bytes) {
+            Ok(path) => path,
+            Err(err) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL",
+                    &format!("persist rendered image failed: {}", err),
+                    request_id,
+                );
+            }
+        };
+        let attachment_size = u64::try_from(image.bytes.len()).unwrap_or(u64::MAX);
+        let name = if rendered_image_count == 1 {
+            format!("rendered.{}", image.ext)
+        } else {
+            format!("rendered-page-{:03}.{}", idx + 1, image.ext)
+        };
+        blob_ids.push(blob_id);
+        ingress_attachments.push(IngressAttachment {
             kind: MediaKind::Image,
-            name: Some(format!("rendered.{}", ext)),
+            name: Some(name.clone()),
             reference: MediaReference::Blob { blob_id },
             size_bytes: Some(attachment_size),
-        }],
-    };
-    let draft = oqqwall_rust_core::draft::Draft {
-        blocks: vec![oqqwall_rust_core::draft::DraftBlock::Attachment {
+        });
+        draft_blocks.push(oqqwall_rust_core::draft::DraftBlock::Attachment {
             kind: oqqwall_rust_core::draft::MediaKind::Image,
-            name: Some(format!("rendered.{}", ext)),
+            name: Some(name),
             reference: oqqwall_rust_core::draft::MediaReference::Blob { blob_id },
             size_bytes: Some(attachment_size),
-        }],
-    };
-    let driver_events = [
-        oqqwall_rust_core::Event::Blob(BlobEvent::BlobRegistered {
+        });
+        driver_events.push(oqqwall_rust_core::Event::Blob(BlobEvent::BlobRegistered {
             blob_id,
             size_bytes: attachment_size,
-        }),
-        oqqwall_rust_core::Event::Blob(BlobEvent::BlobPersisted {
+        }));
+        driver_events.push(oqqwall_rust_core::Event::Blob(BlobEvent::BlobPersisted {
             blob_id,
             path: persisted_path,
-        }),
-        oqqwall_rust_core::Event::Ingress(IngressEvent::MessageAccepted {
+        }));
+    }
+
+    let ingress_message = IngressMessage {
+        text: String::new(),
+        attachments: ingress_attachments,
+    };
+    let draft = oqqwall_rust_core::draft::Draft {
+        blocks: draft_blocks,
+    };
+    driver_events.push(oqqwall_rust_core::Event::Ingress(
+        IngressEvent::MessageAccepted {
             ingress_id,
             profile_id: profile_id.clone(),
             chat_id: chat_id.clone(),
@@ -1327,8 +1343,10 @@ async fn create_rendered_post(
             platform_msg_id,
             received_at_ms,
             message: ingress_message,
-        }),
-        oqqwall_rust_core::Event::Draft(DraftEvent::PostDraftCreated {
+        },
+    ));
+    driver_events.push(oqqwall_rust_core::Event::Draft(
+        DraftEvent::PostDraftCreated {
             post_id,
             session_id,
             group_id: group_id.to_string(),
@@ -1337,9 +1355,17 @@ async fn create_rendered_post(
             is_safe: true,
             draft,
             created_at_ms: received_at_ms,
-        }),
-        oqqwall_rust_core::Event::Render(RenderEvent::PngReady { post_id, blob_id }),
-    ];
+        },
+    ));
+    let render_event = if let [blob_id] = blob_ids.as_slice() {
+        RenderEvent::PngReady {
+            post_id,
+            blob_id: *blob_id,
+        }
+    } else {
+        RenderEvent::PngBatchReady { post_id, blob_ids }
+    };
+    driver_events.push(oqqwall_rust_core::Event::Render(render_event));
     for event in driver_events {
         if state
             .cmd_tx
@@ -1510,7 +1536,11 @@ async fn get_post(
     let render_png_blob_id = guard
         .render
         .get(&post_id)
-        .and_then(|render| render.png_blob)
+        .and_then(|render| {
+            render
+                .png_blob
+                .or_else(|| render.png_blobs.first().copied())
+        })
         .map(id_to_string);
 
     (
@@ -2404,7 +2434,7 @@ fn group_id_of_review(state: &StateView, review_id: Id128) -> Option<&str> {
 fn collect_blob_groups(state: &StateView, blob_id: Id128) -> HashSet<String> {
     let mut groups = HashSet::new();
     for (post_id, render) in &state.render {
-        if render.png_blob == Some(blob_id) {
+        if render.png_blob == Some(blob_id) || render.png_blobs.contains(&blob_id) {
             if let Some(post) = state.posts.get(post_id) {
                 groups.insert(post.group_id.clone());
             }
@@ -2463,6 +2493,41 @@ fn decode_required_base64_payload(raw: &str) -> Result<Vec<u8>, &'static str> {
     Ok(decoded)
 }
 
+fn decode_rendered_images(
+    req: &CreateRenderedPostRequest,
+) -> Result<Vec<DecodedRenderedImage>, String> {
+    let use_batch = !req.images.is_empty();
+    let image_count = if use_batch { req.images.len() } else { 1 };
+    let mut decoded = Vec::with_capacity(image_count);
+
+    for idx in 0..image_count {
+        let (image_base64, image_mime, prefix) = if use_batch {
+            (
+                req.images[idx].image_base64.as_str(),
+                req.images[idx].image_mime.as_str(),
+                format!("images[{}].", idx),
+            )
+        } else {
+            (
+                req.image_base64.as_str(),
+                req.image_mime.as_str(),
+                String::new(),
+            )
+        };
+        let bytes = decode_required_base64_payload(image_base64)
+            .map_err(|reason| format!("{}image_base64 invalid: {}", prefix, reason))?;
+        let ext = normalize_rendered_image_extension(image_mime).ok_or_else(|| {
+            format!(
+                "{}image_mime must be one of image/png,image/jpeg,image/jpg,image/webp",
+                prefix
+            )
+        })?;
+        decoded.push(DecodedRenderedImage { bytes, ext });
+    }
+
+    Ok(decoded)
+}
+
 fn normalize_rendered_image_extension(raw_mime: &str) -> Option<&'static str> {
     let mime = raw_mime.trim().to_ascii_lowercase();
     match mime.as_str() {
@@ -2471,6 +2536,15 @@ fn normalize_rendered_image_extension(raw_mime: &str) -> Option<&'static str> {
         "image/webp" => Some("webp"),
         _ => None,
     }
+}
+
+fn rendered_blob_id(post_id: Id128, page_index: usize) -> Id128 {
+    let post_bytes = post_id.to_be_bytes();
+    if page_index == 0 {
+        return derive_blob_id(&[&post_bytes, b"rendered"]);
+    }
+    let page = (page_index + 1).to_string();
+    derive_blob_id(&[&post_bytes, b"rendered-page", page.as_bytes()])
 }
 
 fn persist_rendered_blob(blob_id: Id128, ext: &str, bytes: &[u8]) -> Result<String, String> {
@@ -3889,6 +3963,7 @@ mod tests {
             target_account: "acc10001".to_string(),
             image_base64: "aGVsbG8=".to_string(),
             image_mime: "image/gif".to_string(),
+            images: Vec::new(),
             sender_id: None,
             sender_name: None,
         };
@@ -3956,6 +4031,7 @@ mod tests {
             target_account: "acc10001".to_string(),
             image_base64: "aGVsbG8=".to_string(),
             image_mime: "image/png".to_string(),
+            images: Vec::new(),
             sender_id: None,
             sender_name: None,
         };
@@ -4031,6 +4107,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_rendered_post_batch_emits_png_batch_ready() {
+        let (state, mut rx, session_id) = build_test_state(None);
+        let idem_key = "idem_rendered_batch";
+        let headers = build_headers(&session_id, Some(idem_key));
+        let expected_post =
+            expected_rendered_post_id(&session_id, "10001", "acc10001", "unknown", idem_key);
+        let expected_first = rendered_blob_id(expected_post, 0);
+        let expected_second = rendered_blob_id(expected_post, 1);
+        let shared_state = state.state.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            let review_id = Id128(998105);
+            let mut guard = shared_state.write().expect("lock");
+            guard.posts.insert(
+                expected_post,
+                PostMeta {
+                    post_id: expected_post,
+                    session_id: Id128(9105),
+                    group_id: "10001".to_string(),
+                    stage: PostStage::ReviewPending,
+                    review_id: Some(review_id),
+                    created_at_ms: now_ms(),
+                    is_anonymous: true,
+                    is_safe: true,
+                    last_error: None,
+                },
+            );
+            guard.reviews.insert(
+                review_id,
+                ReviewMeta {
+                    review_id,
+                    post_id: expected_post,
+                    review_code: 505,
+                    decision: None,
+                    audit_msg_id: None,
+                    delayed_until_ms: None,
+                    needs_republish: false,
+                    decided_by: None,
+                    decided_at_ms: None,
+                    decision_reason: None,
+                    publish_retry_at_ms: None,
+                    publish_last_error: None,
+                    publish_attempt: 0,
+                },
+            );
+        });
+        let req = CreateRenderedPostRequest {
+            target_account: "acc10001".to_string(),
+            image_base64: String::new(),
+            image_mime: String::new(),
+            images: vec![
+                CreateRenderedImageRequest {
+                    image_base64: "aGVsbG8=".to_string(),
+                    image_mime: "image/png".to_string(),
+                },
+                CreateRenderedImageRequest {
+                    image_base64: "d29ybGQ=".to_string(),
+                    image_mime: "image/jpeg".to_string(),
+                },
+            ],
+            sender_id: None,
+            sender_name: None,
+        };
+        let response = create_rendered_post(State(state), headers, Json(req))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["post_id"], json!(expected_post.0.to_string()));
+        assert_eq!(body["review_code"], 505);
+
+        let mut saw_registered = 0usize;
+        let mut saw_persisted = 0usize;
+        let mut saw_ingress = false;
+        let mut saw_draft = false;
+        let mut saw_render = false;
+        for _ in 0..7 {
+            let cmd = rx.try_recv().expect("driver event");
+            match cmd {
+                Command::DriverEvent(event) => match event {
+                    oqqwall_rust_core::Event::Blob(BlobEvent::BlobRegistered {
+                        blob_id,
+                        size_bytes,
+                    }) => {
+                        assert!(blob_id == expected_first || blob_id == expected_second);
+                        assert_eq!(size_bytes, 5);
+                        saw_registered += 1;
+                    }
+                    oqqwall_rust_core::Event::Blob(BlobEvent::BlobPersisted { blob_id, path }) => {
+                        if blob_id == expected_first {
+                            assert!(path.ends_with(".png"));
+                        } else {
+                            assert_eq!(blob_id, expected_second);
+                            assert!(path.ends_with(".jpg"));
+                        }
+                        saw_persisted += 1;
+                    }
+                    oqqwall_rust_core::Event::Ingress(IngressEvent::MessageAccepted {
+                        message,
+                        ..
+                    }) => {
+                        assert_eq!(message.attachments.len(), 2);
+                        assert_eq!(
+                            message.attachments[0].name.as_deref(),
+                            Some("rendered-page-001.png")
+                        );
+                        assert_eq!(
+                            message.attachments[1].name.as_deref(),
+                            Some("rendered-page-002.jpg")
+                        );
+                        saw_ingress = true;
+                    }
+                    oqqwall_rust_core::Event::Draft(DraftEvent::PostDraftCreated {
+                        post_id,
+                        draft,
+                        ..
+                    }) => {
+                        assert_eq!(post_id, expected_post);
+                        assert_eq!(draft.blocks.len(), 2);
+                        saw_draft = true;
+                    }
+                    oqqwall_rust_core::Event::Render(RenderEvent::PngBatchReady {
+                        post_id,
+                        blob_ids,
+                    }) => {
+                        assert_eq!(post_id, expected_post);
+                        assert_eq!(blob_ids, vec![expected_first, expected_second]);
+                        saw_render = true;
+                    }
+                    other => panic!("unexpected event: {:?}", other),
+                },
+                other => panic!("unexpected command: {:?}", other),
+            }
+        }
+        assert_eq!(saw_registered, 2);
+        assert_eq!(saw_persisted, 2);
+        assert!(saw_ingress);
+        assert!(saw_draft);
+        assert!(saw_render);
+    }
+
+    #[tokio::test]
     async fn create_rendered_post_numeric_sender_keeps_name() {
         let (state, mut rx, session_id) = build_test_state(None);
         let idem_key = "idem_rendered_numeric";
@@ -4080,6 +4298,7 @@ mod tests {
             target_account: "acc10001".to_string(),
             image_base64: "aGVsbG8=".to_string(),
             image_mime: "image/jpeg".to_string(),
+            images: Vec::new(),
             sender_id: Some("123456".to_string()),
             sender_name: Some("Alice".to_string()),
         };
@@ -4177,6 +4396,7 @@ mod tests {
             target_account: "acc10001".to_string(),
             image_base64: "aGVsbG8=".to_string(),
             image_mime: "image/webp".to_string(),
+            images: Vec::new(),
             sender_id: Some("abc_sender".to_string()),
             sender_name: Some("Alice".to_string()),
         };
@@ -4252,6 +4472,7 @@ mod tests {
             target_account: "acc10001".to_string(),
             image_base64: "aGVsbG8=".to_string(),
             image_mime: "image/png".to_string(),
+            images: Vec::new(),
             sender_id: None,
             sender_name: None,
         };
@@ -4270,6 +4491,7 @@ mod tests {
             target_account: "acc10001".to_string(),
             image_base64: "aGVsbG8=".to_string(),
             image_mime: "image/png".to_string(),
+            images: Vec::new(),
             sender_id: None,
             sender_name: None,
         };
@@ -4818,6 +5040,7 @@ mod tests {
                 post_id,
                 RenderMeta {
                     png_blob: Some(blob_id),
+                    png_blobs: vec![blob_id],
                     last_error: None,
                     last_attempt: 0,
                     retry_at_ms: None,
@@ -5025,6 +5248,7 @@ mod tests {
                 post_id,
                 RenderMeta {
                     png_blob: Some(blob_id),
+                    png_blobs: vec![blob_id],
                     last_error: None,
                     last_attempt: 0,
                     retry_at_ms: None,

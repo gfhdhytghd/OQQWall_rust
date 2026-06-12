@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use oqqwall_rust_core::{CoreConfig, GroupConfig};
 use oqqwall_rust_drivers::napcat::NapCatConfig;
+use oqqwall_rust_drivers::renderer::{DEFAULT_CANVAS_WIDTH_PX, DEFAULT_MAX_HEIGHT_PX};
 use oqqwall_rust_drivers::shortcut::{
     is_builtin_review_command_name, validate_global_shortcut_definition,
     validate_review_shortcut_definition, validate_shortcut_name,
@@ -94,6 +95,8 @@ pub struct AppConfig {
     pub webview_port: u16,
     pub webview_session_ttl_sec: i64,
     pub webview_admins: Vec<WebviewAdminAccount>,
+    pub renderer_canvas_width_px: u32,
+    pub renderer_max_height_px: u32,
     pub telemetry: TelemetryConfig,
     core_config: CoreConfig,
     #[cfg(debug_assertions)]
@@ -151,6 +154,7 @@ impl AppConfig {
         let default_friend_add_message = parse_string(common.get("friend_add_message"));
         let common_web_api = common.get("web_api").and_then(|value| value.as_object());
         let common_webview = common.get("webview").and_then(|value| value.as_object());
+        let common_renderer = common.get("renderer").and_then(|value| value.as_object());
         let common_telemetry = common.get("telemetry").and_then(|value| value.as_object());
         let web_api_enabled = common_web_api
             .and_then(|obj| parse_bool(obj.get("enabled")))
@@ -179,6 +183,14 @@ impl AppConfig {
             .and_then(|obj| parse_i64(obj.get("session_ttl_sec")))
             .unwrap_or(12 * 60 * 60)
             .clamp(300, 7 * 24 * 60 * 60);
+        let renderer_canvas_width_px = common_renderer
+            .and_then(|obj| parse_u32(obj.get("canvas_width_px")))
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_CANVAS_WIDTH_PX);
+        let renderer_max_height_px = common_renderer
+            .and_then(|obj| parse_u32(obj.get("max_height_px")))
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_HEIGHT_PX);
         let telemetry_enabled = common_telemetry
             .and_then(|obj| parse_bool(obj.get("enabled")))
             .unwrap_or(true);
@@ -221,7 +233,7 @@ impl AppConfig {
             max_append_messages: telemetry_max_append_messages,
         };
         debug_log!(
-            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={} at_unprived_sender={} web_api_enabled={} web_api_port={} web_api_token_present={} webview_enabled={} webview_host={} webview_port={} webview_admins={} telemetry_enabled={} telemetry_upload_enabled={} telemetry_endpoint_present={}",
+            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={} at_unprived_sender={} web_api_enabled={} web_api_port={} web_api_token_present={} webview_enabled={} webview_host={} webview_port={} webview_admins={} renderer_canvas_width_px={} renderer_max_height_px={} telemetry_enabled={} telemetry_upload_enabled={} telemetry_endpoint_present={}",
             tz_offset_minutes,
             default_process_waittime_ms,
             max_cache_mb,
@@ -233,6 +245,8 @@ impl AppConfig {
             webview_host,
             webview_port,
             parse_admin_entries(root_obj.get("webview_global_admins")).len(),
+            renderer_canvas_width_px,
+            renderer_max_height_px,
             telemetry.enabled,
             telemetry.upload_enabled,
             telemetry.upload_endpoint.is_some()
@@ -366,6 +380,8 @@ impl AppConfig {
             webview_port,
             webview_session_ttl_sec,
             webview_admins,
+            renderer_canvas_width_px,
+            renderer_max_height_px,
             telemetry,
             core_config,
             #[cfg(debug_assertions)]
@@ -600,6 +616,9 @@ fn normalize_config_in_place(root: &mut Value) -> Result<bool, String> {
         if normalize_common_web(common_obj) {
             changed = true;
         }
+        if normalize_common_renderer(common_obj) {
+            changed = true;
+        }
         if normalize_common_unsupported(common_obj) {
             changed = true;
         }
@@ -689,6 +708,39 @@ fn normalize_common_web(common_obj: &mut Map<String, Value>) -> bool {
             changed = true;
         }
     }
+    changed
+}
+
+fn normalize_common_renderer(common_obj: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    let mut renderer_obj = common_obj
+        .get("renderer")
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(value) = common_obj.remove("canvas_width_px") {
+        if !renderer_obj.contains_key("canvas_width_px") {
+            renderer_obj.insert("canvas_width_px".to_string(), value);
+        }
+        changed = true;
+    }
+    if let Some(value) = common_obj.remove("max_height_px") {
+        if !renderer_obj.contains_key("max_height_px") {
+            renderer_obj.insert("max_height_px".to_string(), value);
+        }
+        changed = true;
+    }
+    if !renderer_obj.is_empty()
+        && common_obj
+            .get("renderer")
+            .and_then(|value| value.as_object())
+            != Some(&renderer_obj)
+    {
+        common_obj.insert("renderer".to_string(), Value::Object(renderer_obj));
+        changed = true;
+    }
+
     changed
 }
 
@@ -1374,6 +1426,37 @@ mod tests {
             .expect("builtin token");
         assert!(token.starts_with("t_"));
         assert_eq!(token.len(), 34);
+    }
+
+    #[test]
+    fn renderer_config_reads_common_renderer_dimensions() {
+        let root = json!({
+            "common": {
+                "napcat_base_url": "127.0.0.1:3001/oqqwall/ws",
+                "renderer": {
+                    "canvas_width_px": 512,
+                    "max_height_px": 4096
+                }
+            }
+        });
+        let config = AppConfig::from_value(&root).expect("config");
+        assert_eq!(config.renderer_canvas_width_px, 512);
+        assert_eq!(config.renderer_max_height_px, 4096);
+    }
+
+    #[test]
+    fn normalize_config_migrates_renderer_flat_keys() {
+        let mut root = json!({
+            "common": {
+                "canvas_width_px": 512,
+                "max_height_px": 4096
+            }
+        });
+        assert!(normalize_config_in_place(&mut root).expect("normalize"));
+        assert_eq!(root["common"].get("canvas_width_px"), None);
+        assert_eq!(root["common"].get("max_height_px"), None);
+        assert_eq!(root["common"]["renderer"]["canvas_width_px"], json!(512));
+        assert_eq!(root["common"]["renderer"]["max_height_px"], json!(4096));
     }
 
     #[test]

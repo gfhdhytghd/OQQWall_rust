@@ -92,6 +92,7 @@ fn message_recalled_prunes_session_and_post_links() {
 fn render_requested_clears_existing_png_blob() {
     let post_id = Id128(20);
     let blob_id = Id128(21);
+    let second_blob_id = Id128(22);
 
     let mut state = StateView::default();
     state = state.reduce(&wrap(
@@ -99,9 +100,24 @@ fn render_requested_clears_existing_png_blob() {
         1,
         1,
     ));
+    state = state.reduce(&wrap(
+        Event::Render(RenderEvent::PngReady {
+            post_id,
+            blob_id: second_blob_id,
+        }),
+        2,
+        2,
+    ));
     assert_eq!(
         state.render.get(&post_id).and_then(|meta| meta.png_blob),
         Some(blob_id)
+    );
+    assert_eq!(
+        state
+            .render
+            .get(&post_id)
+            .map(|meta| meta.png_blobs.as_slice()),
+        Some([blob_id, second_blob_id].as_slice())
     );
 
     state = state.reduce(&wrap(
@@ -110,12 +126,46 @@ fn render_requested_clears_existing_png_blob() {
             attempt: 2,
             requested_at_ms: 2,
         }),
-        2,
-        2,
+        3,
+        3,
     ));
 
     assert_eq!(
         state.render.get(&post_id).and_then(|meta| meta.png_blob),
         None
+    );
+    assert_eq!(
+        state
+            .render
+            .get(&post_id)
+            .map(|meta| meta.png_blobs.as_slice()),
+        Some([].as_slice())
+    );
+}
+
+#[test]
+fn png_batch_ready_records_all_page_blobs() {
+    let post_id = Id128(30);
+    let blob_ids = vec![Id128(31), Id128(32), Id128(33)];
+
+    let state = StateView::default().reduce(&wrap(
+        Event::Render(RenderEvent::PngBatchReady {
+            post_id,
+            blob_ids: blob_ids.clone(),
+        }),
+        1,
+        1,
+    ));
+
+    assert_eq!(
+        state.render.get(&post_id).and_then(|meta| meta.png_blob),
+        Some(blob_ids[0])
+    );
+    assert_eq!(
+        state
+            .render
+            .get(&post_id)
+            .map(|meta| meta.png_blobs.as_slice()),
+        Some(blob_ids.as_slice())
     );
 }

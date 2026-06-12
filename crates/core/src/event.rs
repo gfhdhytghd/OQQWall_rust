@@ -178,6 +178,10 @@ pub enum RenderEvent {
         post_id: PostId,
         blob_id: BlobId,
     },
+    PngBatchReady {
+        post_id: PostId,
+        blob_ids: Vec<BlobId>,
+    },
     RenderFailed {
         post_id: PostId,
         attempt: u32,

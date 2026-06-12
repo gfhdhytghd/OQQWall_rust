@@ -1,10 +1,10 @@
 use std::error::Error;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use oqqwall_rust_core::Draft;
 use oqqwall_rust_drivers::renderer::{
-    RenderPreviewHeader, RendererRuntimeConfig, render_preview_png,
+    RenderPreviewHeader, RendererRuntimeConfig, render_preview_png_pages,
 };
 use serde::Deserialize;
 
@@ -46,14 +46,36 @@ fn main() -> Result<(), Box<dyn Error>> {
             .insert(fixture.header.group_id.clone(), watermark_text);
     }
 
-    let bytes = render_preview_png(&fixture.draft, fixture.header, &config)?;
-    if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
+    let pages = render_preview_png_pages(&fixture.draft, fixture.header, &config)?;
+    for (idx, bytes) in pages.into_iter().enumerate() {
+        let page_output = if idx == 0 {
+            output.clone()
+        } else {
+            page_output_path(&output, idx + 1)
+        };
+        if let Some(parent) = page_output
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(page_output, bytes)?;
     }
-    fs::write(output, bytes)?;
     Ok(())
 }
 
 fn usage() -> String {
     "usage: render_fixture <fixture.json> <output.png>".to_string()
+}
+
+fn page_output_path(output: &Path, page_number: usize) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    let ext = output
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("png");
+    output.with_file_name(format!("{stem}-page-{page_number:03}.{ext}"))
 }

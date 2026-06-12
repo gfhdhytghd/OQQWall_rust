@@ -313,6 +313,7 @@ fn tick_retries_render_after_failure() {
         post_id,
         RenderMeta {
             png_blob: None,
+            png_blobs: Vec::new(),
             last_error: Some("render failed".to_string()),
             last_attempt: 1,
             retry_at_ms: Some(900),

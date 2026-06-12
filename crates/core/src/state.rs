@@ -84,6 +84,8 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderMeta {
     pub png_blob: Option<BlobId>,
+    #[serde(default)]
+    pub png_blobs: Vec<BlobId>,
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_attempt: u32,

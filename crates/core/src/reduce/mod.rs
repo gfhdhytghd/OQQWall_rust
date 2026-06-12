@@ -5,6 +5,7 @@ use crate::event::{
     IngressEvent, InputStatusKind, ManualEvent, MediaEvent, RenderEvent, ReviewEvent,
     ScheduleEvent, SendEvent, SessionEvent,
 };
+use crate::ids::{BlobId, PostId};
 use crate::state::{
     AccountRuntime, BlobMeta, GroupRuntime, InputStatusMeta, MediaFetchKey, MediaFetchMeta,
     PostMeta, PostStage, QzonePublicationMeta, RenderMeta, ReviewMeta, SendDueKey, SendPlan,
@@ -299,27 +300,23 @@ fn reduce_render(state: &mut StateView, event: &RenderEvent) {
         } => {
             let meta = state.render.entry(*post_id).or_insert(RenderMeta {
                 png_blob: None,
+                png_blobs: Vec::new(),
                 last_error: None,
                 last_attempt: 0,
                 retry_at_ms: None,
             });
             meta.png_blob = None;
+            meta.png_blobs.clear();
             meta.last_attempt = *attempt;
             meta.retry_at_ms = None;
             meta.last_error = None;
             state.update_post_stage(*post_id, PostStage::RenderRequested);
         }
         RenderEvent::PngReady { post_id, blob_id } => {
-            let meta = state.render.entry(*post_id).or_insert(RenderMeta {
-                png_blob: None,
-                last_error: None,
-                last_attempt: 0,
-                retry_at_ms: None,
-            });
-            meta.png_blob = Some(*blob_id);
-            meta.last_error = None;
-            meta.retry_at_ms = None;
-            state.update_post_stage(*post_id, PostStage::Rendered);
+            reduce_png_ready(state, *post_id, &[*blob_id]);
+        }
+        RenderEvent::PngBatchReady { post_id, blob_ids } => {
+            reduce_png_ready(state, *post_id, blob_ids);
         }
         RenderEvent::RenderFailed {
             post_id,
@@ -329,6 +326,7 @@ fn reduce_render(state: &mut StateView, event: &RenderEvent) {
         } => {
             let meta = state.render.entry(*post_id).or_insert(RenderMeta {
                 png_blob: None,
+                png_blobs: Vec::new(),
                 last_error: None,
                 last_attempt: 0,
                 retry_at_ms: None,
@@ -339,6 +337,30 @@ fn reduce_render(state: &mut StateView, event: &RenderEvent) {
             state.update_post_stage(*post_id, PostStage::Failed);
         }
     }
+}
+
+fn reduce_png_ready(state: &mut StateView, post_id: PostId, blob_ids: &[BlobId]) {
+    if blob_ids.is_empty() {
+        return;
+    }
+    let meta = state.render.entry(post_id).or_insert(RenderMeta {
+        png_blob: None,
+        png_blobs: Vec::new(),
+        last_error: None,
+        last_attempt: 0,
+        retry_at_ms: None,
+    });
+    if meta.png_blob.is_none() {
+        meta.png_blob = blob_ids.first().copied();
+    }
+    for blob_id in blob_ids {
+        if !meta.png_blobs.contains(blob_id) {
+            meta.png_blobs.push(*blob_id);
+        }
+    }
+    meta.last_error = None;
+    meta.retry_at_ms = None;
+    state.update_post_stage(post_id, PostStage::Rendered);
 }
 
 fn reduce_review(state: &mut StateView, event: &ReviewEvent) {

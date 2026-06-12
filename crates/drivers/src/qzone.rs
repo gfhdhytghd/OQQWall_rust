@@ -259,11 +259,22 @@ fn build_state_from_view(view: &StateView) -> QzoneState {
     }
 
     for (post_id, render) in &view.render {
-        if render.png_blob.is_some() {
+        let mut pngs = render.png_blobs.clone();
+        if pngs.is_empty() {
+            if let Some(png) = render.png_blob {
+                pngs.push(png);
+            }
+        } else if let Some(png) = render.png_blob {
+            if !pngs.contains(&png) {
+                pngs.insert(0, png);
+            }
+        }
+        if !pngs.is_empty() {
             state.render_blobs.insert(
                 *post_id,
                 RenderBlobs {
-                    png: render.png_blob,
+                    png: pngs.first().copied(),
+                    pngs,
                 },
             );
         }
@@ -284,9 +295,10 @@ struct CookieCache {
     fetched_at_ms: TimestampMs,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct RenderBlobs {
     png: Option<BlobId>,
+    pngs: Vec<BlobId>,
 }
 
 #[cfg(debug_assertions)]
@@ -483,16 +495,35 @@ pub fn spawn_qzone_sender(
                     let mut guard = state.lock().await;
                     let entry = guard.render_blobs.entry(post_id).or_default();
                     entry.png = None;
+                    entry.pngs.clear();
                 }
                 Event::Render(RenderEvent::PngReady { post_id, blob_id }) => {
                     let mut guard = state.lock().await;
                     let entry = guard.render_blobs.entry(post_id).or_default();
-                    entry.png = Some(blob_id);
+                    if entry.png.is_none() {
+                        entry.png = Some(blob_id);
+                    }
+                    if !entry.pngs.contains(&blob_id) {
+                        entry.pngs.push(blob_id);
+                    }
+                }
+                Event::Render(RenderEvent::PngBatchReady { post_id, blob_ids }) => {
+                    let mut guard = state.lock().await;
+                    let entry = guard.render_blobs.entry(post_id).or_default();
+                    if entry.png.is_none() {
+                        entry.png = blob_ids.first().copied();
+                    }
+                    for blob_id in blob_ids {
+                        if !entry.pngs.contains(&blob_id) {
+                            entry.pngs.push(blob_id);
+                        }
+                    }
                 }
                 Event::Render(RenderEvent::RenderFailed { post_id, .. }) => {
                     let mut guard = state.lock().await;
                     let entry = guard.render_blobs.entry(post_id).or_default();
                     entry.png = None;
+                    entry.pngs.clear();
                 }
                 Event::Send(SendEvent::SendSucceeded { post_id, .. })
                 | Event::Send(SendEvent::SendGaveUp { post_id, .. }) => {
@@ -1708,6 +1739,9 @@ fn render_preview_blobs(state: &QzoneState, post_id: PostId) -> Vec<BlobId> {
     let Some(render) = state.render_blobs.get(&post_id) else {
         return Vec::new();
     };
+    if !render.pngs.is_empty() {
+        return render.pngs.clone();
+    }
     if let Some(png) = render.png {
         return vec![png];
     }
@@ -1717,7 +1751,9 @@ fn render_preview_blobs(state: &QzoneState, post_id: PostId) -> Vec<BlobId> {
 fn collect_post_blob_ids(state: &QzoneState, post_id: PostId) -> Vec<BlobId> {
     let mut blob_ids = Vec::new();
     if let Some(render) = state.render_blobs.get(&post_id) {
-        if let Some(png) = render.png {
+        if !render.pngs.is_empty() {
+            blob_ids.extend(render.pngs.iter().copied());
+        } else if let Some(png) = render.png {
             blob_ids.push(png);
         }
     }

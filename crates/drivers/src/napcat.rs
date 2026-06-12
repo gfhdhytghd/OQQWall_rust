@@ -16,8 +16,8 @@ use oqqwall_rust_core::draft::{
     poke_marker, reply_marker,
 };
 use oqqwall_rust_core::event::{
-    BlobEvent, DraftEvent, Event, IngressEvent, InputStatusKind, MediaEvent, ReviewDecision,
-    ReviewEvent, ReviewSubmitterNoticeKind, ScheduleEvent, SendEvent, SendPriority,
+    BlobEvent, DraftEvent, Event, IngressEvent, InputStatusKind, MediaEvent, RenderEvent,
+    ReviewDecision, ReviewEvent, ReviewSubmitterNoticeKind, ScheduleEvent, SendEvent, SendPriority,
 };
 use oqqwall_rust_core::ids::{BlobId, ExternalCode, IngressId, PostId, ReviewCode, ReviewId};
 use oqqwall_rust_core::{Command, IngressCommand, StateView, derive_blob_id, derive_ingress_id};
@@ -210,6 +210,7 @@ struct NapCatState {
     post_ingress: HashMap<PostId, Vec<IngressId>>,
     post_group: HashMap<PostId, String>,
     post_safe: HashMap<PostId, bool>,
+    post_render_blobs: HashMap<PostId, Vec<BlobId>>,
     post_review_code: HashMap<PostId, ReviewCode>,
     post_external_code: HashMap<PostId, ExternalCode>,
     review_submitter: HashMap<ReviewId, String>,
@@ -299,6 +300,17 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
     for (post_id, post) in &view.posts {
         state.post_group.insert(*post_id, post.group_id.clone());
         state.post_safe.insert(*post_id, post.is_safe);
+    }
+    for (post_id, render) in &view.render {
+        let mut blob_ids = render.png_blobs.clone();
+        if blob_ids.is_empty() {
+            if let Some(blob_id) = render.png_blob {
+                blob_ids.push(blob_id);
+            }
+        }
+        if !blob_ids.is_empty() {
+            state.post_render_blobs.insert(*post_id, blob_ids);
+        }
     }
     for (review_id, review) in &view.reviews {
         let group_id = state
@@ -1073,6 +1085,30 @@ async fn build_action_from_event(
             guard.post_safe.insert(post_id, is_safe);
             None
         }
+        Event::Render(RenderEvent::RenderRequested { post_id, .. }) => {
+            let mut guard = state.lock().await;
+            guard.post_render_blobs.remove(&post_id);
+            None
+        }
+        Event::Render(RenderEvent::PngReady { post_id, blob_id }) => {
+            let mut guard = state.lock().await;
+            let blobs = guard.post_render_blobs.entry(post_id).or_default();
+            if !blobs.contains(&blob_id) {
+                blobs.push(blob_id);
+            }
+            None
+        }
+        Event::Render(RenderEvent::PngBatchReady { post_id, blob_ids }) => {
+            let mut guard = state.lock().await;
+            let blobs = guard.post_render_blobs.entry(post_id).or_default();
+            for blob_id in blob_ids {
+                if !blobs.contains(&blob_id) {
+                    blobs.push(blob_id);
+                }
+            }
+            None
+        }
+        Event::Render(RenderEvent::RenderFailed { .. }) => None,
         Event::Review(ReviewEvent::ReviewInfoSynced {
             review_id,
             post_id,
@@ -1818,14 +1854,15 @@ async fn build_action_from_event(
             if let Some(user_id) = resolve_post_submitter_with_ingress(&guard, &ingress_ids) {
                 guard.review_submitter.insert(review_id, user_id);
             }
-            let preview = rendered_png_preview(info.post_id);
+            let render_blob_ids = rendered_png_blob_ids(&guard, info.post_id);
+            let previews = rendered_png_previews(info.post_id, &render_blob_ids, &guard.blob_paths);
             let is_safe = guard.post_safe.get(&info.post_id).copied().unwrap_or(true);
             let summary = build_audit_message(
                 info.review_code,
                 info.post_id,
                 &ingress_ids,
                 &guard.ingress_summary,
-                preview,
+                previews,
                 &guard.blob_paths,
                 is_safe,
             );
@@ -3049,6 +3086,15 @@ fn extract_message_chunks<'a>(
                                 summary_text.push_str(&placeholder);
                             }
                         }
+                        "json" => {
+                            let raw = data
+                                .and_then(|d| d.get("data"))
+                                .and_then(value_to_string)
+                                .or_else(|| data.and_then(|d| serde_json::to_string(d).ok()))
+                                .unwrap_or_default();
+                            text.push_str(&json_card_marker(&raw));
+                            summary_text.push_str("[卡片]");
+                        }
                         "forward" => {
                             let id = data
                                 .and_then(|d| d.get("id"))
@@ -3067,6 +3113,10 @@ fn extract_message_chunks<'a>(
                                     attachments: Vec::new(),
                                 });
                             }
+                        }
+                        "poke" => {
+                            text.push_str(poke_marker());
+                            summary_text.push_str("[戳一戳]");
                         }
                         "image" => {
                             let kind = image_kind_from_data(data);
@@ -4317,14 +4367,11 @@ fn build_audit_message(
     post_id: PostId,
     ingress_ids: &[IngressId],
     ingress_map: &HashMap<IngressId, IngressSummary>,
-    preview_image: Option<String>,
+    preview_images: Vec<String>,
     blob_paths: &HashMap<BlobId, String>,
     is_safe: bool,
 ) -> AuditMessage {
-    let mut images = Vec::new();
-    if let Some(preview) = preview_image {
-        images.push(preview);
-    }
+    let mut images = preview_images;
     if ingress_ids.is_empty() {
         return AuditMessage {
             text: format!("#{} post {}", review_code, post_id.0),
@@ -4555,12 +4602,39 @@ fn image_source_from_attachment(
     }
 }
 
-fn rendered_png_preview(post_id: PostId) -> Option<String> {
-    let blob_id = rendered_png_blob_id(post_id);
+fn rendered_png_blob_ids(state: &NapCatState, post_id: PostId) -> Vec<BlobId> {
+    state
+        .post_render_blobs
+        .get(&post_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn rendered_png_previews(
+    post_id: PostId,
+    blob_ids: &[BlobId],
+    blob_paths: &HashMap<BlobId, String>,
+) -> Vec<String> {
+    let mut ids = blob_ids.to_vec();
+    if ids.is_empty() {
+        ids.push(rendered_png_blob_id(post_id));
+    }
+    ids.into_iter()
+        .filter_map(|blob_id| rendered_png_preview_for_blob(blob_id, blob_paths))
+        .collect()
+}
+
+fn rendered_png_preview_for_blob(
+    blob_id: BlobId,
+    blob_paths: &HashMap<BlobId, String>,
+) -> Option<String> {
     if let Some(bytes) = blob_cache::get_bytes(blob_id) {
         return Some(format!("base64://{}", STANDARD.encode(bytes.as_ref())));
     }
-    let path = rendered_png_path(post_id);
+    if let Some(path) = blob_paths.get(&blob_id) {
+        return Some(file_uri_from_path(Path::new(path)));
+    }
+    let path = rendered_png_path_for_blob(blob_id);
     let meta = fs::metadata(&path).ok()?;
     if meta.len() == 0 {
         return None;
@@ -4572,8 +4646,7 @@ fn rendered_png_blob_id(post_id: PostId) -> BlobId {
     derive_blob_id(&[&post_id.to_be_bytes(), b"png"])
 }
 
-fn rendered_png_path(post_id: PostId) -> PathBuf {
-    let blob_id = rendered_png_blob_id(post_id);
+fn rendered_png_path_for_blob(blob_id: BlobId) -> PathBuf {
     let filename = format!("{}.png", id128_hex(blob_id.0));
     blob_root().join("png").join(filename)
 }
@@ -5209,6 +5282,26 @@ mod tests {
                 serde_json::json!({"type": "text", "data": {"text": "c"}}),
                 serde_json::json!({"type": "face", "data": {"id": "56"}}),
                 serde_json::json!({"type": "text", "data": {"text": "!"}}),
+            ]
+        );
+    }
+
+    #[test]
+    fn rendered_png_previews_keep_all_rendered_pages() {
+        let post_id = PostId::from_u128(42);
+        let page_one = rendered_png_blob_id(post_id);
+        let page_two = BlobId::from_u128(43);
+        let mut blob_paths = HashMap::new();
+        blob_paths.insert(page_one, "/tmp/page-one.png".to_string());
+        blob_paths.insert(page_two, "/tmp/page-two.png".to_string());
+
+        let previews = rendered_png_previews(post_id, &[page_one, page_two], &blob_paths);
+
+        assert_eq!(
+            previews,
+            vec![
+                "file:///tmp/page-one.png".to_string(),
+                "file:///tmp/page-two.png".to_string(),
             ]
         );
     }

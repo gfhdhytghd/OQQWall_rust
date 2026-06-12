@@ -46,7 +46,7 @@
 
 ## Container Build Environment
 - Use `Dockerfile.rust-glibc231-toolchain` to build a fixed toolchain image based on `rust-glibc231:20.04`.
-- The image includes required build deps: `python3`, `pkg-config`, `libfreetype6-dev`, `libfontconfig1-dev`, `ca-certificates`.
+- The image includes required build deps: `python3`, `pkg-config`, `libfreetype6-dev`, `libfontconfig1-dev`, `ffmpeg`, `ca-certificates`.
 - `cargo build`, `cargo test`, and `cargo check` should all run in this container environment for consistency.
 - Build image:
   - `docker build --network host -t rust-glibc231:20.04-oqqwall -f Dockerfile.rust-glibc231-toolchain .`

@@ -666,8 +666,12 @@ fn count_group_queue_images(
 fn count_post_images(state: &StateView, post_id: PostId) -> usize {
     let mut total: usize = 0;
     if let Some(render) = state.render.get(&post_id) {
-        if render.png_blob.is_some() {
-            total = total.saturating_add(1);
+        if render.png_blobs.is_empty() {
+            if render.png_blob.is_some() {
+                total = total.saturating_add(1);
+            }
+        } else {
+            total = total.saturating_add(render.png_blobs.len());
         }
     }
     if let Some(ingress_ids) = state.post_ingress.get(&post_id) {

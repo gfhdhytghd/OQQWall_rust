@@ -107,6 +107,8 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) -> Result
     }
     debug_log!("spawn renderer");
     let renderer_config = RendererRuntimeConfig {
+        canvas_width_px: config.renderer_canvas_width_px,
+        max_height_px: config.renderer_max_height_px,
         napcat_by_group: napcat_by_group.clone(),
         default_napcat: config.fallback_napcat.clone(),
         watermark_text_by_group,

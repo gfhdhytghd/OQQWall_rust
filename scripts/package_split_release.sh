@@ -9,7 +9,7 @@ if [[ ! -d res ]]; then
   exit 1
 fi
 
-cargo build -r -p OQQWall_RUST
+"$ROOT_DIR/scripts/cargo_docker.sh" build -r -p OQQWall_RUST
 
 BIN_PATH="target/release/OQQWall_RUST"
 if [[ ! -x "$BIN_PATH" ]]; then
