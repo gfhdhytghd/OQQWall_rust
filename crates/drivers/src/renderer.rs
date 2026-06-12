@@ -7781,13 +7781,17 @@ mod tests {
 
     #[test]
     fn render_preview_video_uses_image_like_preview_source() {
+        let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+        let mut cursor = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("encode test png");
+        let image_url = format!("base64://{}", STANDARD.encode(cursor.into_inner()));
         let draft = Draft {
             blocks: vec![DraftBlock::Attachment {
                 kind: MediaKind::Video,
                 name: Some("clip.mp4".to_string()),
-                reference: MediaReference::RemoteUrl {
-                    url: DEFAULT_AVATAR_PATH.to_string(),
-                },
+                reference: MediaReference::RemoteUrl { url: image_url },
                 size_bytes: None,
             }],
         };
