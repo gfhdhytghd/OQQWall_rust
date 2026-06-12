@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command as ProcessCommand;
@@ -24,7 +24,11 @@ use oqqwall_rust_core::{
     MediaReference, PostId, ReplyPreview, StateView, derive_blob_id,
 };
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
-use qrcode::{Color as QrColor, QrCode};
+use qrcode::{
+    Color as QrColor, EcLevel, QrCode, bits,
+    canvas::{Canvas as QrCanvas, MaskPattern},
+    ec,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -64,6 +68,33 @@ const MEASURE_MAX_WIDTH: f32 = 10_000.0;
 const FONT_FAMILIES: [&str; 1] = ["PingFang SC"];
 const DEFAULT_AVATAR_PATH: &str = "res/Anonymous_avatar.png";
 const AVATAR_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const CARD_REMOTE_IMAGE_TIMEOUT: Duration = Duration::from_secs(8);
+const CARD_REMOTE_IMAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_CANVAS_WIDTH_PX: u32 = 1152;
+pub const DEFAULT_MAX_HEIGHT_PX: u32 = 6912;
+const JSON_CARD_MAX_WIDTH: u32 = 276;
+const JSON_CARD_QR_SIZE: u32 = 48;
+const JSON_CARD_SIDE_GAP: u32 = 8;
+const JSON_CARD_SOURCE_ICON_SIZE: u32 = 12;
+const JSON_CARD_TAG_ICON_SIZE: u32 = 14;
+const JSON_CARD_BOTTOM_QR_RAISE_PX: u32 = 8;
+const JSON_CARD_BOTTOM_QR_DRAW_HEIGHT_SHRINK_PX: u32 = 2;
+const JSON_CARD_CONTACT_WIDTH_EXTRA_PX: u32 = 1;
+const JSON_CARD_MINIAPP_SOURCE_BASELINE_DOWN_PX: u32 = 4;
+const JSON_CARD_MINIAPP_TITLE_BASELINE_DOWN_PX: u32 = 6;
+const JSON_CARD_NEWS_WITH_FOOTER_WIDTH_SHRINK_PX: u32 = 1;
+const JSON_CARD_VERTICAL_TEXT_BASELINE_RAISE_PX: u32 = 5;
+const JSON_CARD_PREVIEW_MIN_HEIGHT: u32 = 72;
+const REPLY_BODY_BASELINE_OFFSET_PX: u32 = 4;
+const REPLY_INNER_Y_RAISE_PX: u32 = 2;
+const REPLY_WRAP_WIDTH_COMPENSATION_PX: u32 = 8;
+const SHADOW_SM_ALPHA: f32 = 0.10;
+const SHADOW_SM_BLUR_PX: f32 = 2.5;
+const TEXT_RASTER_STROKE_PX: f32 = 0.01;
+const TOP_LEVEL_TEXT_BUBBLE_WIDTH_SHRINK_PX: u32 = 6;
+const FORWARD_TEXT_BUBBLE_WIDTH_SHRINK_PX: u32 = 1;
+const FORWARD_FILE_CARD_WIDTH_SHRINK_PX: u32 = 1;
+const FORWARD_SINGLE_LINE_TEXT_HEIGHT_SHRINK_PX: u32 = 2;
 const REQUIRED_RES_FILES: &[&str] = &[
     "Anonymous_avatar.png",
     "fonts/PingFangSC-Regular.otf",
@@ -89,8 +120,8 @@ impl Default for RendererRuntimeConfig {
             .unwrap_or_else(|_| PathBuf::from("data/blobs"));
         Self {
             blob_root,
-            canvas_width_px: 384,
-            max_height_px: 2304,
+            canvas_width_px: DEFAULT_CANVAS_WIDTH_PX,
+            max_height_px: DEFAULT_MAX_HEIGHT_PX,
             napcat_by_group: HashMap::new(),
             default_napcat: None,
             watermark_text_by_group: HashMap::new(),
@@ -148,6 +179,9 @@ enum BlockKind {
     Image {
         image: Option<ResolvedImage>,
     },
+    VideoPreview {
+        image: Option<ResolvedImage>,
+    },
     MediaCard {
         lines: Vec<String>,
         icon_text: String,
@@ -162,7 +196,6 @@ enum BlockKind {
     Reply {
         meta_lines: Vec<String>,
         body_lines: Vec<String>,
-        missing: bool,
     },
     Poke {
         image: Option<ResolvedImage>,
@@ -173,6 +206,9 @@ enum BlockKind {
         desc_lines: Vec<String>,
         footer_line: Option<String>,
         media: Option<ResolvedImage>,
+        tag_icon: Option<ResolvedImage>,
+        brand_icon: Option<ResolvedImage>,
+        qr_url: Option<String>,
     },
     Forward {
         items: Vec<ForwardLayoutItem>,
@@ -223,18 +259,68 @@ struct JsonCardView {
     footer: Option<String>,
     jump_url: Option<String>,
     media_source: Option<String>,
+    tag_icon_source: Option<String>,
+    brand_icon_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct JsonCardResolvedImages {
+    media: Option<ResolvedImage>,
+    tag_icon: Option<ResolvedImage>,
+    brand_icon: Option<ResolvedImage>,
 }
 
 #[derive(Debug, Clone)]
 struct ForwardLayoutItem {
-    sender: Option<String>,
-    lines: Vec<String>,
+    blocks: Vec<BlockLayout>,
+}
+
+fn assign_legacy_json_card_qr_urls(blocks: &mut [BlockLayout]) {
+    let mut run_indices: Vec<usize> = Vec::new();
+    let mut last_url: Option<String> = None;
+
+    fn flush(
+        blocks: &mut [BlockLayout],
+        run_indices: &mut Vec<usize>,
+        last_url: &mut Option<String>,
+    ) {
+        if let Some(url) = last_url.clone() {
+            for idx in run_indices.drain(..) {
+                if let BlockKind::JsonCard { qr_url, .. } = &mut blocks[idx].kind {
+                    *qr_url = Some(url.clone());
+                }
+            }
+        } else {
+            run_indices.clear();
+        }
+        *last_url = None;
+    }
+
+    for idx in 0..blocks.len() {
+        let jump_url = match &blocks[idx].kind {
+            BlockKind::JsonCard { view, .. } => view.jump_url.clone(),
+            _ => {
+                flush(blocks, &mut run_indices, &mut last_url);
+                continue;
+            }
+        };
+
+        if let Some(url) = jump_url {
+            run_indices.push(idx);
+            last_url = Some(url);
+        } else {
+            flush(blocks, &mut run_indices, &mut last_url);
+        }
+    }
+    flush(blocks, &mut run_indices, &mut last_url);
 }
 
 #[derive(Debug, Clone)]
 struct RenderImageSources {
     avatar: Option<ResolvedImage>,
     block_images: Vec<Option<ResolvedImage>>,
+    block_tag_icons: Vec<Option<ResolvedImage>>,
+    block_brand_icons: Vec<Option<ResolvedImage>>,
     block_labels: Vec<Option<String>>,
 }
 
@@ -326,14 +412,13 @@ impl TextMeasurer {
 }
 
 fn reply_meta_text(preview: &ReplyPreview) -> String {
-    let mut parts = Vec::new();
     if let Some(meta) = preview
         .meta
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        parts.push(meta.to_string());
+        return meta.to_string();
     }
     if let Some(id) = preview
         .id
@@ -341,16 +426,9 @@ fn reply_meta_text(preview: &ReplyPreview) -> String {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        parts.push(format!("id:{}", id));
+        return format!("id:{}", id);
     }
-    if preview.missing {
-        parts.push("原消息缺失".to_string());
-    }
-    if parts.is_empty() {
-        "回复".to_string()
-    } else {
-        parts.join(" · ")
-    }
+    "回复".to_string()
 }
 
 fn parse_json_card_view(raw: &str) -> JsonCardView {
@@ -370,6 +448,8 @@ fn parse_json_card_view(raw: &str) -> JsonCardView {
                     jump_url: json_field_string(contact, &["jumpUrl", "jump_url", "url", "link"])
                         .or_else(|| contact_uin_url(contact)),
                     media_source: json_field_string(contact, &["avatar", "icon", "preview"]),
+                    tag_icon_source: json_field_string(contact, &["tagIcon", "tag_icon"]),
+                    brand_icon_source: None,
                 };
             }
         }
@@ -379,16 +459,15 @@ fn parse_json_card_view(raw: &str) -> JsonCardView {
                     view_kind,
                     title: json_field_string(miniapp, &["title", "name"])
                         .unwrap_or_else(|| "小程序卡片".to_string()),
-                    desc: json_field_string(miniapp, &["desc", "description"]),
-                    footer: json_field_string(miniapp, &["source", "tag", "footer"]),
+                    desc: json_field_string(miniapp, &["source"]),
+                    footer: json_field_string(miniapp, &["tag", "footer"]),
                     jump_url: json_field_string(
                         miniapp,
                         &["jumpUrl", "jump_url", "doc_url", "url", "link"],
                     ),
-                    media_source: json_field_string(
-                        miniapp,
-                        &["preview", "cover", "image", "sourcelogo", "icon"],
-                    ),
+                    media_source: json_field_string(miniapp, &["preview", "cover", "image"]),
+                    tag_icon_source: json_field_string(miniapp, &["tagIcon", "tag_icon"]),
+                    brand_icon_source: json_field_string(miniapp, &["sourcelogo", "sourceLogo"]),
                 };
             }
         }
@@ -402,6 +481,8 @@ fn parse_json_card_view(raw: &str) -> JsonCardView {
                     footer: json_field_string(news, &["tag", "source", "footer"]),
                     jump_url: json_field_string(news, &["jumpUrl", "jump_url", "url", "link"]),
                     media_source: json_field_string(news, &["preview", "cover", "image", "thumb"]),
+                    tag_icon_source: json_field_string(news, &["tagIcon", "tag_icon"]),
+                    brand_icon_source: None,
                 };
             }
         }
@@ -429,6 +510,8 @@ fn parse_json_card_view(raw: &str) -> JsonCardView {
                         "img_url",
                     ],
                 ),
+                tag_icon_source: json_field_string(generic, &["tagIcon", "tag_icon"]),
+                brand_icon_source: json_field_string(generic, &["sourcelogo", "sourceLogo"]),
             };
         }
     }
@@ -482,6 +565,12 @@ fn parse_json_card_view(raw: &str) -> JsonCardView {
         footer,
         jump_url,
         media_source,
+        tag_icon_source: value
+            .as_ref()
+            .and_then(|value| find_json_string(value, &["tagIcon", "tag_icon"])),
+        brand_icon_source: value
+            .as_ref()
+            .and_then(|value| find_json_string(value, &["sourcelogo", "sourceLogo"])),
     }
 }
 
@@ -510,6 +599,366 @@ fn contact_uin_url(contact: &Value) -> Option<String> {
 
 fn json_card_uses_vertical_media(view: &JsonCardView) -> bool {
     view.media_source.is_some() && !matches!(view.view_kind.as_str(), "contact" | "news")
+        || json_card_uses_bottom_qr(view)
+}
+
+fn json_card_uses_bottom_qr(view: &JsonCardView) -> bool {
+    view.jump_url.is_some() && !matches!(view.view_kind.as_str(), "contact" | "news" | "miniapp")
+}
+
+fn json_card_side_media_space(_view: &JsonCardView, has_side_media_slot: bool) -> u32 {
+    if !has_side_media_slot {
+        0
+    } else {
+        JSON_CARD_QR_SIZE + JSON_CARD_SIDE_GAP
+    }
+}
+
+fn json_card_has_side_media_slot(view: &JsonCardView, media: Option<&ResolvedImage>) -> bool {
+    matches!(view.view_kind.as_str(), "contact" | "news")
+        && (view.media_source.is_some() || media.map(|img| img.has_bytes()).unwrap_or(false))
+}
+
+fn json_card_top_qr_space(view: &JsonCardView) -> u32 {
+    if view.jump_url.is_some() && !json_card_uses_bottom_qr(view) {
+        JSON_CARD_QR_SIZE + JSON_CARD_SIDE_GAP
+    } else {
+        0
+    }
+}
+
+fn json_card_preview_height(
+    view: &JsonCardView,
+    media: Option<&ResolvedImage>,
+    width: u32,
+    card_padding: u32,
+) -> u32 {
+    if !json_card_uses_vertical_media(view) || media.is_none() {
+        return 0;
+    }
+    let inner_width = width.saturating_sub(card_padding * 2).max(1);
+    media
+        .and_then(|img| img.width.zip(img.height))
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .map(|(w, h)| {
+            ((inner_width as f32 * h as f32 / w as f32).round() as u32)
+                .max(JSON_CARD_PREVIEW_MIN_HEIGHT)
+        })
+        .unwrap_or(JSON_CARD_PREVIEW_MIN_HEIGHT)
+}
+
+fn json_card_tag_row_height(has_tag: bool) -> u32 {
+    if has_tag { JSON_CARD_TAG_ICON_SIZE } else { 0 }
+}
+
+fn json_card_miniapp_header_height(
+    source_lines: usize,
+    title_lines: usize,
+    has_qr: bool,
+    file_meta_height: u32,
+    card_line_height: u32,
+) -> u32 {
+    let source_height = if source_lines > 0 {
+        source_lines as u32 * file_meta_height + JSON_CARD_SIDE_GAP.saturating_sub(2)
+    } else {
+        0
+    };
+    let text_height = source_height + title_lines as u32 * card_line_height;
+    text_height.max(if has_qr { JSON_CARD_QR_SIZE } else { 0 })
+}
+
+fn json_card_resolved_images(
+    view: &JsonCardView,
+    block_idx: usize,
+    image_sources: &RenderImageSources,
+) -> JsonCardResolvedImages {
+    JsonCardResolvedImages {
+        media: image_sources
+            .block_images
+            .get(block_idx)
+            .and_then(|value| value.as_ref().cloned())
+            .or_else(|| {
+                view.media_source
+                    .as_deref()
+                    .filter(|source| !is_remote_http(source))
+                    .and_then(resolve_source_to_image)
+            }),
+        tag_icon: image_sources
+            .block_tag_icons
+            .get(block_idx)
+            .and_then(|value| value.as_ref().cloned())
+            .or_else(|| {
+                view.tag_icon_source
+                    .as_deref()
+                    .filter(|source| !is_remote_http(source))
+                    .and_then(resolve_source_to_image)
+            }),
+        brand_icon: image_sources
+            .block_brand_icons
+            .get(block_idx)
+            .and_then(|value| value.as_ref().cloned())
+            .or_else(|| {
+                view.brand_icon_source
+                    .as_deref()
+                    .filter(|source| !is_remote_http(source))
+                    .and_then(resolve_source_to_image)
+            }),
+    }
+}
+
+fn resolve_json_card_local_images(view: &JsonCardView) -> JsonCardResolvedImages {
+    let load = |source: &Option<String>| {
+        source
+            .as_deref()
+            .filter(|source| !is_remote_http(source))
+            .and_then(resolve_source_to_image)
+    };
+    JsonCardResolvedImages {
+        media: load(&view.media_source),
+        tag_icon: load(&view.tag_icon_source),
+        brand_icon: load(&view.brand_icon_source),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layout_json_card_block(
+    x: u32,
+    y: u32,
+    content_width: u32,
+    view: JsonCardView,
+    images: JsonCardResolvedImages,
+    font_size: u32,
+    font_weight_title: u32,
+    font_weight_body: u32,
+    meta_size: u32,
+    card_padding: u32,
+    card_line_height: u32,
+    file_meta_height: u32,
+    file_meta_gap: u32,
+    measurer: &mut TextMeasurer,
+    emoji_cache: &EmojiRenderCache,
+) -> BlockLayout {
+    let card_title_size = font_size.saturating_sub(2).max(meta_size);
+    let max_card_width = content_width.min(JSON_CARD_MAX_WIDTH).max(1);
+    let mut width = max_card_width;
+    let bottom_qr = json_card_uses_bottom_qr(&view);
+    let qr_space = json_card_top_qr_space(&view);
+    let vertical_media = json_card_uses_vertical_media(&view);
+    let side_media_slot =
+        !vertical_media && json_card_has_side_media_slot(&view, images.media.as_ref());
+    let media_space = json_card_side_media_space(&view, side_media_slot);
+    let text_max_w = width
+        .saturating_sub(card_padding * 2 + qr_space + media_space)
+        .max(1);
+    let body_text_max_w = if view.view_kind == "news" {
+        width.saturating_sub(card_padding * 2).max(1)
+    } else {
+        text_max_w
+    };
+    let title_lines = limit_lines(
+        wrap_text(
+            &view.title,
+            text_max_w,
+            card_title_size,
+            font_weight_title,
+            measurer,
+            emoji_cache,
+        ),
+        2,
+        text_max_w,
+        card_title_size,
+        font_weight_title,
+        measurer,
+        emoji_cache,
+    );
+    let desc_lines = view
+        .desc
+        .as_deref()
+        .map(|desc| {
+            let limit = if view.view_kind == "miniapp" {
+                1
+            } else {
+                usize::MAX
+            };
+            limit_lines(
+                wrap_text(
+                    desc,
+                    body_text_max_w,
+                    meta_size,
+                    font_weight_body,
+                    measurer,
+                    emoji_cache,
+                ),
+                limit,
+                body_text_max_w,
+                meta_size,
+                font_weight_body,
+                measurer,
+                emoji_cache,
+            )
+        })
+        .unwrap_or_default();
+    let footer_line = view.footer.as_deref().map(|footer| {
+        truncate_text(
+            footer,
+            body_text_max_w,
+            meta_size,
+            font_weight_body,
+            measurer,
+            emoji_cache,
+        )
+    });
+
+    if matches!(view.view_kind.as_str(), "contact" | "news") {
+        let title_width = title_lines
+            .iter()
+            .map(|line| {
+                measure_inline_text_width(
+                    line,
+                    card_title_size,
+                    font_weight_title,
+                    measurer,
+                    emoji_cache,
+                )
+            })
+            .max()
+            .unwrap_or(0);
+        let desc_width = desc_lines
+            .iter()
+            .map(|line| {
+                measure_inline_text_width(line, meta_size, font_weight_body, measurer, emoji_cache)
+            })
+            .max()
+            .unwrap_or(0);
+        let footer_width = footer_line
+            .as_ref()
+            .map(|line| {
+                let icon_space = if images.tag_icon.is_some() {
+                    JSON_CARD_TAG_ICON_SIZE + 4
+                } else {
+                    0
+                };
+                icon_space.saturating_add(measure_inline_text_width(
+                    line,
+                    meta_size,
+                    font_weight_body,
+                    measurer,
+                    emoji_cache,
+                ))
+            })
+            .unwrap_or(0);
+        let side_space = qr_space + media_space;
+        let content_fit = if view.view_kind == "news" {
+            title_width
+                .saturating_add(side_space)
+                .max(desc_width)
+                .max(footer_width)
+        } else {
+            side_space.saturating_add(title_width.max(desc_width).max(footer_width))
+        };
+        width = card_padding
+            .saturating_mul(2)
+            .saturating_add(content_fit)
+            .saturating_add(if view.view_kind == "contact" {
+                JSON_CARD_CONTACT_WIDTH_EXTRA_PX
+            } else {
+                0
+            })
+            .min(max_card_width)
+            .max(JSON_CARD_QR_SIZE);
+        if view.view_kind == "news" && footer_line.is_some() {
+            width = width.saturating_sub(JSON_CARD_NEWS_WITH_FOOTER_WIDTH_SHRINK_PX);
+        }
+    }
+
+    let has_footer = footer_line.as_ref().is_some_and(|line| !line.is_empty());
+    let text_height = title_lines.len() as u32 * card_line_height
+        + desc_lines.len() as u32 * file_meta_height
+        + if has_footer { file_meta_height } else { 0 };
+    let height = if vertical_media {
+        if view.view_kind == "miniapp" {
+            let header_height = json_card_miniapp_header_height(
+                desc_lines.len(),
+                title_lines.len(),
+                view.jump_url.is_some(),
+                file_meta_height,
+                card_line_height,
+            );
+            let preview_height =
+                json_card_preview_height(&view, images.media.as_ref(), width, card_padding);
+            card_padding * 2
+                + header_height
+                + if preview_height > 0 {
+                    JSON_CARD_SIDE_GAP.saturating_sub(2) + preview_height
+                } else {
+                    0
+                }
+                + if has_footer {
+                    JSON_CARD_SIDE_GAP.saturating_sub(2) + json_card_tag_row_height(true)
+                } else {
+                    0
+                }
+        } else {
+            let header_height = text_height.max(if qr_space > 0 { JSON_CARD_QR_SIZE } else { 0 });
+            let bottom_qr_height = if bottom_qr {
+                JSON_CARD_QR_SIZE + card_padding
+            } else {
+                0
+            };
+            let preview_height =
+                json_card_preview_height(&view, images.media.as_ref(), width, card_padding);
+            card_padding * 2
+                + header_height
+                + bottom_qr_height
+                + if preview_height > 0 {
+                    card_padding + preview_height
+                } else {
+                    0
+                }
+        }
+    } else {
+        let side_height = if qr_space > 0 || media_space > 0 {
+            JSON_CARD_QR_SIZE
+        } else {
+            0
+        };
+        if view.view_kind == "news" {
+            let body_height = desc_lines.len() as u32 * file_meta_height
+                + if has_footer {
+                    file_meta_gap + json_card_tag_row_height(true)
+                } else {
+                    0
+                };
+            card_padding * 2
+                + side_height.max(card_line_height)
+                + if body_height > 0 {
+                    JSON_CARD_SIDE_GAP.saturating_sub(2)
+                        + JSON_CARD_SIDE_GAP.saturating_sub(4)
+                        + body_height
+                } else {
+                    0
+                }
+        } else {
+            card_padding * 2 + text_height.max(side_height).max(card_line_height)
+        }
+    };
+
+    BlockLayout {
+        x,
+        y,
+        width,
+        height,
+        kind: BlockKind::JsonCard {
+            qr_url: view.jump_url.clone(),
+            view,
+            title_lines,
+            desc_lines,
+            footer_line,
+            media: images.media,
+            tag_icon: images.tag_icon,
+            brand_icon: images.brand_icon,
+        },
+    }
 }
 
 fn find_json_string(value: &Value, keys: &[&str]) -> Option<String> {
@@ -547,72 +996,529 @@ fn find_json_string(value: &Value, keys: &[&str]) -> Option<String> {
 
 fn layout_forward_items(
     items: &[ForwardItem],
-    max_width: u32,
+    x: u32,
+    start_y: u32,
+    content_width: u32,
     font_size: u32,
-    font_weight: u32,
+    line_height: u32,
+    face_size: u32,
+    font_weight_title: u32,
+    font_weight_body: u32,
+    meta_size: u32,
+    card_padding: u32,
+    card_line_height: u32,
+    card_icon_size: u32,
+    card_icon_gap: u32,
+    file_padding: u32,
+    file_line_height: u32,
+    file_meta_height: u32,
+    file_meta_gap: u32,
+    file_icon_size: u32,
+    file_icon_gap: u32,
+    bubble_pad_left: u32,
+    bubble_pad_right: u32,
+    bubble_pad_top: u32,
+    bubble_pad_bottom: u32,
+    spacing: u32,
     measurer: &mut TextMeasurer,
     emoji_cache: &EmojiRenderCache,
-) -> Vec<ForwardLayoutItem> {
-    items
-        .iter()
-        .take(5)
-        .map(|item| {
-            let summary = forward_item_summary(item);
-            let lines = limit_lines(
-                wrap_text(
-                    &summary,
-                    max_width,
-                    font_size,
-                    font_weight,
-                    measurer,
-                    emoji_cache,
-                ),
-                2,
-                max_width,
+) -> (Vec<ForwardLayoutItem>, u32) {
+    let mut cursor_y = start_y;
+    let mut out = Vec::new();
+    for item in items {
+        let mut blocks = Vec::new();
+        for block in &item.blocks {
+            if let Some(layout) = layout_forward_child_block(
+                block,
+                x,
+                cursor_y,
+                content_width,
                 font_size,
-                font_weight,
+                line_height,
+                face_size,
+                font_weight_title,
+                font_weight_body,
+                meta_size,
+                card_padding,
+                card_line_height,
+                card_icon_size,
+                card_icon_gap,
+                file_padding,
+                file_line_height,
+                file_meta_height,
+                file_meta_gap,
+                file_icon_size,
+                file_icon_gap,
+                bubble_pad_left,
+                bubble_pad_right,
+                bubble_pad_top,
+                bubble_pad_bottom,
+                measurer,
+                emoji_cache,
+            ) {
+                cursor_y = cursor_y
+                    .saturating_add(layout.height)
+                    .saturating_add(spacing);
+                blocks.push(layout);
+            }
+        }
+        if blocks.is_empty() {
+            let fallback = DraftBlock::Paragraph {
+                text: "[空消息]".to_string(),
+            };
+            if let Some(layout) = layout_forward_child_block(
+                &fallback,
+                x,
+                cursor_y,
+                content_width,
+                font_size,
+                line_height,
+                face_size,
+                font_weight_title,
+                font_weight_body,
+                meta_size,
+                card_padding,
+                card_line_height,
+                card_icon_size,
+                card_icon_gap,
+                file_padding,
+                file_line_height,
+                file_meta_height,
+                file_meta_gap,
+                file_icon_size,
+                file_icon_gap,
+                bubble_pad_left,
+                bubble_pad_right,
+                bubble_pad_top,
+                bubble_pad_bottom,
+                measurer,
+                emoji_cache,
+            ) {
+                cursor_y = cursor_y
+                    .saturating_add(layout.height)
+                    .saturating_add(spacing);
+                blocks.push(layout);
+            }
+        }
+        assign_legacy_json_card_qr_urls(&mut blocks);
+        out.push(ForwardLayoutItem { blocks });
+    }
+    let bottom = if cursor_y > start_y {
+        cursor_y.saturating_sub(spacing)
+    } else {
+        start_y
+    };
+    (out, bottom)
+}
+
+fn layout_forward_child_block(
+    block: &DraftBlock,
+    x: u32,
+    y: u32,
+    content_width: u32,
+    font_size: u32,
+    line_height: u32,
+    face_size: u32,
+    font_weight_title: u32,
+    font_weight_body: u32,
+    meta_size: u32,
+    card_padding: u32,
+    card_line_height: u32,
+    card_icon_size: u32,
+    card_icon_gap: u32,
+    file_padding: u32,
+    file_line_height: u32,
+    file_meta_height: u32,
+    file_meta_gap: u32,
+    file_icon_size: u32,
+    file_icon_gap: u32,
+    bubble_pad_left: u32,
+    bubble_pad_right: u32,
+    bubble_pad_top: u32,
+    bubble_pad_bottom: u32,
+    measurer: &mut TextMeasurer,
+    emoji_cache: &EmojiRenderCache,
+) -> Option<BlockLayout> {
+    match block {
+        DraftBlock::Paragraph { text } => {
+            let max_text_w = content_width
+                .saturating_sub(bubble_pad_left + bubble_pad_right)
+                .max(1);
+            let lines = wrap_inline_text(
+                text,
+                max_text_w,
+                font_size,
+                face_size,
+                font_weight_body,
                 measurer,
                 emoji_cache,
             );
-            ForwardLayoutItem {
-                sender: item.sender_name.clone(),
-                lines,
+            let max_line_w = lines.iter().map(|line| line.width).max().unwrap_or(0);
+            let width = (max_line_w + bubble_pad_left + bubble_pad_right)
+                .saturating_sub(FORWARD_TEXT_BUBBLE_WIDTH_SHRINK_PX)
+                .min(content_width)
+                .max(1);
+            let height = (bubble_pad_top + bubble_pad_bottom + line_height * lines.len() as u32)
+                .saturating_sub(if lines.len() == 1 {
+                    FORWARD_SINGLE_LINE_TEXT_HEIGHT_SHRINK_PX
+                } else {
+                    0
+                });
+            Some(BlockLayout {
+                x,
+                y,
+                width,
+                height,
+                kind: BlockKind::Text { lines },
+            })
+        }
+        DraftBlock::Attachment {
+            kind,
+            name,
+            reference,
+            size_bytes,
+        } => match *kind {
+            oqqwall_rust_core::MediaKind::Image | oqqwall_rust_core::MediaKind::Sticker => {
+                let image = match reference {
+                    MediaReference::RemoteUrl { url } if !is_remote_http(url) => {
+                        resolve_source_to_image(url)
+                    }
+                    _ => None,
+                };
+                let (width, height) = match image
+                    .as_ref()
+                    .and_then(|img| img.width.zip(img.height))
+                    .filter(|(w, h)| *w > 0 && *h > 0)
+                {
+                    Some((orig_w, orig_h)) => {
+                        let max_width = (content_width / 2).max(1);
+                        let max_height = 300u32;
+                        let scale_w = max_width as f32 / orig_w as f32;
+                        let scale_h = max_height as f32 / orig_h as f32;
+                        let scale = scale_w.min(scale_h).min(1.0);
+                        (
+                            (orig_w as f32 * scale).round().max(1.0) as u32,
+                            (orig_h as f32 * scale).round().max(1.0) as u32,
+                        )
+                    }
+                    None => image_preview_fallback_size(content_width),
+                };
+                Some(BlockLayout {
+                    x,
+                    y,
+                    width,
+                    height,
+                    kind: BlockKind::Image { image },
+                })
             }
-        })
-        .collect()
-}
-
-fn forward_item_summary(item: &ForwardItem) -> String {
-    let parts = item
-        .blocks
-        .iter()
-        .map(draft_block_summary)
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>();
-    if parts.is_empty() {
-        "[空消息]".to_string()
-    } else {
-        parts.join(" ")
-    }
-}
-
-fn draft_block_summary(block: &DraftBlock) -> String {
-    match block {
-        DraftBlock::Paragraph { text } => text.trim().to_string(),
-        DraftBlock::Attachment { kind, name, .. } => name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| format!("[{}]", media_label(*kind))),
-        DraftBlock::Reply { preview } => format!("[回复] {}", preview.body.trim()),
-        DraftBlock::Poke => "[戳一戳]".to_string(),
+            oqqwall_rust_core::MediaKind::Video => {
+                let image = match reference {
+                    MediaReference::RemoteUrl { url } if !is_remote_http(url) => {
+                        resolve_source_to_video_preview(url)
+                    }
+                    _ => None,
+                };
+                let (fallback_width, fallback_height) = image_preview_fallback_size(content_width);
+                let (width, height) = image_like_preview_size(
+                    image.as_ref(),
+                    content_width,
+                    fallback_width,
+                    fallback_height,
+                );
+                Some(BlockLayout {
+                    x,
+                    y,
+                    width,
+                    height,
+                    kind: BlockKind::VideoPreview { image },
+                })
+            }
+            oqqwall_rust_core::MediaKind::File => {
+                let file_name_size = font_size.saturating_sub(2).max(meta_size);
+                let max_width = content_width.min(320).max(1);
+                let text_max_w = max_width
+                    .saturating_sub(file_padding * 2 + file_icon_size + file_icon_gap)
+                    .max(1);
+                let filename = name
+                    .clone()
+                    .or_else(|| {
+                        media_reference_label(reference).and_then(|url| extract_filename(&url))
+                    })
+                    .unwrap_or_else(|| "Unknown file".to_string());
+                let name_lines = wrap_text(
+                    &filename,
+                    text_max_w,
+                    file_name_size,
+                    font_weight_body,
+                    measurer,
+                    emoji_cache,
+                );
+                let meta_line = size_bytes.as_ref().and_then(|size| format_size_line(*size));
+                let width = file_card_width(
+                    max_width,
+                    &name_lines,
+                    meta_line.as_deref(),
+                    file_padding,
+                    file_icon_size,
+                    file_icon_gap,
+                    file_name_size,
+                    11,
+                    font_weight_body,
+                    measurer,
+                    emoji_cache,
+                )
+                .saturating_sub(FORWARD_FILE_CARD_WIDTH_SHRINK_PX)
+                .max(1);
+                let name_height = name_lines.len() as u32 * file_line_height;
+                let meta_height = if meta_line.is_some() {
+                    file_meta_height + file_meta_gap
+                } else {
+                    0
+                };
+                let text_height = name_height + meta_height;
+                let content_height = file_icon_size.max(text_height);
+                Some(BlockLayout {
+                    x,
+                    y,
+                    width,
+                    height: content_height + file_padding * 2,
+                    kind: BlockKind::FileCard {
+                        name_lines,
+                        meta_line,
+                        icon_path: file_icon_path(&filename),
+                        icon_text: file_icon_text(&filename),
+                    },
+                })
+            }
+            _ => {
+                let height = 90;
+                let width = content_width.min(320).max(1);
+                let text_max_w = width
+                    .saturating_sub(card_padding * 2 + card_icon_size + card_icon_gap)
+                    .max(1);
+                let mut lines = vec![media_label(*kind).to_string()];
+                if let Some(detail) =
+                    media_reference_label(reference).and_then(|url| extract_filename(&url))
+                {
+                    let detail_line = truncate_text(
+                        &detail,
+                        text_max_w,
+                        font_size,
+                        font_weight_body,
+                        measurer,
+                        emoji_cache,
+                    );
+                    if !detail_line.is_empty() {
+                        lines.push(detail_line);
+                    }
+                }
+                Some(BlockLayout {
+                    x,
+                    y,
+                    width,
+                    height,
+                    kind: BlockKind::MediaCard {
+                        lines,
+                        icon_text: media_icon_text(*kind),
+                        media_kind: *kind,
+                    },
+                })
+            }
+        },
+        DraftBlock::Reply { preview } => {
+            let width = content_width.max(1);
+            let wrap_width = width.min(320).max(1);
+            let reply_accent_width = 3u32;
+            let reply_inner_pad_x = card_padding;
+            let reply_inner_pad_y = 6u32;
+            let reply_meta_size = font_size.saturating_sub(2).max(meta_size);
+            let reply_body_size = font_size;
+            let reply_meta_line_height = file_line_height;
+            let reply_body_line_height = line_height;
+            let reply_outer_extra_height = 6u32;
+            let text_max_w = wrap_width
+                .saturating_sub(
+                    bubble_pad_left + bubble_pad_right + reply_accent_width + reply_inner_pad_x * 2,
+                )
+                .saturating_add(REPLY_WRAP_WIDTH_COMPENSATION_PX)
+                .max(1);
+            let meta = reply_meta_text(preview);
+            let meta_lines = limit_lines(
+                wrap_text(
+                    &meta,
+                    text_max_w,
+                    reply_meta_size,
+                    font_weight_body,
+                    measurer,
+                    emoji_cache,
+                ),
+                1,
+                text_max_w,
+                reply_meta_size,
+                font_weight_body,
+                measurer,
+                emoji_cache,
+            );
+            let body_lines = wrap_text(
+                &preview.body,
+                text_max_w,
+                reply_body_size,
+                font_weight_body,
+                measurer,
+                emoji_cache,
+            );
+            let body_gap = if body_lines.is_empty() {
+                0
+            } else {
+                file_meta_gap
+            };
+            let inner_height = reply_inner_pad_y * 2
+                + meta_lines.len() as u32 * reply_meta_line_height
+                + body_gap
+                + body_lines.len() as u32 * reply_body_line_height;
+            let height =
+                bubble_pad_top + bubble_pad_bottom + inner_height + reply_outer_extra_height;
+            Some(BlockLayout {
+                x,
+                y,
+                width,
+                height,
+                kind: BlockKind::Reply {
+                    meta_lines,
+                    body_lines,
+                },
+            })
+        }
+        DraftBlock::Poke => {
+            let image = resolve_source_to_image("res/poke.png");
+            let (width, height) = image
+                .as_ref()
+                .and_then(|img| img.width.zip(img.height))
+                .map(|(orig_w, orig_h)| {
+                    let max_width = (content_width / 2).max(48);
+                    let max_height = 120u32;
+                    let scale_w = max_width as f32 / orig_w.max(1) as f32;
+                    let scale_h = max_height as f32 / orig_h.max(1) as f32;
+                    let scale = scale_w.min(scale_h).min(1.0);
+                    (
+                        (orig_w as f32 * scale).round().max(1.0) as u32,
+                        (orig_h as f32 * scale).round().max(1.0) as u32,
+                    )
+                })
+                .unwrap_or((64, 64));
+            Some(BlockLayout {
+                x,
+                y,
+                width,
+                height,
+                kind: BlockKind::Poke { image },
+            })
+        }
         DraftBlock::JsonCard { raw } => {
             let view = parse_json_card_view(raw);
-            format!("[卡片] {}", view.title)
+            Some(layout_json_card_block(
+                x,
+                y,
+                content_width,
+                view.clone(),
+                resolve_json_card_local_images(&view),
+                font_size,
+                font_weight_title,
+                font_weight_body,
+                meta_size,
+                card_padding,
+                card_line_height,
+                file_meta_height,
+                file_meta_gap,
+                measurer,
+                emoji_cache,
+            ))
         }
-        DraftBlock::Forward { items } => format!("[合并转发:{}条]", items.len()),
+        DraftBlock::Forward { items } => {
+            let title_h = meta_size + file_meta_gap;
+            let forward_child_indent = 17u32;
+            let child_x = x + forward_child_indent;
+            let child_y = y + title_h + file_meta_gap + 12;
+            let child_width = content_width.saturating_sub(forward_child_indent).max(1);
+            let (layout_items, bottom) = layout_forward_items(
+                items,
+                child_x,
+                child_y,
+                child_width,
+                font_size,
+                line_height,
+                face_size,
+                font_weight_title,
+                font_weight_body,
+                meta_size,
+                card_padding,
+                card_line_height,
+                card_icon_size,
+                card_icon_gap,
+                file_padding,
+                file_line_height,
+                file_meta_height,
+                file_meta_gap,
+                file_icon_size,
+                file_icon_gap,
+                bubble_pad_left,
+                bubble_pad_right,
+                bubble_pad_top,
+                bubble_pad_bottom,
+                10,
+                measurer,
+                emoji_cache,
+            );
+            let height = bottom.saturating_sub(y).saturating_add(card_padding);
+            Some(BlockLayout {
+                x,
+                y,
+                width: content_width,
+                height,
+                kind: BlockKind::Forward {
+                    items: layout_items,
+                },
+            })
+        }
     }
+}
+
+fn media_reference_label(reference: &MediaReference) -> Option<String> {
+    match reference {
+        MediaReference::RemoteUrl { url } => Some(url.clone()),
+        MediaReference::Blob { .. } => None,
+    }
+}
+
+fn file_card_width(
+    content_width: u32,
+    name_lines: &[String],
+    meta_line: Option<&str>,
+    file_padding: u32,
+    file_icon_size: u32,
+    file_icon_gap: u32,
+    font_size: u32,
+    meta_size: u32,
+    font_weight: u32,
+    measurer: &mut TextMeasurer,
+    emoji_cache: &EmojiRenderCache,
+) -> u32 {
+    let name_width = name_lines
+        .iter()
+        .map(|line| measure_inline_text_width(line, font_size, font_weight, measurer, emoji_cache))
+        .max()
+        .unwrap_or(0);
+    let meta_width = meta_line
+        .map(|line| measure_inline_text_width(line, meta_size, font_weight, measurer, emoji_cache))
+        .unwrap_or(0);
+    let text_width = name_width.max(meta_width);
+    let desired = text_width
+        .saturating_add(file_icon_size)
+        .saturating_add(file_icon_gap)
+        .saturating_add(file_padding * 2);
+    desired
+        .min(content_width)
+        .max(file_icon_size + file_padding * 2)
 }
 
 impl ImageMemoryCache {
@@ -724,6 +1630,40 @@ impl ImageMemoryCache {
         Some(image)
     }
 
+    async fn get_or_fetch_remote_source(&mut self, source: &str) -> Option<ResolvedImage> {
+        let key = ImageCacheKey::Source(source.to_string());
+        if let Some(image) = self.entries.get(&key) {
+            return Some(image.clone());
+        }
+        let image = fetch_remote_image(source).await?;
+        self.entries.insert(key, image.clone());
+        Some(image)
+    }
+
+    fn get_or_load_video_preview_source(&mut self, source: &str) -> Option<ResolvedImage> {
+        let key = ImageCacheKey::Source(format!("video-preview:{}", source));
+        if let Some(image) = self.entries.get(&key) {
+            return Some(image.clone());
+        }
+        let image = resolve_source_to_video_preview(source)?;
+        self.entries.insert(key, image.clone());
+        Some(image)
+    }
+
+    fn get_or_load_video_preview_blob(
+        &mut self,
+        state: &StateView,
+        blob_id: BlobId,
+    ) -> Option<ResolvedImage> {
+        let key = ImageCacheKey::Source(format!("video-preview:blob:{}", id128_hex(blob_id.0)));
+        if let Some(image) = self.entries.get(&key) {
+            return Some(image.clone());
+        }
+        let image = resolve_blob_video_preview(state, blob_id)?;
+        self.entries.insert(key, image.clone());
+        Some(image)
+    }
+
     fn get_or_load_blob(&mut self, state: &StateView, blob_id: BlobId) -> Option<ResolvedImage> {
         let key = ImageCacheKey::Blob(blob_id);
         if let Some(image) = self.entries.get(&key) {
@@ -737,6 +1677,41 @@ impl ImageMemoryCache {
 
 fn is_renderable_image(kind: MediaKind) -> bool {
     matches!(kind, MediaKind::Image | MediaKind::Sticker)
+}
+
+fn is_video_media(kind: MediaKind) -> bool {
+    matches!(kind, MediaKind::Video)
+}
+
+fn image_preview_fallback_size(content_width: u32) -> (u32, u32) {
+    let width = (content_width / 2).max(1);
+    let height = (width.saturating_mul(3) / 4).min(300).max(1);
+    (width, height)
+}
+
+fn image_like_preview_size(
+    image: Option<&ResolvedImage>,
+    content_width: u32,
+    fallback_width: u32,
+    fallback_height: u32,
+) -> (u32, u32) {
+    let max_width = (content_width / 2).max(1);
+    let max_height = 300u32;
+    match image
+        .and_then(|img| img.width.zip(img.height))
+        .filter(|(w, h)| *w > 0 && *h > 0)
+    {
+        Some((orig_w, orig_h)) => {
+            let scale_w = max_width as f32 / orig_w as f32;
+            let scale_h = max_height as f32 / orig_h as f32;
+            let scale = scale_w.min(scale_h).min(1.0);
+            (
+                (orig_w as f32 * scale).round().max(1.0) as u32,
+                (orig_h as f32 * scale).round().max(1.0) as u32,
+            )
+        }
+        None => (fallback_width.max(1), fallback_height.max(1)),
+    }
 }
 
 fn attachment_is_image(state: &StateView, ingress_id: IngressId, attachment_index: usize) -> bool {
@@ -892,45 +1867,63 @@ async fn handle_render_request(
     let render_result = render_png_async(&draft, &header, &image_sources, config).await;
     drop(image_sources);
     image_cache.release_keys(&used_keys);
-    let bytes = match render_result {
-        Ok(bytes) => {
+    let pages = match render_result {
+        Ok(pages) => {
             let render_only_blob_ids = collect_post_blob_ids(state, post_id);
             blob_cache::release_render_only(render_only_blob_ids);
-            bytes
+            pages
         }
         Err(err) => {
             return send_render_failed(cmd_tx, post_id, attempt, err).await;
         }
     };
 
-    let blob_id = render_blob_id(post_id);
-    let bytes = blob_cache::store_bytes(
-        blob_id,
-        bytes,
-        CacheKind::Image,
-        CacheRetention::UntilSend,
-        Some("image/png".to_string()),
-    );
-    let (path, size_bytes) =
-        persist_blob(&config.blob_root, "png", "png", blob_id, bytes.as_ref())?;
+    if pages.is_empty() {
+        return send_render_failed(
+            cmd_tx,
+            post_id,
+            attempt,
+            "render produced no pages".to_string(),
+        )
+        .await;
+    }
 
-    send_event(
-        cmd_tx,
-        Event::Blob(BlobEvent::BlobRegistered {
+    let mut ready_blob_ids = Vec::new();
+    for (page_index, bytes) in pages.into_iter().enumerate() {
+        let blob_id = render_blob_id(post_id, page_index);
+        let bytes = blob_cache::store_bytes(
             blob_id,
-            size_bytes,
-        }),
-    )
-    .await?;
-    send_event(
-        cmd_tx,
-        Event::Blob(BlobEvent::BlobPersisted { blob_id, path }),
-    )
-    .await?;
+            bytes,
+            CacheKind::Image,
+            CacheRetention::UntilSend,
+            Some("image/png".to_string()),
+        );
+        let (path, size_bytes) =
+            persist_blob(&config.blob_root, "png", "png", blob_id, bytes.as_ref())?;
+
+        send_event(
+            cmd_tx,
+            Event::Blob(BlobEvent::BlobRegistered {
+                blob_id,
+                size_bytes,
+            }),
+        )
+        .await?;
+        send_event(
+            cmd_tx,
+            Event::Blob(BlobEvent::BlobPersisted { blob_id, path }),
+        )
+        .await?;
+
+        ready_blob_ids.push(blob_id);
+    }
 
     send_event(
         cmd_tx,
-        Event::Render(RenderEvent::PngReady { post_id, blob_id }),
+        Event::Render(RenderEvent::PngBatchReady {
+            post_id,
+            blob_ids: ready_blob_ids,
+        }),
     )
     .await?;
 
@@ -979,90 +1972,103 @@ async fn resolve_forward_draft(
     header: &HeaderInfo,
     _config: &RendererRuntimeConfig,
 ) -> Draft {
-    if !draft_has_forward_reference(draft) {
-        return expand_embedded_forward_draft(draft);
-    }
-
-    let Some(account_id) = napcat_account_for_group(&header.group_id) else {
-        return expand_embedded_forward_draft(draft);
-    };
-
-    let mut context = ForwardContext {
+    let mut context = napcat_account_for_group(&header.group_id).map(|account_id| ForwardContext {
         account_id,
         cache: HashMap::new(),
         seen: HashSet::new(),
-    };
+    });
 
-    let mut blocks = Vec::new();
-    for block in &draft.blocks {
-        match block {
-            DraftBlock::Paragraph { text } => {
-                let mut expanded = expand_forward_in_text(text, &mut context, 0).await;
-                blocks.append(&mut expanded);
-            }
-            DraftBlock::Attachment { .. }
-            | DraftBlock::Reply { .. }
-            | DraftBlock::Poke
-            | DraftBlock::JsonCard { .. }
-            | DraftBlock::Forward { .. } => blocks.push(block.clone()),
-        }
-    }
-    expand_embedded_forward_draft(&Draft { blocks })
-}
-
-fn draft_has_forward_reference(draft: &Draft) -> bool {
-    draft.blocks.iter().any(|block| match block {
-        DraftBlock::Paragraph { text } => text.contains(FORWARD_PREFIX),
-        _ => false,
-    })
-}
-
-fn expand_embedded_forward_draft(draft: &Draft) -> Draft {
-    let mut blocks = Vec::new();
-    for block in &draft.blocks {
-        append_block_expanding_forward(block, &mut blocks, 0);
-    }
+    let blocks = resolve_forward_blocks(&draft.blocks, &mut context, 0).await;
     Draft { blocks }
 }
 
-fn append_block_expanding_forward(block: &DraftBlock, blocks: &mut Vec<DraftBlock>, depth: u32) {
+fn resolve_forward_blocks<'a>(
+    source_blocks: &'a [DraftBlock],
+    context: &'a mut Option<ForwardContext>,
+    depth: u32,
+) -> Pin<Box<dyn Future<Output = Vec<DraftBlock>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut blocks = Vec::new();
+        for block in source_blocks {
+            match block {
+                DraftBlock::Paragraph { text }
+                    if context.is_some() && text.contains(FORWARD_PREFIX) =>
+                {
+                    let mut expanded = expand_forward_in_text(text, context, depth).await;
+                    blocks.append(&mut expanded);
+                }
+                DraftBlock::Forward { items } => {
+                    if depth >= MAX_FORWARD_DEPTH {
+                        blocks.push(DraftBlock::Paragraph {
+                            text: "[合并转发:层级过深]".to_string(),
+                        });
+                    } else {
+                        let items = resolve_forward_items(items, context, depth + 1).await;
+                        blocks.push(DraftBlock::Forward { items });
+                    }
+                }
+                _ => blocks.push(block.clone()),
+            }
+        }
+        blocks
+    })
+}
+
+fn resolve_forward_items<'a>(
+    source_items: &'a [ForwardItem],
+    context: &'a mut Option<ForwardContext>,
+    depth: u32,
+) -> Pin<Box<dyn Future<Output = Vec<ForwardItem>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut items = Vec::with_capacity(source_items.len());
+        for item in source_items {
+            let blocks = resolve_forward_blocks(&item.blocks, context, depth).await;
+            items.push(ForwardItem {
+                sender_name: item.sender_name.clone(),
+                blocks,
+            });
+        }
+        items
+    })
+}
+
+fn normalize_embedded_forward_draft(draft: &Draft) -> Draft {
+    let blocks = draft
+        .blocks
+        .iter()
+        .cloned()
+        .map(|block| normalize_embedded_forward_block(block, 0))
+        .collect();
+    Draft { blocks }
+}
+
+fn normalize_embedded_forward_block(block: DraftBlock, depth: u32) -> DraftBlock {
     match block {
-        DraftBlock::Forward { items } => append_forward_items_as_blocks(items, blocks, depth),
-        _ => blocks.push(block.clone()),
+        DraftBlock::Forward { items } if depth < MAX_FORWARD_DEPTH => DraftBlock::Forward {
+            items: normalize_forward_items(items, depth + 1),
+        },
+        DraftBlock::Forward { .. } => DraftBlock::Paragraph {
+            text: "[合并转发:层级过深]".to_string(),
+        },
+        _ => block,
     }
 }
 
-fn append_forward_items_as_blocks(items: &[ForwardItem], blocks: &mut Vec<DraftBlock>, depth: u32) {
-    if depth >= MAX_FORWARD_DEPTH {
-        blocks.push(DraftBlock::Paragraph {
-            text: "[合并转发:层级过深]".to_string(),
-        });
-        return;
-    }
-
-    blocks.push(DraftBlock::Paragraph {
-        text: "合并转发聊天记录".to_string(),
-    });
-    for item in items.iter().take(10) {
-        if let Some(sender) = item
-            .sender_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            blocks.push(DraftBlock::Paragraph {
-                text: format!("{}:", sender),
-            });
-        }
-        for nested in &item.blocks {
-            append_block_expanding_forward(nested, blocks, depth + 1);
-        }
-    }
-    if items.len() > 10 {
-        blocks.push(DraftBlock::Paragraph {
-            text: format!("... {} more forwarded items ...", items.len() - 10),
-        });
-    }
+fn normalize_forward_items(items: Vec<ForwardItem>, depth: u32) -> Vec<ForwardItem> {
+    items
+        .into_iter()
+        .map(|item| {
+            let blocks = item
+                .blocks
+                .into_iter()
+                .map(|block| normalize_embedded_forward_block(block, depth))
+                .collect();
+            ForwardItem {
+                sender_name: item.sender_name,
+                blocks,
+            }
+        })
+        .collect()
 }
 
 fn forward_placeholder(id: &str) -> String {
@@ -1084,6 +2090,21 @@ fn push_text_block(blocks: &mut Vec<DraftBlock>, text: &str) {
 }
 
 fn expand_forward_in_text<'a>(
+    text: &'a str,
+    context: &'a mut Option<ForwardContext>,
+    depth: u32,
+) -> Pin<Box<dyn Future<Output = Vec<DraftBlock>> + Send + 'a>> {
+    Box::pin(async move {
+        let Some(context) = context.as_mut() else {
+            let mut blocks = Vec::new();
+            push_text_block(&mut blocks, text);
+            return blocks;
+        };
+        expand_forward_in_text_with_context(text, context, depth).await
+    })
+}
+
+fn expand_forward_in_text_with_context<'a>(
     text: &'a str,
     context: &'a mut ForwardContext,
     depth: u32,
@@ -1183,7 +2204,7 @@ async fn forward_messages_to_items(
     for message in messages {
         let payload = message.get("message").or_else(|| message.get("content"));
         let extracted = extract_message_lite(payload);
-        let mut blocks = expand_forward_in_text(&extracted.text, context, depth).await;
+        let mut blocks = expand_forward_in_text_with_context(&extracted.text, context, depth).await;
         for attachment in extracted.attachments {
             blocks.push(DraftBlock::Attachment {
                 kind: attachment.kind,
@@ -1254,15 +2275,27 @@ fn render_png(
     image_sources: &RenderImageSources,
     config: &RendererRuntimeConfig,
 ) -> Result<Vec<u8>, String> {
+    render_png_pages(draft, header, image_sources, config)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "render produced no pages".to_string())
+}
+
+fn render_png_pages(
+    draft: &Draft,
+    header: &HeaderInfo,
+    image_sources: &RenderImageSources,
+    config: &RendererRuntimeConfig,
+) -> Result<Vec<Vec<u8>>, String> {
     let padding = 20u32;
     let spacing_lg = 10u32;
-    let spacing_xxl = 20u32;
+    let spacing_xxl = 5u32;
     let bubble_pad_left = 8u32;
     let bubble_pad_right = 8u32;
     let bubble_pad_top = 6u32;
     let bubble_pad_bottom = 6u32;
     let font_size = 16u32;
-    let line_height = 21u32;
+    let line_height = 22u32;
     let face_size = 16u32;
     let title_size = 32u32;
     let meta_size = 12u32;
@@ -1272,9 +2305,11 @@ fn render_png(
     let avatar_size = 50u32;
     let radius_lg = 12u32;
     let card_padding = 8u32;
+    let card_title_size = font_size.saturating_sub(2).max(meta_size);
     let card_line_height = 18u32;
     let card_icon_size = 24u32;
     let card_icon_gap = 8u32;
+    let forward_line_gap = 6u32;
     let file_padding = 7u32;
     let file_line_height = 18u32;
     let file_meta_height = 14u32;
@@ -1286,21 +2321,25 @@ fn render_png(
     let mut text_measurer = TextMeasurer::new(font_collection.clone());
     let mut emoji_cache = EmojiRenderCache::new();
 
-    let scale = 4u32;
+    let scale = 3u32;
+    let canvas_width_px = (config.canvas_width_px / scale).max(1);
+    let max_height_px = (config.max_height_px / scale).max(1);
     debug_log!(
-        "render start: blocks={} canvas_width={} max_height={} scale={}",
+        "render start: blocks={} output_canvas_width={} output_max_height={} logical_canvas_width={} logical_max_height={} scale={}",
         draft.blocks.len(),
         config.canvas_width_px,
         config.max_height_px,
+        canvas_width_px,
+        max_height_px,
         scale
     );
-    let content_width = config
-        .canvas_width_px
-        .saturating_sub(padding.saturating_mul(2));
+    let content_padding = 15u32;
+    let header_content_width = canvas_width_px.saturating_sub(padding.saturating_mul(2));
+    let content_width = canvas_width_px.saturating_sub(content_padding.saturating_mul(2));
     let header_x = padding;
     let header_y = padding;
     let header_text_x = header_x + avatar_size + header_gap;
-    let header_text_width = content_width.saturating_sub(avatar_size + header_gap);
+    let header_text_width = header_content_width.saturating_sub(avatar_size + header_gap);
 
     let title_text = if header.is_anonymous {
         "匿名".to_string()
@@ -1371,11 +2410,12 @@ fn render_png(
                     max_line_w = max_line_w.max(line.width);
                 }
                 let bubble_w = (max_line_w + bubble_pad_left + bubble_pad_right)
+                    .saturating_sub(TOP_LEVEL_TEXT_BUBBLE_WIDTH_SHRINK_PX)
                     .min(content_width)
                     .max(1);
                 let height = bubble_pad_top + bubble_pad_bottom + line_height * lines.len() as u32;
                 BlockLayout {
-                    x: padding,
+                    x: content_padding,
                     y: cursor_y,
                     width: bubble_w,
                     height,
@@ -1398,30 +2438,16 @@ fn render_png(
                     .and_then(|value| value.clone());
                 match *kind {
                     oqqwall_rust_core::MediaKind::Image | oqqwall_rust_core::MediaKind::Sticker => {
-                        let max_width = (content_width / 2).max(1);
-                        let max_height = 300u32;
-                        let (width, height) = match image
-                            .and_then(|img| img.width.zip(img.height))
-                            .filter(|(w, h)| *w > 0 && *h > 0)
-                        {
-                            Some((orig_w, orig_h)) => {
-                                let scale_w = max_width as f32 / orig_w as f32;
-                                let scale_h = max_height as f32 / orig_h as f32;
-                                let scale = scale_w.min(scale_h).min(1.0);
-                                let width = (orig_w as f32 * scale).round().max(1.0) as u32;
-                                let height = (orig_h as f32 * scale).round().max(1.0) as u32;
-                                (width, height)
-                            }
-                            None => {
-                                let width = max_width;
-                                let height = (width.saturating_mul(3).saturating_div(4))
-                                    .min(max_height)
-                                    .max(1);
-                                (width, height)
-                            }
-                        };
+                        let (fallback_width, fallback_height) =
+                            image_preview_fallback_size(content_width);
+                        let (width, height) = image_like_preview_size(
+                            image,
+                            content_width,
+                            fallback_width,
+                            fallback_height,
+                        );
                         BlockLayout {
-                            x: padding,
+                            x: content_padding,
                             y: cursor_y,
                             width,
                             height,
@@ -1430,9 +2456,29 @@ fn render_png(
                             },
                         }
                     }
+                    oqqwall_rust_core::MediaKind::Video => {
+                        let (fallback_width, fallback_height) =
+                            image_preview_fallback_size(content_width);
+                        let (width, height) = image_like_preview_size(
+                            image,
+                            content_width,
+                            fallback_width,
+                            fallback_height,
+                        );
+                        BlockLayout {
+                            x: content_padding,
+                            y: cursor_y,
+                            width,
+                            height,
+                            kind: BlockKind::VideoPreview {
+                                image: image.cloned(),
+                            },
+                        }
+                    }
                     oqqwall_rust_core::MediaKind::File => {
-                        let width = content_width.min(320).max(1);
-                        let text_max_w = width
+                        let file_name_size = font_size.saturating_sub(2).max(meta_size);
+                        let max_width = content_width.min(320).max(1);
+                        let text_max_w = max_width
                             .saturating_sub(file_padding * 2 + file_icon_size + file_icon_gap)
                             .max(1);
                         let filename = label_href
@@ -1440,25 +2486,29 @@ fn render_png(
                             .and_then(extract_filename)
                             .or_else(|| name.clone())
                             .unwrap_or_else(|| "Unknown file".to_string());
-                        let mut name_lines = wrap_text(
+                        let name_lines = wrap_text(
                             &filename,
                             text_max_w,
-                            font_size,
-                            font_weight_body,
-                            &mut text_measurer,
-                            &emoji_cache,
-                        );
-                        name_lines = limit_lines(
-                            name_lines,
-                            2,
-                            text_max_w,
-                            font_size,
+                            file_name_size,
                             font_weight_body,
                             &mut text_measurer,
                             &emoji_cache,
                         );
                         let meta_line =
                             size_bytes.as_ref().and_then(|size| format_size_line(*size));
+                        let width = file_card_width(
+                            max_width,
+                            &name_lines,
+                            meta_line.as_deref(),
+                            file_padding,
+                            file_icon_size,
+                            file_icon_gap,
+                            file_name_size,
+                            11,
+                            font_weight_body,
+                            &mut text_measurer,
+                            &emoji_cache,
+                        );
                         let name_height = name_lines.len() as u32 * file_line_height;
                         let meta_height = if meta_line.is_some() {
                             file_meta_height + file_meta_gap
@@ -1469,7 +2519,7 @@ fn render_png(
                         let content_height = file_icon_size.max(text_height);
                         let height = content_height + file_padding * 2;
                         BlockLayout {
-                            x: padding,
+                            x: content_padding,
                             y: cursor_y,
                             width,
                             height,
@@ -1482,12 +2532,8 @@ fn render_png(
                         }
                     }
                     _ => {
+                        let height = 90u32;
                         let width = content_width.min(320).max(1);
-                        let height = if matches!(*kind, oqqwall_rust_core::MediaKind::Video) {
-                            (width.saturating_mul(9) / 16).clamp(120, 300)
-                        } else {
-                            90u32
-                        };
                         let text_max_w = width
                             .saturating_sub(card_padding * 2 + card_icon_size + card_icon_gap)
                             .max(1);
@@ -1507,7 +2553,7 @@ fn render_png(
                             }
                         }
                         BlockLayout {
-                            x: padding,
+                            x: content_padding,
                             y: cursor_y,
                             width,
                             height,
@@ -1521,13 +2567,30 @@ fn render_png(
                 }
             }
             DraftBlock::Reply { preview } => {
-                let width = content_width.min(320).max(1);
-                let text_max_w = width.saturating_sub(card_padding * 2 + 8).max(1);
+                let width = content_width.max(1);
+                let wrap_width = width.min(320).max(1);
+                let reply_accent_width = 3u32;
+                let reply_inner_pad_x = card_padding;
+                let reply_inner_pad_y = 6u32;
+                let reply_meta_size = font_size.saturating_sub(2).max(meta_size);
+                let reply_body_size = font_size;
+                let reply_meta_line_height = file_line_height;
+                let reply_body_line_height = line_height;
+                let reply_outer_extra_height = 6u32;
+                let text_max_w = wrap_width
+                    .saturating_sub(
+                        bubble_pad_left
+                            + bubble_pad_right
+                            + reply_accent_width
+                            + reply_inner_pad_x * 2,
+                    )
+                    .saturating_add(REPLY_WRAP_WIDTH_COMPENSATION_PX)
+                    .max(1);
                 let meta = reply_meta_text(preview);
                 let mut meta_lines = wrap_text(
                     &meta,
                     text_max_w,
-                    meta_size,
+                    reply_meta_size,
                     font_weight_body,
                     &mut text_measurer,
                     &emoji_cache,
@@ -1536,41 +2599,38 @@ fn render_png(
                     meta_lines,
                     1,
                     text_max_w,
-                    meta_size,
+                    reply_meta_size,
                     font_weight_body,
                     &mut text_measurer,
                     &emoji_cache,
                 );
-                let mut body_lines = wrap_text(
+                let body_lines = wrap_text(
                     &preview.body,
                     text_max_w,
-                    meta_size,
+                    reply_body_size,
                     font_weight_body,
                     &mut text_measurer,
                     &emoji_cache,
                 );
-                body_lines = limit_lines(
-                    body_lines,
-                    3,
-                    text_max_w,
-                    meta_size,
-                    font_weight_body,
-                    &mut text_measurer,
-                    &emoji_cache,
-                );
-                let height = card_padding * 2
-                    + meta_lines.len() as u32 * file_meta_height
-                    + file_meta_gap
-                    + body_lines.len() as u32 * card_line_height;
+                let body_gap = if body_lines.is_empty() {
+                    0
+                } else {
+                    file_meta_gap
+                };
+                let inner_height = reply_inner_pad_y * 2
+                    + meta_lines.len() as u32 * reply_meta_line_height
+                    + body_gap
+                    + body_lines.len() as u32 * reply_body_line_height;
+                let height =
+                    bubble_pad_top + bubble_pad_bottom + inner_height + reply_outer_extra_height;
                 BlockLayout {
-                    x: padding,
+                    x: content_padding,
                     y: cursor_y,
                     width,
                     height,
                     kind: BlockKind::Reply {
                         meta_lines,
                         body_lines,
-                        missing: preview.missing,
                     },
                 }
             }
@@ -1592,7 +2652,7 @@ fn render_png(
                     })
                     .unwrap_or((64, 64));
                 BlockLayout {
-                    x: padding,
+                    x: content_padding,
                     y: cursor_y,
                     width,
                     height,
@@ -1601,128 +2661,62 @@ fn render_png(
             }
             DraftBlock::JsonCard { raw } => {
                 let view = parse_json_card_view(raw);
-                let width = content_width.min(276).max(1);
-                let qr_space = if view.jump_url.is_some() { 56 } else { 0 };
-                let vertical_media = json_card_uses_vertical_media(&view);
-                let media_space = if !vertical_media && view.media_source.is_some() {
-                    56
-                } else {
-                    0
-                };
-                let text_max_w = width
-                    .saturating_sub(card_padding * 2 + qr_space + media_space)
-                    .max(1);
-                let mut title_lines = wrap_text(
-                    &view.title,
-                    text_max_w,
+                layout_json_card_block(
+                    content_padding,
+                    cursor_y,
+                    content_width,
+                    view.clone(),
+                    json_card_resolved_images(&view, block_idx, image_sources),
                     font_size,
                     font_weight_title,
-                    &mut text_measurer,
-                    &emoji_cache,
-                );
-                title_lines = limit_lines(
-                    title_lines,
-                    2,
-                    text_max_w,
-                    font_size,
-                    font_weight_title,
-                    &mut text_measurer,
-                    &emoji_cache,
-                );
-                let mut desc_lines = view
-                    .desc
-                    .as_deref()
-                    .map(|desc| {
-                        wrap_text(
-                            desc,
-                            text_max_w,
-                            meta_size,
-                            font_weight_body,
-                            &mut text_measurer,
-                            &emoji_cache,
-                        )
-                    })
-                    .unwrap_or_default();
-                desc_lines = limit_lines(
-                    desc_lines,
-                    2,
-                    text_max_w,
-                    meta_size,
                     font_weight_body,
+                    meta_size,
+                    card_padding,
+                    card_line_height,
+                    file_meta_height,
+                    file_meta_gap,
                     &mut text_measurer,
                     &emoji_cache,
-                );
-                let footer_line = view.footer.as_deref().map(|footer| {
-                    truncate_text(
-                        footer,
-                        text_max_w,
-                        meta_size,
-                        font_weight_body,
-                        &mut text_measurer,
-                        &emoji_cache,
-                    )
-                });
-                let text_height = title_lines.len() as u32 * card_line_height
-                    + desc_lines.len() as u32 * file_meta_height
-                    + footer_line.as_ref().map(|_| file_meta_height).unwrap_or(0);
-                let media = view
-                    .media_source
-                    .as_deref()
-                    .and_then(resolve_source_to_image);
-                let height = if vertical_media {
-                    let header_height = text_height.max(if qr_space > 0 { 48 } else { 0 });
-                    let preview_height = if media.is_some() {
-                        width.saturating_sub(card_padding * 2).min(170).max(72)
-                    } else {
-                        0
-                    };
-                    card_padding * 2
-                        + header_height
-                        + if preview_height > 0 {
-                            card_padding + preview_height
-                        } else {
-                            0
-                        }
-                } else {
-                    let side_height = if qr_space > 0 || media_space > 0 {
-                        48
-                    } else {
-                        0
-                    };
-                    card_padding * 2 + text_height.max(side_height).max(card_line_height)
-                };
-                BlockLayout {
-                    x: padding,
-                    y: cursor_y,
-                    width,
-                    height,
-                    kind: BlockKind::JsonCard {
-                        view,
-                        title_lines,
-                        desc_lines,
-                        footer_line,
-                        media,
-                    },
-                }
+                )
             }
             DraftBlock::Forward { items } => {
                 let width = content_width.min(340).max(1);
-                let text_max_w = width.saturating_sub(card_padding * 2 + 14).max(1);
-                let layout_items = layout_forward_items(
+                let forward_child_indent = 17u32;
+                let child_x = content_padding + forward_child_indent;
+                let child_start_y = cursor_y + meta_size + file_meta_gap + forward_line_gap + 6;
+                let child_width = width.saturating_sub(forward_child_indent).max(1);
+                let (layout_items, bottom) = layout_forward_items(
                     items,
-                    text_max_w,
-                    meta_size,
+                    child_x,
+                    child_start_y,
+                    child_width,
+                    font_size,
+                    line_height,
+                    face_size,
+                    font_weight_title,
                     font_weight_body,
+                    meta_size,
+                    card_padding,
+                    card_line_height,
+                    card_icon_size,
+                    card_icon_gap,
+                    file_padding,
+                    file_line_height,
+                    file_meta_height,
+                    file_meta_gap,
+                    file_icon_size,
+                    file_icon_gap,
+                    bubble_pad_left,
+                    bubble_pad_right,
+                    bubble_pad_top,
+                    bubble_pad_bottom,
+                    spacing_lg,
                     &mut text_measurer,
                     &emoji_cache,
                 );
-                let item_lines = layout_items
-                    .iter()
-                    .map(|item| item.lines.len().max(1) as u32)
-                    .sum::<u32>();
-                let height = card_padding * 2 + card_line_height + item_lines * card_line_height;
+                let height = bottom.saturating_sub(cursor_y).saturating_add(card_padding);
                 BlockLayout {
-                    x: padding,
+                    x: content_padding,
                     y: cursor_y,
                     width,
                     height,
@@ -1746,6 +2740,16 @@ fn render_png(
                 let _size = image.as_ref().and_then(|img| img.width.zip(img.height));
                 debug_log!(
                     "layout block: idx={} kind=image width={} height={} image_size={:?}",
+                    block_idx,
+                    layout.width,
+                    layout.height,
+                    _size
+                );
+            }
+            BlockKind::VideoPreview { image } => {
+                let _size = image.as_ref().and_then(|img| img.width.zip(img.height));
+                debug_log!(
+                    "layout block: idx={} kind=video width={} height={} image_size={:?}",
                     block_idx,
                     layout.width,
                     layout.height,
@@ -1818,53 +2822,6 @@ fn render_png(
         }
 
         let layout_height = layout.height;
-        let mut next_bottom = layout
-            .y
-            .saturating_add(layout_height)
-            .saturating_add(padding);
-        if !blocks.is_empty() {
-            next_bottom = next_bottom.saturating_add(spacing_lg);
-        }
-        if next_bottom > config.max_height_px {
-            let trunc_text_w = content_width
-                .saturating_sub(bubble_pad_left + bubble_pad_right)
-                .max(1);
-            let trunc_lines = wrap_inline_text(
-                "... truncated ...",
-                trunc_text_w,
-                font_size,
-                face_size,
-                font_weight_body,
-                &mut text_measurer,
-                &emoji_cache,
-            );
-            let mut max_line_w = 0u32;
-            for line in &trunc_lines {
-                max_line_w = max_line_w.max(line.width);
-            }
-            let bubble_w = (max_line_w + bubble_pad_left + bubble_pad_right)
-                .min(content_width)
-                .max(1);
-            let trunc_height = bubble_pad_top + bubble_pad_bottom + line_height;
-            let trunc_bottom = cursor_y
-                .saturating_add(trunc_height)
-                .saturating_add(padding);
-            if trunc_bottom <= config.max_height_px {
-                debug_log!("layout truncate: adding truncation block");
-                blocks.push(BlockLayout {
-                    x: padding,
-                    y: cursor_y,
-                    width: bubble_w,
-                    height: trunc_height,
-                    kind: BlockKind::Text { lines: trunc_lines },
-                });
-                cursor_y = cursor_y
-                    .saturating_add(trunc_height)
-                    .saturating_add(spacing_lg);
-            }
-            break;
-        }
-
         blocks.push(layout);
         cursor_y = cursor_y
             .saturating_add(layout_height)
@@ -1874,6 +2831,7 @@ fn render_png(
     if !blocks.is_empty() {
         cursor_y = cursor_y.saturating_sub(spacing_lg);
     }
+    assign_legacy_json_card_qr_urls(&mut blocks);
 
     let canvas_bottom = if blocks.is_empty() {
         header_y + header_height + spacing_xxl
@@ -1881,25 +2839,23 @@ fn render_png(
         cursor_y
     };
     let canvas_height = canvas_bottom.saturating_add(padding);
-    let background_height = canvas_height
-        .max(config.canvas_width_px)
-        .min(config.max_height_px)
-        .max(1);
-
-    let output_width = config.canvas_width_px.saturating_mul(scale);
-    let output_height = background_height.saturating_mul(scale);
-    debug_log!(
-        "render canvas: background_height={} output={}x{}",
-        background_height,
-        output_width,
-        output_height
+    let full_background_height = canvas_height.max(canvas_width_px).max(1);
+    let max_page_height = max_height_px.max(1);
+    let min_page_height = canvas_width_px.min(max_page_height).max(1);
+    let page_ranges = paginate_render_pages(
+        &blocks,
+        full_background_height,
+        max_page_height,
+        min_page_height,
+        padding,
+        spacing_lg,
     );
-
-    let mut surface =
-        skia_safe::surfaces::raster_n32_premul((output_width as i32, output_height as i32))
-            .ok_or_else(|| "surface alloc failed".to_string())?;
-    let canvas = surface.canvas();
-    canvas.scale((scale as f32, scale as f32));
+    debug_log!(
+        "render canvas: full_background_height={} pages={} max_page_height={}",
+        full_background_height,
+        page_ranges.len(),
+        max_page_height
+    );
 
     let color_bg = color_from_hex(0xF2F2F2);
     let color_white = Color4f::new(1.0, 1.0, 1.0, 1.0);
@@ -1908,182 +2864,197 @@ fn render_png(
     let color_meta = color_from_hex(0x666666);
     let color_muted = color_from_hex(0x888888);
 
-    let mut bg_paint = Paint::default();
-    bg_paint.set_color4f(color_bg, None);
-    bg_paint.set_anti_alias(true);
-    canvas.draw_rect(
-        Rect::from_xywh(
-            0.0,
-            0.0,
-            config.canvas_width_px as f32,
-            background_height as f32,
-        ),
-        &bg_paint,
-    );
+    let mut pages = Vec::with_capacity(page_ranges.len());
+    for (page_index, (page_y, background_height)) in page_ranges.iter().copied().enumerate() {
+        let output_width = canvas_width_px.saturating_mul(scale);
+        let output_height = background_height.saturating_mul(scale);
+        debug_log!(
+            "render page: index={} y={} height={} output={}x{}",
+            page_index,
+            page_y,
+            background_height,
+            output_width,
+            output_height
+        );
 
-    let avatar_rect = Rect::from_xywh(
-        header_x as f32,
-        header_y as f32,
-        avatar_size as f32,
-        avatar_size as f32,
-    );
-    let avatar_rr = RRect::new_rect_xy(
-        avatar_rect,
-        avatar_size as f32 / 2.0,
-        avatar_size as f32 / 2.0,
-    );
-    draw_shadowed_rrect(canvas, avatar_rr, 4.0, 0.30);
-    let mut avatar_bg = Paint::default();
-    avatar_bg.set_color4f(color_white, None);
-    avatar_bg.set_anti_alias(true);
-    canvas.draw_rrect(avatar_rr, &avatar_bg);
-    let mut avatar_border = Paint::default();
-    avatar_border.set_color4f(color_border, None);
-    avatar_border.set_style(skia_safe::paint::Style::Stroke);
-    avatar_border.set_stroke_width(1.0);
-    avatar_border.set_anti_alias(true);
-    canvas.draw_rrect(avatar_rr, &avatar_border);
+        let mut surface =
+            skia_safe::surfaces::raster_n32_premul((output_width as i32, output_height as i32))
+                .ok_or_else(|| "surface alloc failed".to_string())?;
+        let canvas = surface.canvas();
+        canvas.scale((scale as f32, scale as f32));
 
-    if let Some(avatar) = image_sources.avatar.as_ref().filter(|img| img.has_bytes()) {
-        if let Some(image) = decode_image(avatar) {
-            draw_image_cover_rounded(canvas, &image, avatar_rect, avatar_size as f32 / 2.0);
+        let mut bg_paint = Paint::default();
+        bg_paint.set_color4f(color_bg, None);
+        bg_paint.set_anti_alias(true);
+        canvas.draw_rect(
+            Rect::from_xywh(0.0, 0.0, canvas_width_px as f32, background_height as f32),
+            &bg_paint,
+        );
+        canvas.save();
+        canvas.translate((0.0, -(page_y as f32)));
+
+        let avatar_rect = Rect::from_xywh(
+            header_x as f32,
+            header_y as f32,
+            avatar_size as f32,
+            avatar_size as f32,
+        );
+        let avatar_rr = RRect::new_rect_xy(
+            avatar_rect,
+            avatar_size as f32 / 2.0,
+            avatar_size as f32 / 2.0,
+        );
+        draw_shadowed_rrect(canvas, avatar_rr, 4.0, 0.30);
+        let mut avatar_bg = Paint::default();
+        avatar_bg.set_color4f(color_white, None);
+        avatar_bg.set_anti_alias(true);
+        canvas.draw_rrect(avatar_rr, &avatar_bg);
+        let mut avatar_border = Paint::default();
+        avatar_border.set_color4f(color_border, None);
+        avatar_border.set_style(skia_safe::paint::Style::Stroke);
+        avatar_border.set_stroke_width(1.0);
+        avatar_border.set_anti_alias(true);
+        canvas.draw_rrect(avatar_rr, &avatar_border);
+
+        if let Some(avatar) = image_sources.avatar.as_ref().filter(|img| img.has_bytes()) {
+            if let Some(image) = decode_image(avatar) {
+                draw_image_cover_rounded(canvas, &image, avatar_rect, avatar_size as f32 / 2.0);
+            }
         }
-    }
 
-    let title_baseline = if header.is_anonymous {
-        let center_y = header_y as f32 + avatar_size as f32 / 2.0;
-        if let Some((_, metrics)) = build_line_paragraph(
+        let title_baseline = if header.is_anonymous {
+            let center_y = header_y as f32 + avatar_size as f32 / 2.0;
+            if let Some((_, metrics)) = build_line_paragraph(
+                &font_collection,
+                &title_text,
+                title_size,
+                font_weight_title,
+                color_text,
+            ) {
+                center_baseline(center_y, &metrics)
+            } else {
+                title_y as f32
+            }
+        } else {
+            title_y as f32
+        };
+
+        draw_text_line(
+            canvas,
             &font_collection,
+            &mut emoji_cache,
             &title_text,
+            header_text_x as f32,
+            title_baseline,
             title_size,
             font_weight_title,
             color_text,
-        ) {
-            center_baseline(center_y, &metrics)
-        } else {
-            title_y as f32
-        }
-    } else {
-        title_y as f32
-    };
+        );
+        draw_text_line(
+            canvas,
+            &font_collection,
+            &mut emoji_cache,
+            &meta_text,
+            header_text_x as f32,
+            meta_y as f32,
+            meta_size,
+            font_weight_body,
+            color_meta,
+        );
 
-    draw_text_line(
-        canvas,
-        &font_collection,
-        &mut emoji_cache,
-        &title_text,
-        header_text_x as f32,
-        title_baseline,
-        title_size,
-        font_weight_title,
-        color_text,
-    );
-    draw_text_line(
-        canvas,
-        &font_collection,
-        &mut emoji_cache,
-        &meta_text,
-        header_text_x as f32,
-        meta_y as f32,
-        meta_size,
-        font_weight_body,
-        color_meta,
-    );
+        let mut face_cache: HashMap<String, ResolvedImage> = HashMap::new();
+        let mut face_image_cache: HashMap<String, Option<Image>> = HashMap::new();
+        let mut file_icon_cache: HashMap<&'static str, Option<Image>> = HashMap::new();
 
-    let mut divider = Paint::default();
-    divider.set_color4f(color_border, None);
-    divider.set_anti_alias(true);
-    divider.set_style(skia_safe::paint::Style::Stroke);
-    divider.set_stroke_width(1.0);
-    canvas.draw_line(
-        (
-            padding as f32,
-            (header_y + header_height + spacing_xxl / 2) as f32,
-        ),
-        (
-            (padding + content_width) as f32,
-            (header_y + header_height + spacing_xxl / 2) as f32,
-        ),
-        &divider,
-    );
+        let page_bottom = page_y.saturating_add(background_height);
+        for block in blocks.clone() {
+            let block_bottom = block.y.saturating_add(block.height);
+            if block_bottom <= page_y || block.y >= page_bottom {
+                continue;
+            }
+            match block.kind {
+                BlockKind::Text { lines } => {
+                    let rect = Rect::from_xywh(
+                        block.x as f32,
+                        block.y as f32,
+                        block.width as f32,
+                        block.height as f32,
+                    );
+                    let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
+                    draw_shadowed_rrect(canvas, rr, SHADOW_SM_BLUR_PX, SHADOW_SM_ALPHA);
 
-    let mut face_cache: HashMap<String, ResolvedImage> = HashMap::new();
-    let mut face_image_cache: HashMap<String, Option<Image>> = HashMap::new();
-    let mut file_icon_cache: HashMap<&'static str, Option<Image>> = HashMap::new();
+                    let mut bubble_bg = Paint::default();
+                    bubble_bg.set_color4f(color_white, None);
+                    bubble_bg.set_anti_alias(true);
+                    canvas.draw_rrect(rr, &bubble_bg);
 
-    for block in blocks {
-        match block.kind {
-            BlockKind::Text { lines } => {
-                let rect = Rect::from_xywh(
-                    block.x as f32,
-                    block.y as f32,
-                    block.width as f32,
-                    block.height as f32,
-                );
-                let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
-                draw_shadowed_rrect(canvas, rr, 2.0, 0.10);
-
-                let mut bubble_bg = Paint::default();
-                bubble_bg.set_color4f(color_white, None);
-                bubble_bg.set_anti_alias(true);
-                canvas.draw_rrect(rr, &bubble_bg);
-                let mut bubble_border = Paint::default();
-                bubble_border.set_color4f(color_border, None);
-                bubble_border.set_style(skia_safe::paint::Style::Stroke);
-                bubble_border.set_stroke_width(1.0);
-                bubble_border.set_anti_alias(true);
-                canvas.draw_rrect(rr, &bubble_border);
-
-                let line_x = block.x + bubble_pad_left;
-                let line_y = block.y + bubble_pad_top + font_size;
-                for (idx, line) in lines.iter().enumerate() {
-                    let baseline_y = line_y + line_height.saturating_mul(idx as u32);
-                    let mut cursor_x = line_x;
-                    for run in &line.runs {
-                        match run {
-                            InlineRun::Text(text) => {
-                                if !text.is_empty() {
-                                    draw_text_line(
-                                        canvas,
-                                        &font_collection,
-                                        &mut emoji_cache,
-                                        text,
-                                        cursor_x as f32,
-                                        baseline_y as f32,
-                                        font_size,
-                                        font_weight_body,
-                                        color_text,
-                                    );
-                                    cursor_x = cursor_x.saturating_add(measure_inline_text_width(
-                                        text,
-                                        font_size,
-                                        font_weight_body,
-                                        &mut text_measurer,
-                                        &emoji_cache,
-                                    ));
-                                }
-                            }
-                            InlineRun::Face { id } => {
-                                if let Some(face) = resolve_face_image(id, &mut face_cache) {
-                                    let line_top = baseline_y.saturating_sub(font_size);
-                                    let face_y = line_top
-                                        .saturating_add(line_height.saturating_sub(face_size) / 2);
-                                    let face_x = cursor_x;
-                                    let face_image = face_image_cache
-                                        .entry(id.clone())
-                                        .or_insert_with(|| decode_image(&face));
-                                    if let Some(image) = face_image.as_ref() {
-                                        draw_image_cover_rounded(
+                    let line_x = block.x + bubble_pad_left;
+                    let line_y = block.y + bubble_pad_top + font_size;
+                    for (idx, line) in lines.iter().enumerate() {
+                        let baseline_y = line_y + line_height.saturating_mul(idx as u32);
+                        let mut cursor_x = line_x;
+                        for run in &line.runs {
+                            match run {
+                                InlineRun::Text(text) => {
+                                    if !text.is_empty() {
+                                        draw_text_line(
                                             canvas,
-                                            image,
-                                            Rect::from_xywh(
-                                                face_x as f32,
-                                                face_y as f32,
-                                                face_size as f32,
-                                                face_size as f32,
-                                            ),
-                                            3.0,
+                                            &font_collection,
+                                            &mut emoji_cache,
+                                            text,
+                                            cursor_x as f32,
+                                            baseline_y as f32,
+                                            font_size,
+                                            font_weight_body,
+                                            color_text,
                                         );
+                                        cursor_x =
+                                            cursor_x.saturating_add(measure_inline_text_width(
+                                                text,
+                                                font_size,
+                                                font_weight_body,
+                                                &mut text_measurer,
+                                                &emoji_cache,
+                                            ));
+                                    }
+                                }
+                                InlineRun::Face { id } => {
+                                    if let Some(face) = resolve_face_image(id, &mut face_cache) {
+                                        let line_top = baseline_y.saturating_sub(font_size);
+                                        let face_y = line_top.saturating_add(
+                                            line_height.saturating_sub(face_size) / 2,
+                                        );
+                                        let face_x = cursor_x;
+                                        let face_image = face_image_cache
+                                            .entry(id.clone())
+                                            .or_insert_with(|| decode_image(&face));
+                                        if let Some(image) = face_image.as_ref() {
+                                            draw_image_cover_rounded(
+                                                canvas,
+                                                image,
+                                                Rect::from_xywh(
+                                                    face_x as f32,
+                                                    face_y as f32,
+                                                    face_size as f32,
+                                                    face_size as f32,
+                                                ),
+                                                3.0,
+                                            );
+                                        } else {
+                                            let fallback = format!("[face:{}]", id);
+                                            draw_text_line(
+                                                canvas,
+                                                &font_collection,
+                                                &mut emoji_cache,
+                                                &fallback,
+                                                cursor_x as f32,
+                                                baseline_y as f32,
+                                                font_size,
+                                                font_weight_body,
+                                                color_text,
+                                            );
+                                        }
+                                        cursor_x = cursor_x.saturating_add(face_size);
                                     } else {
                                         let fallback = format!("[face:{}]", id);
                                         draw_text_line(
@@ -2097,202 +3068,253 @@ fn render_png(
                                             font_weight_body,
                                             color_text,
                                         );
+                                        cursor_x =
+                                            cursor_x.saturating_add(measure_inline_text_width(
+                                                &fallback,
+                                                font_size,
+                                                font_weight_body,
+                                                &mut text_measurer,
+                                                &emoji_cache,
+                                            ));
+                                    }
+                                }
+                                InlineRun::Emoji { glyph_id } => {
+                                    let line_top = baseline_y.saturating_sub(font_size);
+                                    let emoji_y = line_top
+                                        .saturating_add(line_height.saturating_sub(face_size) / 2);
+                                    let emoji_x = cursor_x;
+                                    if let Some(image) = emoji_cache.resolve_image_by_gid(*glyph_id)
+                                    {
+                                        draw_image_stretch(
+                                            canvas,
+                                            &image,
+                                            Rect::from_xywh(
+                                                emoji_x as f32,
+                                                emoji_y as f32,
+                                                face_size as f32,
+                                                face_size as f32,
+                                            ),
+                                        );
                                     }
                                     cursor_x = cursor_x.saturating_add(face_size);
-                                } else {
-                                    let fallback = format!("[face:{}]", id);
-                                    draw_text_line(
-                                        canvas,
-                                        &font_collection,
-                                        &mut emoji_cache,
-                                        &fallback,
-                                        cursor_x as f32,
-                                        baseline_y as f32,
-                                        font_size,
-                                        font_weight_body,
-                                        color_text,
-                                    );
-                                    cursor_x = cursor_x.saturating_add(measure_inline_text_width(
-                                        &fallback,
-                                        font_size,
-                                        font_weight_body,
-                                        &mut text_measurer,
-                                        &emoji_cache,
-                                    ));
                                 }
-                            }
-                            InlineRun::Emoji { glyph_id } => {
-                                let line_top = baseline_y.saturating_sub(font_size);
-                                let emoji_y = line_top
-                                    .saturating_add(line_height.saturating_sub(face_size) / 2);
-                                let emoji_x = cursor_x;
-                                if let Some(image) = emoji_cache.resolve_image_by_gid(*glyph_id) {
-                                    draw_image_stretch(
-                                        canvas,
-                                        &image,
-                                        Rect::from_xywh(
-                                            emoji_x as f32,
-                                            emoji_y as f32,
-                                            face_size as f32,
-                                            face_size as f32,
-                                        ),
-                                    );
-                                }
-                                cursor_x = cursor_x.saturating_add(face_size);
                             }
                         }
                     }
                 }
-            }
-            BlockKind::Image { image } => {
-                let rect = Rect::from_xywh(
-                    block.x as f32,
-                    block.y as f32,
-                    block.width as f32,
-                    block.height as f32,
-                );
-                let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
-                draw_shadowed_rrect(canvas, rr, 3.0, 0.20);
-
-                let mut img_bg = Paint::default();
-                img_bg.set_color4f(color_white, None);
-                img_bg.set_anti_alias(true);
-                canvas.draw_rrect(rr, &img_bg);
-                let mut img_border = Paint::default();
-                img_border.set_color4f(color_border, None);
-                img_border.set_style(skia_safe::paint::Style::Stroke);
-                img_border.set_stroke_width(1.0);
-                img_border.set_anti_alias(true);
-                canvas.draw_rrect(rr, &img_border);
-
-                if let Some(img) = image.as_ref().filter(|img| img.has_bytes()) {
-                    if let Some(decoded) = decode_image(img) {
-                        draw_image_cover_rounded(canvas, &decoded, rect, radius_lg as f32);
-                    }
-                } else {
-                    let text_x = block.x + bubble_pad_left;
-                    let text_y = block.y + bubble_pad_top + font_size;
-                    draw_text_line(
-                        canvas,
-                        &font_collection,
-                        &mut emoji_cache,
-                        "Image",
-                        text_x as f32,
-                        text_y as f32,
-                        meta_size,
-                        font_weight_body,
-                        color_muted,
-                    );
-                }
-            }
-            BlockKind::MediaCard {
-                lines,
-                icon_text,
-                media_kind,
-            } => {
-                let rect = Rect::from_xywh(
-                    block.x as f32,
-                    block.y as f32,
-                    block.width as f32,
-                    block.height as f32,
-                );
-                let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
-                if matches!(media_kind, oqqwall_rust_core::MediaKind::Video) {
-                    draw_shadowed_rrect(canvas, rr, 3.0, 0.20);
-
-                    let mut video_bg = Paint::default();
-                    video_bg.set_color4f(color_from_hex(0x262626), None);
-                    video_bg.set_anti_alias(true);
-                    canvas.draw_rrect(rr, &video_bg);
-
-                    let bottom_h = 26.0;
-                    let bottom_rect = Rect::from_xywh(
+                BlockKind::Image { image } => {
+                    let rect = Rect::from_xywh(
                         block.x as f32,
-                        block.y as f32 + block.height as f32 - bottom_h,
+                        block.y as f32,
                         block.width as f32,
-                        bottom_h,
+                        block.height as f32,
                     );
-                    let mut controls_bg = Paint::default();
-                    controls_bg.set_color4f(Color4f::new(0.0, 0.0, 0.0, 0.25), None);
-                    controls_bg.set_anti_alias(true);
-                    canvas.draw_rect(bottom_rect, &controls_bg);
-
-                    let progress_y = block.y as f32 + block.height as f32 - 13.0;
-                    let mut progress = Paint::default();
-                    progress.set_color4f(Color4f::new(1.0, 1.0, 1.0, 0.35), None);
-                    progress.set_stroke_width(2.0);
-                    progress.set_anti_alias(true);
-                    canvas.draw_line(
-                        (block.x as f32 + 36.0, progress_y),
-                        (block.x as f32 + block.width as f32 - 18.0, progress_y),
-                        &progress,
+                    draw_image_preview_frame(
+                        canvas,
+                        image.as_ref(),
+                        rect,
+                        radius_lg as f32,
+                        color_white,
+                        color_border,
                     );
+                    if image.as_ref().filter(|img| img.has_bytes()).is_none() {
+                        let text_x = block.x + bubble_pad_left;
+                        let text_y = block.y + bubble_pad_top + font_size;
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            "Image",
+                            text_x as f32,
+                            text_y as f32,
+                            meta_size,
+                            font_weight_body,
+                            color_muted,
+                        );
+                    }
+                }
+                BlockKind::VideoPreview { image } => {
+                    let rect = Rect::from_xywh(
+                        block.x as f32,
+                        block.y as f32,
+                        block.width as f32,
+                        block.height as f32,
+                    );
+                    let bg = if image.as_ref().filter(|img| img.has_bytes()).is_some() {
+                        color_white
+                    } else {
+                        color_from_hex(0x262626)
+                    };
+                    draw_image_preview_frame(
+                        canvas,
+                        image.as_ref(),
+                        rect,
+                        radius_lg as f32,
+                        bg,
+                        color_border,
+                    );
+                    draw_video_play_triangle(canvas, rect);
+                }
+                BlockKind::MediaCard {
+                    lines,
+                    icon_text,
+                    media_kind,
+                } => {
+                    let rect = Rect::from_xywh(
+                        block.x as f32,
+                        block.y as f32,
+                        block.width as f32,
+                        block.height as f32,
+                    );
+                    let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
+                    if matches!(media_kind, oqqwall_rust_core::MediaKind::Video) {
+                        draw_image_preview_frame(
+                            canvas,
+                            None,
+                            rect,
+                            radius_lg as f32,
+                            color_from_hex(0x262626),
+                            color_border,
+                        );
+                        draw_video_play_triangle(canvas, rect);
+                    } else {
+                        draw_shadowed_rrect(canvas, rr, SHADOW_SM_BLUR_PX, SHADOW_SM_ALPHA);
 
-                    let play_x = block.x as f32 + 18.0;
-                    let play_y = progress_y - 6.0;
-                    let mut play = PathBuilder::new();
-                    play.move_to((play_x, play_y));
-                    play.line_to((play_x, play_y + 12.0));
-                    play.line_to((play_x + 10.0, play_y + 6.0));
-                    play.close();
-                    let play = play.detach();
-                    let mut play_paint = Paint::default();
-                    play_paint.set_color4f(Color4f::new(1.0, 1.0, 1.0, 0.65), None);
-                    play_paint.set_anti_alias(true);
-                    canvas.draw_path(&play, &play_paint);
-                } else {
-                    draw_shadowed_rrect(canvas, rr, 2.0, 0.10);
+                        let mut card_bg = Paint::default();
+                        card_bg.set_color4f(color_white, None);
+                        card_bg.set_anti_alias(true);
+                        canvas.draw_rrect(rr, &card_bg);
+                        let mut card_border = Paint::default();
+                        card_border.set_color4f(color_border, None);
+                        card_border.set_style(skia_safe::paint::Style::Stroke);
+                        card_border.set_stroke_width(1.0);
+                        card_border.set_anti_alias(true);
+                        canvas.draw_rrect(rr, &card_border);
+
+                        let icon_x = block.x + card_padding;
+                        let icon_y = block.y + (block.height - card_icon_size) / 2;
+                        let icon_rect = Rect::from_xywh(
+                            icon_x as f32,
+                            icon_y as f32,
+                            card_icon_size as f32,
+                            card_icon_size as f32,
+                        );
+                        let icon_rr = RRect::new_rect_xy(icon_rect, 4.0, 4.0);
+                        let mut icon_bg = Paint::default();
+                        icon_bg.set_color4f(color_bg, None);
+                        icon_bg.set_anti_alias(true);
+                        canvas.draw_rrect(icon_rr, &icon_bg);
+                        let mut icon_border = Paint::default();
+                        icon_border.set_color4f(color_border, None);
+                        icon_border.set_style(skia_safe::paint::Style::Stroke);
+                        icon_border.set_stroke_width(1.0);
+                        icon_border.set_anti_alias(true);
+                        canvas.draw_rrect(icon_rr, &icon_border);
+
+                        let icon_center_x = icon_x + card_icon_size / 2;
+                        let icon_center_y = icon_y + card_icon_size / 2;
+                        if let Some((paragraph, metrics)) = build_line_paragraph(
+                            &font_collection,
+                            &icon_text,
+                            11,
+                            font_weight_body,
+                            color_meta,
+                        ) {
+                            let icon_baseline = center_baseline(icon_center_y as f32, &metrics);
+                            let icon_x = icon_center_x as f32 - metrics.width * 0.5;
+                            let top_y = icon_baseline - metrics.baseline;
+                            paragraph.paint(canvas, (icon_x, top_y));
+                        }
+
+                        let text_x = block.x + card_padding + card_icon_size + card_icon_gap;
+                        let text_y = block.y + card_padding + font_size;
+                        for (idx, line) in lines.iter().enumerate() {
+                            let baseline = text_y + card_line_height.saturating_mul(idx as u32);
+                            draw_text_line(
+                                canvas,
+                                &font_collection,
+                                &mut emoji_cache,
+                                line,
+                                text_x as f32,
+                                baseline as f32,
+                                font_size,
+                                font_weight_body,
+                                color_text,
+                            );
+                        }
+                    }
+                }
+                BlockKind::FileCard {
+                    name_lines,
+                    meta_line,
+                    icon_path,
+                    icon_text,
+                } => {
+                    let rect = Rect::from_xywh(
+                        block.x as f32,
+                        block.y as f32,
+                        block.width as f32,
+                        block.height as f32,
+                    );
+                    let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
+                    draw_shadowed_rrect(canvas, rr, SHADOW_SM_BLUR_PX, SHADOW_SM_ALPHA);
 
                     let mut card_bg = Paint::default();
                     card_bg.set_color4f(color_white, None);
                     card_bg.set_anti_alias(true);
                     canvas.draw_rrect(rr, &card_bg);
-                    let mut card_border = Paint::default();
-                    card_border.set_color4f(color_border, None);
-                    card_border.set_style(skia_safe::paint::Style::Stroke);
-                    card_border.set_stroke_width(1.0);
-                    card_border.set_anti_alias(true);
-                    canvas.draw_rrect(rr, &card_border);
 
-                    let icon_x = block.x + card_padding;
-                    let icon_y = block.y + (block.height - card_icon_size) / 2;
-                    let icon_rect = Rect::from_xywh(
-                        icon_x as f32,
-                        icon_y as f32,
-                        card_icon_size as f32,
-                        card_icon_size as f32,
-                    );
-                    let icon_rr = RRect::new_rect_xy(icon_rect, 4.0, 4.0);
-                    let mut icon_bg = Paint::default();
-                    icon_bg.set_color4f(color_bg, None);
-                    icon_bg.set_anti_alias(true);
-                    canvas.draw_rrect(icon_rr, &icon_bg);
-                    let mut icon_border = Paint::default();
-                    icon_border.set_color4f(color_border, None);
-                    icon_border.set_style(skia_safe::paint::Style::Stroke);
-                    icon_border.set_stroke_width(1.0);
-                    icon_border.set_anti_alias(true);
-                    canvas.draw_rrect(icon_rr, &icon_border);
-
-                    let icon_center_x = icon_x + card_icon_size / 2;
-                    let icon_center_y = icon_y + card_icon_size / 2;
-                    if let Some((paragraph, metrics)) = build_line_paragraph(
-                        &font_collection,
-                        &icon_text,
-                        11,
-                        font_weight_body,
-                        color_meta,
-                    ) {
-                        let icon_baseline = center_baseline(icon_center_y as f32, &metrics);
-                        let icon_x = icon_center_x as f32 - metrics.width * 0.5;
-                        let top_y = icon_baseline - metrics.baseline;
-                        paragraph.paint(canvas, (icon_x, top_y));
+                    let icon_x =
+                        block.x + block.width.saturating_sub(file_padding + file_icon_size);
+                    let icon_y = block.y + (block.height - file_icon_size) / 2;
+                    let mut drew_icon = false;
+                    if let Some(path) = icon_path {
+                        let icon_image = file_icon_cache.entry(path).or_insert_with(|| {
+                            resolved_image_from_path(path).and_then(|img| decode_image(&img))
+                        });
+                        if let Some(image) = icon_image.as_ref() {
+                            let icon_dst = Rect::from_xywh(
+                                icon_x as f32,
+                                icon_y as f32,
+                                file_icon_size as f32,
+                                file_icon_size as f32,
+                            );
+                            draw_image_stretch(canvas, image, icon_dst);
+                            drew_icon = true;
+                        }
+                    }
+                    if !drew_icon {
+                        let icon_center_x = icon_x + file_icon_size / 2;
+                        let icon_center_y = icon_y + file_icon_size / 2;
+                        if let Some((paragraph, metrics)) = build_line_paragraph(
+                            &font_collection,
+                            &icon_text,
+                            11,
+                            font_weight_body,
+                            color_meta,
+                        ) {
+                            let icon_baseline = center_baseline(icon_center_y as f32, &metrics);
+                            let icon_x = icon_center_x as f32 - metrics.width * 0.5;
+                            let top_y = icon_baseline - metrics.baseline;
+                            paragraph.paint(canvas, (icon_x, top_y));
+                        }
                     }
 
-                    let text_x = block.x + card_padding + card_icon_size + card_icon_gap;
-                    let text_y = block.y + card_padding + font_size;
-                    for (idx, line) in lines.iter().enumerate() {
-                        let baseline = text_y + card_line_height.saturating_mul(idx as u32);
+                    let text_x = block.x + file_padding;
+                    let name_height = name_lines.len() as u32 * file_line_height;
+                    let meta_height = if meta_line.is_some() {
+                        file_meta_height + file_meta_gap
+                    } else {
+                        0
+                    };
+                    let text_height = name_height + meta_height;
+                    let content_height = file_icon_size.max(text_height);
+                    let text_top = block.y + file_padding + (content_height - text_height) / 2 - 4;
+                    let file_name_size = font_size.saturating_sub(2).max(meta_size);
+                    let text_baseline = text_top + file_name_size;
+
+                    for (idx, line) in name_lines.iter().enumerate() {
+                        let baseline = text_baseline + file_line_height.saturating_mul(idx as u32);
                         draw_text_line(
                             canvas,
                             &font_collection,
@@ -2300,463 +3322,827 @@ fn render_png(
                             line,
                             text_x as f32,
                             baseline as f32,
+                            file_name_size,
+                            font_weight_body,
+                            color_text,
+                        );
+                    }
+                    if let Some(meta) = meta_line {
+                        let meta_font_size = 11u32;
+                        let meta_y = text_top + name_height + file_meta_gap + meta_font_size + 6;
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            &meta,
+                            text_x as f32,
+                            meta_y as f32,
+                            meta_font_size,
+                            font_weight_body,
+                            color_muted,
+                        );
+                    }
+                }
+                BlockKind::Reply {
+                    meta_lines,
+                    body_lines,
+                } => {
+                    let rect = Rect::from_xywh(
+                        block.x as f32,
+                        block.y as f32,
+                        block.width as f32,
+                        block.height as f32,
+                    );
+                    let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
+                    draw_shadowed_rrect(canvas, rr, SHADOW_SM_BLUR_PX, SHADOW_SM_ALPHA);
+                    let mut bubble_bg = Paint::default();
+                    bubble_bg.set_color4f(color_white, None);
+                    bubble_bg.set_anti_alias(true);
+                    canvas.draw_rrect(rr, &bubble_bg);
+
+                    let reply_accent_width = 3u32;
+                    let reply_inner_pad_x = card_padding;
+                    let reply_inner_pad_y = 6u32;
+                    let reply_meta_size = font_size.saturating_sub(2).max(meta_size);
+                    let reply_body_size = font_size;
+                    let reply_body_draw_size = font_size;
+                    let reply_meta_line_height = file_line_height;
+                    let reply_body_line_height = line_height;
+                    let inner_x = block.x + bubble_pad_left;
+                    let inner_y = block
+                        .y
+                        .saturating_add(bubble_pad_top)
+                        .saturating_sub(REPLY_INNER_Y_RAISE_PX);
+                    let inner_width = block
+                        .width
+                        .saturating_sub(bubble_pad_left + bubble_pad_right);
+                    let inner_height = block
+                        .height
+                        .saturating_sub(bubble_pad_top + bubble_pad_bottom);
+                    let inner_rect = Rect::from_xywh(
+                        inner_x as f32,
+                        inner_y as f32,
+                        inner_width as f32,
+                        inner_height as f32,
+                    );
+                    let inner_rr = RRect::new_rect_xy(inner_rect, 4.0, 4.0);
+                    let mut bg = Paint::default();
+                    bg.set_color4f(color_from_hex(0xFAFAFA), None);
+                    bg.set_anti_alias(true);
+                    canvas.draw_rrect(inner_rr, &bg);
+                    let mut accent = Paint::default();
+                    accent.set_color4f(color_border, None);
+                    accent.set_anti_alias(true);
+                    canvas.draw_rect(
+                        Rect::from_xywh(
+                            inner_x as f32,
+                            inner_y as f32,
+                            reply_accent_width as f32,
+                            inner_height as f32,
+                        ),
+                        &accent,
+                    );
+                    let text_x = inner_x + reply_accent_width + reply_inner_pad_x;
+                    let mut baseline = inner_y + reply_inner_pad_y + reply_meta_size;
+                    for line in &meta_lines {
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            line,
+                            text_x as f32,
+                            baseline as f32,
+                            reply_meta_size,
+                            font_weight_body,
+                            color_meta,
+                        );
+                        baseline = baseline.saturating_add(reply_meta_line_height);
+                    }
+                    baseline = inner_y
+                        + reply_inner_pad_y
+                        + meta_lines.len() as u32 * reply_meta_line_height
+                        + file_meta_gap
+                        + reply_body_size
+                        + REPLY_BODY_BASELINE_OFFSET_PX;
+                    for line in &body_lines {
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            line,
+                            text_x as f32,
+                            baseline as f32,
+                            reply_body_draw_size,
+                            font_weight_body,
+                            color_from_hex(0x333333),
+                        );
+                        baseline = baseline.saturating_add(reply_body_line_height);
+                    }
+                }
+                BlockKind::Poke { image } => {
+                    let rect = Rect::from_xywh(
+                        block.x as f32,
+                        block.y as f32,
+                        block.width as f32,
+                        block.height as f32,
+                    );
+                    if let Some(img) = image.as_ref().filter(|img| img.has_bytes()) {
+                        if let Some(decoded) = decode_image(img) {
+                            draw_image_stretch(canvas, &decoded, rect);
+                        }
+                    } else {
+                        draw_text_line(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            "[戳一戳]",
+                            block.x as f32,
+                            (block.y + font_size) as f32,
                             font_size,
                             font_weight_body,
                             color_text,
                         );
                     }
                 }
-            }
-            BlockKind::FileCard {
-                name_lines,
-                meta_line,
-                icon_path,
-                icon_text,
-            } => {
-                let rect = Rect::from_xywh(
-                    block.x as f32,
-                    block.y as f32,
-                    block.width as f32,
-                    block.height as f32,
-                );
-                let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
-                draw_shadowed_rrect(canvas, rr, 2.0, 0.10);
-
-                let mut card_bg = Paint::default();
-                card_bg.set_color4f(color_white, None);
-                card_bg.set_anti_alias(true);
-                canvas.draw_rrect(rr, &card_bg);
-                let mut card_border = Paint::default();
-                card_border.set_color4f(color_border, None);
-                card_border.set_style(skia_safe::paint::Style::Stroke);
-                card_border.set_stroke_width(1.0);
-                card_border.set_anti_alias(true);
-                canvas.draw_rrect(rr, &card_border);
-
-                let icon_x = block.x + block.width.saturating_sub(file_padding + file_icon_size);
-                let icon_y = block.y + (block.height - file_icon_size) / 2;
-                let mut drew_icon = false;
-                if let Some(path) = icon_path {
-                    let icon_image = file_icon_cache.entry(path).or_insert_with(|| {
-                        resolved_image_from_path(path).and_then(|img| decode_image(&img))
-                    });
-                    if let Some(image) = icon_image.as_ref() {
-                        let pad = 2.0f32;
-                        let icon_dst = Rect::from_xywh(
-                            icon_x as f32 + pad,
-                            icon_y as f32 + pad,
-                            (file_icon_size as f32 - pad * 2.0).max(1.0),
-                            (file_icon_size as f32 - pad * 2.0).max(1.0),
-                        );
-                        draw_image_stretch(canvas, image, icon_dst);
-                        drew_icon = true;
-                    }
-                }
-                if !drew_icon {
-                    let icon_center_x = icon_x + file_icon_size / 2;
-                    let icon_center_y = icon_y + file_icon_size / 2;
-                    if let Some((paragraph, metrics)) = build_line_paragraph(
-                        &font_collection,
-                        &icon_text,
-                        11,
-                        font_weight_body,
-                        color_meta,
-                    ) {
-                        let icon_baseline = center_baseline(icon_center_y as f32, &metrics);
-                        let icon_x = icon_center_x as f32 - metrics.width * 0.5;
-                        let top_y = icon_baseline - metrics.baseline;
-                        paragraph.paint(canvas, (icon_x, top_y));
-                    }
-                }
-
-                let text_x = block.x + file_padding;
-                let name_height = name_lines.len() as u32 * file_line_height;
-                let meta_height = if meta_line.is_some() {
-                    file_meta_height + file_meta_gap
-                } else {
-                    0
-                };
-                let text_height = name_height + meta_height;
-                let content_height = file_icon_size.max(text_height);
-                let text_top = block.y + file_padding + (content_height - text_height) / 2 - 4;
-                let text_baseline = text_top + font_size;
-
-                for (idx, line) in name_lines.iter().enumerate() {
-                    let baseline = text_baseline + file_line_height.saturating_mul(idx as u32);
-                    draw_text_line(
+                BlockKind::JsonCard {
+                    qr_url,
+                    view,
+                    title_lines,
+                    desc_lines,
+                    footer_line,
+                    media,
+                    tag_icon,
+                    brand_icon,
+                } => {
+                    draw_json_card_frame(
                         canvas,
                         &font_collection,
                         &mut emoji_cache,
-                        line,
-                        text_x as f32,
-                        baseline as f32,
+                        BlockFrame {
+                            x: block.x,
+                            y: block.y,
+                            width: block.width,
+                            height: block.height,
+                        },
+                        radius_lg,
+                        card_padding,
                         font_size,
-                        font_weight_body,
-                        color_text,
-                    );
-                }
-                if let Some(meta) = meta_line {
-                    let meta_font_size = 11u32;
-                    let meta_y = text_top + name_height + file_meta_gap + meta_font_size + 8;
-                    draw_text_line(
-                        canvas,
-                        &font_collection,
-                        &mut emoji_cache,
-                        &meta,
-                        text_x as f32,
-                        meta_y as f32,
-                        meta_font_size,
-                        font_weight_body,
-                        color_muted,
-                    );
-                }
-            }
-            BlockKind::Reply {
-                meta_lines,
-                body_lines,
-                missing,
-            } => {
-                let rect = Rect::from_xywh(
-                    block.x as f32,
-                    block.y as f32,
-                    block.width as f32,
-                    block.height as f32,
-                );
-                let rr = RRect::new_rect_xy(rect, 4.0, 4.0);
-                let mut bg = Paint::default();
-                bg.set_color4f(color_from_hex(0xFAFAFA), None);
-                bg.set_anti_alias(true);
-                canvas.draw_rrect(rr, &bg);
-                let mut accent = Paint::default();
-                accent.set_color4f(
-                    if missing {
-                        color_from_hex(0xC7C7CC)
-                    } else {
-                        color_border
-                    },
-                    None,
-                );
-                accent.set_anti_alias(true);
-                canvas.draw_rect(
-                    Rect::from_xywh(block.x as f32, block.y as f32, 3.0, block.height as f32),
-                    &accent,
-                );
-                let text_x = block.x + card_padding;
-                let mut baseline = block.y + card_padding + meta_size;
-                for line in meta_lines {
-                    draw_text_line(
-                        canvas,
-                        &font_collection,
-                        &mut emoji_cache,
-                        &line,
-                        text_x as f32,
-                        baseline as f32,
                         meta_size,
+                        card_title_size,
+                        card_line_height,
+                        file_meta_height,
+                        file_meta_gap,
+                        font_weight_title,
                         font_weight_body,
-                        color_meta,
-                    );
-                    baseline = baseline.saturating_add(file_meta_height);
-                }
-                baseline = baseline.saturating_add(file_meta_gap + meta_size);
-                for line in body_lines {
-                    draw_text_line(
-                        canvas,
-                        &font_collection,
-                        &mut emoji_cache,
-                        &line,
-                        text_x as f32,
-                        baseline as f32,
-                        meta_size,
-                        font_weight_body,
-                        color_from_hex(0x333333),
-                    );
-                    baseline = baseline.saturating_add(card_line_height);
-                }
-            }
-            BlockKind::Poke { image } => {
-                let rect = Rect::from_xywh(
-                    block.x as f32,
-                    block.y as f32,
-                    block.width as f32,
-                    block.height as f32,
-                );
-                if let Some(img) = image.as_ref().filter(|img| img.has_bytes()) {
-                    if let Some(decoded) = decode_image(img) {
-                        draw_image_cover_rounded(canvas, &decoded, rect, radius_lg as f32);
-                    }
-                } else {
-                    draw_text_line(
-                        canvas,
-                        &font_collection,
-                        &mut emoji_cache,
-                        "[戳一戳]",
-                        block.x as f32,
-                        (block.y + font_size) as f32,
-                        font_size,
-                        font_weight_body,
-                        color_text,
-                    );
-                }
-            }
-            BlockKind::JsonCard {
-                view,
-                title_lines,
-                desc_lines,
-                footer_line,
-                media,
-            } => {
-                let rect = Rect::from_xywh(
-                    block.x as f32,
-                    block.y as f32,
-                    block.width as f32,
-                    block.height as f32,
-                );
-                let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
-                draw_shadowed_rrect(canvas, rr, 2.0, 0.10);
-                let mut card_bg = Paint::default();
-                card_bg.set_color4f(color_white, None);
-                card_bg.set_anti_alias(true);
-                canvas.draw_rrect(rr, &card_bg);
-                let mut border = Paint::default();
-                border.set_color4f(color_border, None);
-                border.set_style(skia_safe::paint::Style::Stroke);
-                border.set_stroke_width(1.0);
-                border.set_anti_alias(true);
-                canvas.draw_rrect(rr, &border);
-
-                let vertical_media = json_card_uses_vertical_media(&view);
-                let side_y = block.y + card_padding;
-                let qr_x = view
-                    .jump_url
-                    .as_ref()
-                    .map(|_| block.x + block.width.saturating_sub(card_padding + 48));
-                if let (Some(url), Some(x)) = (view.jump_url.as_deref(), qr_x) {
-                    draw_qr_code(
-                        canvas,
-                        url,
-                        Rect::from_xywh(x as f32, side_y as f32, 48.0, 48.0),
                         color_white,
                         color_text,
+                        color_meta,
+                        color_muted,
+                        qr_url.as_deref(),
+                        &view,
+                        &title_lines,
+                        &desc_lines,
+                        footer_line.as_deref(),
+                        media.as_ref(),
+                        tag_icon.as_ref(),
+                        brand_icon.as_ref(),
                     );
                 }
+                BlockKind::Forward { items } => {
+                    let title = "合并转发聊天记录";
+                    let title_y = block.y.saturating_add(meta_size).saturating_sub(1);
+                    draw_text_line(
+                        canvas,
+                        &font_collection,
+                        &mut emoji_cache,
+                        title,
+                        block.x as f32,
+                        title_y as f32,
+                        meta_size,
+                        font_weight_body,
+                        color_meta,
+                    );
+                    let left = block.x;
+                    let first_child_y = items
+                        .iter()
+                        .flat_map(|item| item.blocks.iter().map(|child| child.y))
+                        .min()
+                        .unwrap_or(block.y);
+                    let top = first_child_y.saturating_sub(forward_line_gap);
+                    let bottom = block.y.saturating_add(block.height).saturating_add(2);
+                    let mut accent = Paint::default();
+                    accent.set_color4f(color_from_hex(0x71A1CC), None);
+                    accent.set_anti_alias(true);
+                    canvas.draw_rect(
+                        Rect::from_xywh(
+                            left as f32,
+                            top as f32,
+                            3.0,
+                            bottom.saturating_sub(top) as f32,
+                        ),
+                        &accent,
+                    );
+                    for item in items {
+                        for child in item.blocks {
+                            match child.kind {
+                                BlockKind::Text { lines } => {
+                                    let rect = Rect::from_xywh(
+                                        child.x as f32,
+                                        child.y as f32,
+                                        child.width as f32,
+                                        child.height as f32,
+                                    );
+                                    let rr = RRect::new_rect_xy(
+                                        rect,
+                                        radius_lg as f32,
+                                        radius_lg as f32,
+                                    );
+                                    draw_shadowed_rrect(
+                                        canvas,
+                                        rr,
+                                        SHADOW_SM_BLUR_PX,
+                                        SHADOW_SM_ALPHA,
+                                    );
 
-                if vertical_media {
-                    let text_x = block.x + card_padding;
-                    let mut baseline = block.y + card_padding + font_size;
-                    for line in title_lines {
-                        draw_text_line(
-                            canvas,
-                            &font_collection,
-                            &mut emoji_cache,
-                            &line,
-                            text_x as f32,
-                            baseline as f32,
-                            font_size,
-                            font_weight_title,
-                            color_text,
-                        );
-                        baseline = baseline.saturating_add(card_line_height);
-                    }
-                    for line in desc_lines {
-                        draw_text_line(
-                            canvas,
-                            &font_collection,
-                            &mut emoji_cache,
-                            &line,
-                            text_x as f32,
-                            baseline as f32,
-                            meta_size,
-                            font_weight_body,
-                            color_meta,
-                        );
-                        baseline = baseline.saturating_add(file_meta_height);
-                    }
-                    if let Some(line) = footer_line {
-                        draw_text_line(
-                            canvas,
-                            &font_collection,
-                            &mut emoji_cache,
-                            &line,
-                            text_x as f32,
-                            baseline as f32,
-                            meta_size,
-                            font_weight_body,
-                            color_muted,
-                        );
-                        baseline = baseline.saturating_add(file_meta_height);
-                    }
+                                    let mut bubble_bg = Paint::default();
+                                    bubble_bg.set_color4f(color_white, None);
+                                    bubble_bg.set_anti_alias(true);
+                                    canvas.draw_rrect(rr, &bubble_bg);
 
-                    if let Some(img) = media.as_ref().filter(|img| img.has_bytes()) {
-                        if let Some(decoded) = decode_image(img) {
-                            let preview_y = (block.y + card_padding)
-                                .saturating_add(
-                                    (baseline.saturating_sub(block.y + card_padding))
-                                        .max(if qr_x.is_some() { 48 } else { 0 }),
-                                )
-                                .saturating_add(card_padding);
-                            let preview_h = block
-                                .y
-                                .saturating_add(block.height)
-                                .saturating_sub(card_padding)
-                                .saturating_sub(preview_y)
-                                .max(1);
-                            draw_image_cover_rounded(
-                                canvas,
-                                &decoded,
-                                Rect::from_xywh(
-                                    (block.x + card_padding) as f32,
-                                    preview_y as f32,
-                                    block.width.saturating_sub(card_padding * 2) as f32,
-                                    preview_h as f32,
-                                ),
-                                6.0,
-                            );
+                                    let line_x = child.x + bubble_pad_left;
+                                    let line_y = child.y + bubble_pad_top + font_size;
+                                    for (idx, line) in lines.iter().enumerate() {
+                                        let baseline_y =
+                                            line_y + line_height.saturating_mul(idx as u32);
+                                        let mut cursor_x = line_x;
+                                        for run in &line.runs {
+                                            match run {
+                                                InlineRun::Text(text) => {
+                                                    if !text.is_empty() {
+                                                        draw_text_line(
+                                                            canvas,
+                                                            &font_collection,
+                                                            &mut emoji_cache,
+                                                            text,
+                                                            cursor_x as f32,
+                                                            baseline_y as f32,
+                                                            font_size,
+                                                            font_weight_body,
+                                                            color_text,
+                                                        );
+                                                        cursor_x = cursor_x.saturating_add(
+                                                            measure_inline_text_width(
+                                                                text,
+                                                                font_size,
+                                                                font_weight_body,
+                                                                &mut text_measurer,
+                                                                &emoji_cache,
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                                InlineRun::Face { id } => {
+                                                    if let Some(face) =
+                                                        resolve_face_image(id, &mut face_cache)
+                                                    {
+                                                        let line_top =
+                                                            baseline_y.saturating_sub(font_size);
+                                                        let face_y = line_top.saturating_add(
+                                                            line_height.saturating_sub(face_size)
+                                                                / 2,
+                                                        );
+                                                        let face_x = cursor_x;
+                                                        let face_image = face_image_cache
+                                                            .entry(id.clone())
+                                                            .or_insert_with(|| decode_image(&face));
+                                                        if let Some(image) = face_image.as_ref() {
+                                                            draw_image_cover_rounded(
+                                                                canvas,
+                                                                image,
+                                                                Rect::from_xywh(
+                                                                    face_x as f32,
+                                                                    face_y as f32,
+                                                                    face_size as f32,
+                                                                    face_size as f32,
+                                                                ),
+                                                                3.0,
+                                                            );
+                                                        }
+                                                        cursor_x =
+                                                            cursor_x.saturating_add(face_size);
+                                                    }
+                                                }
+                                                InlineRun::Emoji { glyph_id } => {
+                                                    let line_top =
+                                                        baseline_y.saturating_sub(font_size);
+                                                    let emoji_y = line_top.saturating_add(
+                                                        line_height.saturating_sub(face_size) / 2,
+                                                    );
+                                                    if let Some(image) =
+                                                        emoji_cache.resolve_image_by_gid(*glyph_id)
+                                                    {
+                                                        draw_image_stretch(
+                                                            canvas,
+                                                            &image,
+                                                            Rect::from_xywh(
+                                                                cursor_x as f32,
+                                                                emoji_y as f32,
+                                                                face_size as f32,
+                                                                face_size as f32,
+                                                            ),
+                                                        );
+                                                    }
+                                                    cursor_x = cursor_x.saturating_add(face_size);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                BlockKind::FileCard {
+                                    name_lines,
+                                    meta_line,
+                                    icon_path,
+                                    icon_text,
+                                } => {
+                                    let rect = Rect::from_xywh(
+                                        child.x as f32,
+                                        child.y as f32,
+                                        child.width as f32,
+                                        child.height as f32,
+                                    );
+                                    let rr = RRect::new_rect_xy(
+                                        rect,
+                                        radius_lg as f32,
+                                        radius_lg as f32,
+                                    );
+                                    draw_shadowed_rrect(
+                                        canvas,
+                                        rr,
+                                        SHADOW_SM_BLUR_PX,
+                                        SHADOW_SM_ALPHA,
+                                    );
+
+                                    let mut card_bg = Paint::default();
+                                    card_bg.set_color4f(color_white, None);
+                                    card_bg.set_anti_alias(true);
+                                    canvas.draw_rrect(rr, &card_bg);
+
+                                    let icon_x = child.x
+                                        + child.width.saturating_sub(file_padding + file_icon_size);
+                                    let icon_y = child.y + (child.height - file_icon_size) / 2;
+                                    let mut drew_icon = false;
+                                    if let Some(path) = icon_path {
+                                        let icon_image =
+                                            file_icon_cache.entry(path).or_insert_with(|| {
+                                                resolved_image_from_path(path)
+                                                    .and_then(|img| decode_image(&img))
+                                            });
+                                        if let Some(image) = icon_image.as_ref() {
+                                            draw_image_stretch(
+                                                canvas,
+                                                image,
+                                                Rect::from_xywh(
+                                                    icon_x as f32,
+                                                    icon_y as f32,
+                                                    file_icon_size as f32,
+                                                    file_icon_size as f32,
+                                                ),
+                                            );
+                                            drew_icon = true;
+                                        }
+                                    }
+                                    if !drew_icon {
+                                        let icon_center_x = icon_x + file_icon_size / 2;
+                                        let icon_center_y = icon_y + file_icon_size / 2;
+                                        if let Some((paragraph, metrics)) = build_line_paragraph(
+                                            &font_collection,
+                                            &icon_text,
+                                            11,
+                                            font_weight_body,
+                                            color_meta,
+                                        ) {
+                                            let icon_baseline =
+                                                center_baseline(icon_center_y as f32, &metrics);
+                                            let icon_x = icon_center_x as f32 - metrics.width * 0.5;
+                                            paragraph.paint(
+                                                canvas,
+                                                (icon_x, icon_baseline - metrics.baseline),
+                                            );
+                                        }
+                                    }
+
+                                    let text_x = child.x + file_padding;
+                                    let name_height = name_lines.len() as u32 * file_line_height;
+                                    let meta_height = if meta_line.is_some() {
+                                        file_meta_height + file_meta_gap
+                                    } else {
+                                        0
+                                    };
+                                    let text_height = name_height + meta_height;
+                                    let content_height = file_icon_size.max(text_height);
+                                    let text_top =
+                                        child.y + file_padding + (content_height - text_height) / 2
+                                            - 4;
+                                    let file_name_size = font_size.saturating_sub(2).max(meta_size);
+                                    let text_baseline = text_top + file_name_size;
+
+                                    for (idx, line) in name_lines.iter().enumerate() {
+                                        let baseline = text_baseline
+                                            + file_line_height.saturating_mul(idx as u32);
+                                        draw_text_line(
+                                            canvas,
+                                            &font_collection,
+                                            &mut emoji_cache,
+                                            line,
+                                            text_x as f32,
+                                            baseline as f32,
+                                            file_name_size,
+                                            font_weight_body,
+                                            color_text,
+                                        );
+                                    }
+                                    if let Some(meta) = meta_line {
+                                        let meta_font_size = 11u32;
+                                        let meta_y = text_top
+                                            + name_height
+                                            + file_meta_gap
+                                            + meta_font_size
+                                            + 6;
+                                        draw_text_line(
+                                            canvas,
+                                            &font_collection,
+                                            &mut emoji_cache,
+                                            &meta,
+                                            text_x as f32,
+                                            meta_y as f32,
+                                            meta_font_size,
+                                            font_weight_body,
+                                            color_muted,
+                                        );
+                                    }
+                                }
+                                BlockKind::JsonCard {
+                                    qr_url,
+                                    view,
+                                    title_lines,
+                                    desc_lines,
+                                    footer_line,
+                                    media,
+                                    tag_icon,
+                                    brand_icon,
+                                } => {
+                                    draw_json_card_frame(
+                                        canvas,
+                                        &font_collection,
+                                        &mut emoji_cache,
+                                        BlockFrame {
+                                            x: child.x,
+                                            y: child.y,
+                                            width: child.width,
+                                            height: child.height,
+                                        },
+                                        radius_lg,
+                                        card_padding,
+                                        font_size,
+                                        meta_size,
+                                        card_title_size,
+                                        card_line_height,
+                                        file_meta_height,
+                                        file_meta_gap,
+                                        font_weight_title,
+                                        font_weight_body,
+                                        color_white,
+                                        color_text,
+                                        color_meta,
+                                        color_muted,
+                                        qr_url.as_deref(),
+                                        &view,
+                                        &title_lines,
+                                        &desc_lines,
+                                        footer_line.as_deref(),
+                                        media.as_ref(),
+                                        tag_icon.as_ref(),
+                                        brand_icon.as_ref(),
+                                    );
+                                }
+                                BlockKind::Image { image } => {
+                                    let rect = Rect::from_xywh(
+                                        child.x as f32,
+                                        child.y as f32,
+                                        child.width as f32,
+                                        child.height as f32,
+                                    );
+                                    draw_image_preview_frame(
+                                        canvas,
+                                        image.as_ref(),
+                                        rect,
+                                        radius_lg as f32,
+                                        color_white,
+                                        color_border,
+                                    );
+                                }
+                                BlockKind::VideoPreview { image } => {
+                                    let rect = Rect::from_xywh(
+                                        child.x as f32,
+                                        child.y as f32,
+                                        child.width as f32,
+                                        child.height as f32,
+                                    );
+                                    let bg =
+                                        if image.as_ref().filter(|img| img.has_bytes()).is_some() {
+                                            color_white
+                                        } else {
+                                            color_from_hex(0x262626)
+                                        };
+                                    draw_image_preview_frame(
+                                        canvas,
+                                        image.as_ref(),
+                                        rect,
+                                        radius_lg as f32,
+                                        bg,
+                                        color_border,
+                                    );
+                                    draw_video_play_triangle(canvas, rect);
+                                }
+                                BlockKind::MediaCard { media_kind, .. } => {
+                                    draw_text_line(
+                                        canvas,
+                                        &font_collection,
+                                        &mut emoji_cache,
+                                        media_label(media_kind),
+                                        child.x as f32,
+                                        (child.y + font_size) as f32,
+                                        font_size,
+                                        font_weight_body,
+                                        color_text,
+                                    );
+                                }
+                                BlockKind::Reply {
+                                    meta_lines,
+                                    body_lines,
+                                } => {
+                                    let rect = Rect::from_xywh(
+                                        child.x as f32,
+                                        child.y as f32,
+                                        child.width as f32,
+                                        child.height as f32,
+                                    );
+                                    let rr = RRect::new_rect_xy(
+                                        rect,
+                                        radius_lg as f32,
+                                        radius_lg as f32,
+                                    );
+                                    draw_shadowed_rrect(
+                                        canvas,
+                                        rr,
+                                        SHADOW_SM_BLUR_PX,
+                                        SHADOW_SM_ALPHA,
+                                    );
+                                    let mut bubble_bg = Paint::default();
+                                    bubble_bg.set_color4f(color_white, None);
+                                    bubble_bg.set_anti_alias(true);
+                                    canvas.draw_rrect(rr, &bubble_bg);
+
+                                    let reply_accent_width = 3u32;
+                                    let reply_inner_pad_x = card_padding;
+                                    let reply_inner_pad_y = 6u32;
+                                    let reply_meta_size =
+                                        font_size.saturating_sub(2).max(meta_size);
+                                    let reply_body_size = font_size;
+                                    let reply_meta_line_height = file_line_height;
+                                    let reply_body_line_height = line_height;
+                                    let inner_x = child.x + bubble_pad_left;
+                                    let inner_y = child
+                                        .y
+                                        .saturating_add(bubble_pad_top)
+                                        .saturating_sub(REPLY_INNER_Y_RAISE_PX);
+                                    let inner_width = child
+                                        .width
+                                        .saturating_sub(bubble_pad_left + bubble_pad_right);
+                                    let inner_height = child
+                                        .height
+                                        .saturating_sub(bubble_pad_top + bubble_pad_bottom);
+                                    let inner_rect = Rect::from_xywh(
+                                        inner_x as f32,
+                                        inner_y as f32,
+                                        inner_width as f32,
+                                        inner_height as f32,
+                                    );
+                                    let inner_rr = RRect::new_rect_xy(inner_rect, 4.0, 4.0);
+                                    let mut bg = Paint::default();
+                                    bg.set_color4f(color_from_hex(0xFAFAFA), None);
+                                    bg.set_anti_alias(true);
+                                    canvas.draw_rrect(inner_rr, &bg);
+                                    let mut accent = Paint::default();
+                                    accent.set_color4f(color_border, None);
+                                    accent.set_anti_alias(true);
+                                    canvas.draw_rect(
+                                        Rect::from_xywh(
+                                            inner_x as f32,
+                                            inner_y as f32,
+                                            reply_accent_width as f32,
+                                            inner_height as f32,
+                                        ),
+                                        &accent,
+                                    );
+                                    let text_x = inner_x + reply_accent_width + reply_inner_pad_x;
+                                    let mut baseline =
+                                        inner_y + reply_inner_pad_y + reply_meta_size;
+                                    for line in &meta_lines {
+                                        draw_text_line(
+                                            canvas,
+                                            &font_collection,
+                                            &mut emoji_cache,
+                                            line,
+                                            text_x as f32,
+                                            baseline as f32,
+                                            reply_meta_size,
+                                            font_weight_body,
+                                            color_meta,
+                                        );
+                                        baseline = baseline.saturating_add(reply_meta_line_height);
+                                    }
+                                    baseline = inner_y
+                                        + reply_inner_pad_y
+                                        + meta_lines.len() as u32 * reply_meta_line_height
+                                        + file_meta_gap
+                                        + reply_body_size
+                                        + REPLY_BODY_BASELINE_OFFSET_PX;
+                                    for line in &body_lines {
+                                        draw_text_line(
+                                            canvas,
+                                            &font_collection,
+                                            &mut emoji_cache,
+                                            line,
+                                            text_x as f32,
+                                            baseline as f32,
+                                            reply_body_size,
+                                            font_weight_body,
+                                            color_from_hex(0x333333),
+                                        );
+                                        baseline = baseline.saturating_add(reply_body_line_height);
+                                    }
+                                }
+                                BlockKind::Poke { image } => {
+                                    let rect = Rect::from_xywh(
+                                        child.x as f32,
+                                        child.y as f32,
+                                        child.width as f32,
+                                        child.height as f32,
+                                    );
+                                    if let Some(img) = image.as_ref().filter(|img| img.has_bytes())
+                                    {
+                                        if let Some(decoded) = decode_image(img) {
+                                            draw_image_stretch(canvas, &decoded, rect);
+                                        }
+                                    } else {
+                                        draw_text_line(
+                                            canvas,
+                                            &font_collection,
+                                            &mut emoji_cache,
+                                            "[戳一戳]",
+                                            child.x as f32,
+                                            (child.y + font_size) as f32,
+                                            font_size,
+                                            font_weight_body,
+                                            color_text,
+                                        );
+                                    }
+                                }
+                                BlockKind::Forward { items } => {
+                                    let frame = BlockFrame {
+                                        x: child.x,
+                                        y: child.y,
+                                        width: child.width,
+                                        height: child.height,
+                                    };
+                                    let mut painter = ForwardDrawContext {
+                                        canvas,
+                                        font_collection: &font_collection,
+                                        emoji_cache: &mut emoji_cache,
+                                        text_measurer: &mut text_measurer,
+                                        face_cache: &mut face_cache,
+                                        face_image_cache: &mut face_image_cache,
+                                        file_icon_cache: &mut file_icon_cache,
+                                        bubble_pad_left,
+                                        bubble_pad_right,
+                                        bubble_pad_top,
+                                        bubble_pad_bottom,
+                                        font_size,
+                                        line_height,
+                                        face_size,
+                                        font_weight_title,
+                                        font_weight_body,
+                                        meta_size,
+                                        card_title_size,
+                                        card_padding,
+                                        card_line_height,
+                                        file_padding,
+                                        file_line_height,
+                                        file_meta_height,
+                                        file_meta_gap,
+                                        file_icon_size,
+                                        radius_lg,
+                                        forward_line_gap,
+                                        color_white,
+                                        color_border,
+                                        color_text,
+                                        color_meta,
+                                        color_muted,
+                                    };
+                                    painter.draw_forward(frame, &items);
+                                }
+                            }
                         }
-                    }
-                } else {
-                    let mut text_x = block.x + card_padding;
-                    if let Some(img) = media.as_ref().filter(|img| img.has_bytes()) {
-                        if let Some(decoded) = decode_image(img) {
-                            draw_image_cover_rounded(
-                                canvas,
-                                &decoded,
-                                Rect::from_xywh(text_x as f32, side_y as f32, 48.0, 48.0),
-                                4.0,
-                            );
-                            text_x = text_x.saturating_add(56);
-                        }
-                    }
-
-                    let mut baseline = block.y + card_padding + font_size;
-                    for line in title_lines {
-                        draw_text_line(
-                            canvas,
-                            &font_collection,
-                            &mut emoji_cache,
-                            &line,
-                            text_x as f32,
-                            baseline as f32,
-                            font_size,
-                            font_weight_title,
-                            color_text,
-                        );
-                        baseline = baseline.saturating_add(card_line_height);
-                    }
-                    for line in desc_lines {
-                        draw_text_line(
-                            canvas,
-                            &font_collection,
-                            &mut emoji_cache,
-                            &line,
-                            text_x as f32,
-                            baseline as f32,
-                            meta_size,
-                            font_weight_body,
-                            color_meta,
-                        );
-                        baseline = baseline.saturating_add(file_meta_height);
-                    }
-                    if let Some(line) = footer_line {
-                        draw_text_line(
-                            canvas,
-                            &font_collection,
-                            &mut emoji_cache,
-                            &line,
-                            text_x as f32,
-                            baseline as f32,
-                            meta_size,
-                            font_weight_body,
-                            color_muted,
-                        );
-                    }
-                }
-            }
-            BlockKind::Forward { items } => {
-                let title = "合并转发聊天记录";
-                let title_y = block.y + card_padding + meta_size;
-                draw_text_line(
-                    canvas,
-                    &font_collection,
-                    &mut emoji_cache,
-                    title,
-                    block.x as f32,
-                    title_y as f32,
-                    meta_size,
-                    font_weight_body,
-                    color_meta,
-                );
-                let left = block.x + 2;
-                let top = title_y + file_meta_gap;
-                let mut accent = Paint::default();
-                accent.set_color4f(color_from_hex(0x71A1CC), None);
-                accent.set_anti_alias(true);
-                canvas.draw_rect(
-                    Rect::from_xywh(
-                        left as f32,
-                        top as f32,
-                        3.0,
-                        block.height.saturating_sub(card_padding + card_line_height) as f32,
-                    ),
-                    &accent,
-                );
-                let text_x = left + card_padding;
-                let mut baseline = top + card_line_height;
-                for item in items {
-                    if let Some(sender) = item.sender.as_ref() {
-                        draw_text_line(
-                            canvas,
-                            &font_collection,
-                            &mut emoji_cache,
-                            sender,
-                            text_x as f32,
-                            baseline as f32,
-                            meta_size,
-                            font_weight_title,
-                            color_meta,
-                        );
-                        baseline = baseline.saturating_add(card_line_height);
-                    }
-                    for line in item.lines {
-                        draw_text_line(
-                            canvas,
-                            &font_collection,
-                            &mut emoji_cache,
-                            &line,
-                            text_x as f32,
-                            baseline as f32,
-                            meta_size,
-                            font_weight_body,
-                            color_text,
-                        );
-                        baseline = baseline.saturating_add(card_line_height);
                     }
                 }
             }
         }
+
+        canvas.restore();
+
+        if let Some(watermark_text) = config
+            .watermark_text_by_group
+            .get(&header.group_id)
+            .map(|text| text.trim())
+            .filter(|text| !text.is_empty())
+        {
+            draw_watermark_layer(
+                canvas,
+                &font_collection,
+                &mut emoji_cache,
+                header,
+                canvas_width_px,
+                background_height,
+                watermark_text,
+            );
+        }
+
+        let image = surface.image_snapshot();
+        let data = image
+            .encode(None, EncodedImageFormat::PNG, None)
+            .ok_or_else(|| "encode png failed".to_string())?;
+        pages.push(data.as_bytes().to_vec());
     }
 
-    if let Some(watermark_text) = config
-        .watermark_text_by_group
-        .get(&header.group_id)
-        .map(|text| text.trim())
-        .filter(|text| !text.is_empty())
-    {
-        draw_watermark_layer(
-            canvas,
-            &font_collection,
-            &mut emoji_cache,
-            header,
-            config.canvas_width_px,
-            background_height,
-            watermark_text,
-        );
+    Ok(pages)
+}
+
+fn paginate_render_pages(
+    blocks: &[BlockLayout],
+    full_height: u32,
+    max_page_height: u32,
+    min_page_height: u32,
+    padding: u32,
+    spacing: u32,
+) -> Vec<(u32, u32)> {
+    let full_height = full_height.max(1);
+    let max_page_height = max_page_height.max(1);
+    let min_page_height = min_page_height.min(max_page_height).max(1);
+    let mut pages = Vec::new();
+    let mut start = 0u32;
+
+    while start < full_height {
+        let hard_end = start.saturating_add(max_page_height).min(full_height);
+        if hard_end >= full_height {
+            pages.push((start, hard_end.saturating_sub(start).max(min_page_height)));
+            break;
+        }
+
+        let mut soft_end = None;
+        for block in blocks {
+            let block_top = block.y;
+            if block_top <= start {
+                continue;
+            }
+            let block_bottom = block.y.saturating_add(block.height).saturating_add(padding);
+            if block_bottom > hard_end {
+                let break_y = block_top.saturating_sub(spacing / 2);
+                if break_y > start {
+                    soft_end = Some(break_y);
+                }
+                break;
+            }
+            soft_end = Some(block_bottom.min(hard_end));
+        }
+
+        let candidate_end = soft_end.unwrap_or(hard_end);
+        let end = if candidate_end <= start
+            || candidate_end.saturating_sub(start) < min_page_height.saturating_div(2).max(1)
+        {
+            hard_end
+        } else {
+            candidate_end.min(hard_end)
+        };
+        let height = end.saturating_sub(start).max(min_page_height);
+        pages.push((start, height.min(max_page_height)));
+        start = end.max(start.saturating_add(1));
     }
 
-    let image = surface.image_snapshot();
-    let data = image
-        .encode(None, EncodedImageFormat::PNG, None)
-        .ok_or_else(|| "encode png failed".to_string())?;
-    Ok(data.as_bytes().to_vec())
+    if pages.is_empty() {
+        pages.push((0, min_page_height));
+    }
+    pages
 }
 
 pub fn render_preview_png(
@@ -2764,10 +4150,21 @@ pub fn render_preview_png(
     header: RenderPreviewHeader,
     config: &RendererRuntimeConfig,
 ) -> Result<Vec<u8>, String> {
+    let draft = normalize_embedded_forward_draft(draft);
     let header = HeaderInfo::from(header);
-    let draft = expand_embedded_forward_draft(draft);
     let image_sources = render_preview_image_sources(&draft);
     render_png(&draft, &header, &image_sources, config)
+}
+
+pub fn render_preview_png_pages(
+    draft: &Draft,
+    header: RenderPreviewHeader,
+    config: &RendererRuntimeConfig,
+) -> Result<Vec<Vec<u8>>, String> {
+    let draft = normalize_embedded_forward_draft(draft);
+    let header = HeaderInfo::from(header);
+    let image_sources = render_preview_image_sources(&draft);
+    render_png_pages(&draft, &header, &image_sources, config)
 }
 
 fn color_from_hex(hex: u32) -> Color4f {
@@ -2775,6 +4172,1011 @@ fn color_from_hex(hex: u32) -> Color4f {
     let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
     let b = (hex & 0xFF) as f32 / 255.0;
     Color4f::new(r, g, b, 1.0)
+}
+
+#[derive(Clone, Copy)]
+struct BlockFrame {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl BlockFrame {
+    fn from_layout(block: &BlockLayout) -> Self {
+        Self {
+            x: block.x,
+            y: block.y,
+            width: block.width,
+            height: block.height,
+        }
+    }
+
+    fn rect(self) -> Rect {
+        Rect::from_xywh(
+            self.x as f32,
+            self.y as f32,
+            self.width as f32,
+            self.height as f32,
+        )
+    }
+}
+
+fn draw_json_card_image(canvas: &Canvas, image: Option<&ResolvedImage>, rect: Rect, radius: f32) {
+    let Some(img) = image.filter(|img| img.has_bytes()) else {
+        return;
+    };
+    let Some(decoded) = decode_image(img) else {
+        return;
+    };
+    if radius > 0.0 {
+        draw_image_cover_rounded(canvas, &decoded, rect, radius);
+    } else {
+        draw_image_stretch(canvas, &decoded, rect);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_json_card_tag_row(
+    canvas: &Canvas,
+    font_collection: &FontCollection,
+    emoji_cache: &mut EmojiRenderCache,
+    x: u32,
+    top_y: u32,
+    text: &str,
+    icon: Option<&ResolvedImage>,
+    font_size: u32,
+    font_weight: u32,
+    text_color: Color4f,
+) {
+    let mut text_x = x;
+    if icon.is_some_and(|img| img.has_bytes()) {
+        draw_json_card_image(
+            canvas,
+            icon,
+            Rect::from_xywh(
+                x as f32,
+                top_y as f32,
+                JSON_CARD_TAG_ICON_SIZE as f32,
+                JSON_CARD_TAG_ICON_SIZE as f32,
+            ),
+            3.0,
+        );
+        text_x = text_x.saturating_add(JSON_CARD_TAG_ICON_SIZE + 4);
+    }
+    draw_text_line(
+        canvas,
+        font_collection,
+        emoji_cache,
+        text,
+        text_x as f32,
+        (top_y + font_size) as f32,
+        font_size,
+        font_weight,
+        text_color,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_json_card_frame(
+    canvas: &Canvas,
+    font_collection: &FontCollection,
+    emoji_cache: &mut EmojiRenderCache,
+    frame: BlockFrame,
+    radius_lg: u32,
+    card_padding: u32,
+    font_size: u32,
+    meta_size: u32,
+    card_title_size: u32,
+    card_line_height: u32,
+    file_meta_height: u32,
+    file_meta_gap: u32,
+    font_weight_title: u32,
+    font_weight_body: u32,
+    color_white: Color4f,
+    color_text: Color4f,
+    color_meta: Color4f,
+    color_muted: Color4f,
+    qr_url: Option<&str>,
+    view: &JsonCardView,
+    title_lines: &[String],
+    desc_lines: &[String],
+    footer_line: Option<&str>,
+    media: Option<&ResolvedImage>,
+    tag_icon: Option<&ResolvedImage>,
+    brand_icon: Option<&ResolvedImage>,
+) {
+    let bottom_qr = json_card_uses_bottom_qr(view);
+    let card_draw_height = frame.height.saturating_sub(if bottom_qr {
+        JSON_CARD_BOTTOM_QR_DRAW_HEIGHT_SHRINK_PX
+    } else {
+        0
+    });
+    let rect = Rect::from_xywh(
+        frame.x as f32,
+        frame.y as f32,
+        frame.width as f32,
+        card_draw_height.max(1) as f32,
+    );
+    let rr = RRect::new_rect_xy(rect, radius_lg as f32, radius_lg as f32);
+    draw_shadowed_rrect(canvas, rr, SHADOW_SM_BLUR_PX, SHADOW_SM_ALPHA);
+    let mut card_bg = Paint::default();
+    card_bg.set_color4f(color_white, None);
+    card_bg.set_anti_alias(true);
+    canvas.draw_rrect(rr, &card_bg);
+
+    let side_y = frame.y + card_padding;
+    let qr_text = qr_url.or(view.jump_url.as_deref());
+    if !bottom_qr {
+        if let Some(url) = qr_text.filter(|_| view.jump_url.is_some()) {
+            let qr_x = frame
+                .x
+                .saturating_add(frame.width.saturating_sub(card_padding + JSON_CARD_QR_SIZE));
+            draw_qr_code(
+                canvas,
+                url,
+                Rect::from_xywh(
+                    qr_x as f32,
+                    side_y as f32,
+                    JSON_CARD_QR_SIZE as f32,
+                    JSON_CARD_QR_SIZE as f32,
+                ),
+                color_white,
+                color_text,
+            );
+        }
+    }
+
+    match view.view_kind.as_str() {
+        "miniapp" => {
+            let text_x = frame.x + card_padding;
+            if !desc_lines.is_empty() {
+                let source_baseline =
+                    frame.y + card_padding + meta_size + JSON_CARD_MINIAPP_SOURCE_BASELINE_DOWN_PX;
+                let mut source_text_x = text_x;
+                if brand_icon.is_some_and(|img| img.has_bytes()) {
+                    let icon_top = source_baseline.saturating_sub(meta_size + 1);
+                    draw_json_card_image(
+                        canvas,
+                        brand_icon,
+                        Rect::from_xywh(
+                            text_x as f32,
+                            icon_top as f32,
+                            JSON_CARD_SOURCE_ICON_SIZE as f32,
+                            JSON_CARD_SOURCE_ICON_SIZE as f32,
+                        ),
+                        2.0,
+                    );
+                    source_text_x = source_text_x.saturating_add(JSON_CARD_SOURCE_ICON_SIZE + 4);
+                }
+                for (idx, line) in desc_lines.iter().enumerate() {
+                    let baseline =
+                        source_baseline.saturating_add(file_meta_height.saturating_mul(idx as u32));
+                    draw_text_line(
+                        canvas,
+                        font_collection,
+                        emoji_cache,
+                        line,
+                        source_text_x as f32,
+                        baseline as f32,
+                        meta_size,
+                        font_weight_body,
+                        color_meta,
+                    );
+                }
+            }
+
+            let mut title_baseline = if desc_lines.is_empty() {
+                frame.y + card_padding + card_title_size
+            } else {
+                frame.y
+                    + card_padding
+                    + meta_size
+                    + card_line_height
+                    + 4
+                    + JSON_CARD_MINIAPP_TITLE_BASELINE_DOWN_PX
+            };
+            for line in title_lines {
+                draw_text_line(
+                    canvas,
+                    font_collection,
+                    emoji_cache,
+                    line,
+                    text_x as f32,
+                    title_baseline as f32,
+                    card_title_size,
+                    font_weight_title,
+                    color_text,
+                );
+                title_baseline = title_baseline.saturating_add(card_line_height);
+            }
+
+            let header_height = json_card_miniapp_header_height(
+                desc_lines.len(),
+                title_lines.len(),
+                view.jump_url.is_some(),
+                file_meta_height,
+                card_line_height,
+            );
+            let preview_h = json_card_preview_height(view, media, frame.width, card_padding);
+            let mut cursor_y = frame.y + card_padding + header_height;
+            if preview_h > 0 {
+                cursor_y = cursor_y.saturating_add(JSON_CARD_SIDE_GAP.saturating_sub(2));
+                draw_json_card_image(
+                    canvas,
+                    media,
+                    Rect::from_xywh(
+                        (frame.x + card_padding) as f32,
+                        cursor_y as f32,
+                        frame.width.saturating_sub(card_padding * 2) as f32,
+                        preview_h as f32,
+                    ),
+                    0.0,
+                );
+                cursor_y = cursor_y.saturating_add(preview_h);
+            }
+            if let Some(line) = footer_line.filter(|line| !line.is_empty()) {
+                cursor_y = cursor_y.saturating_add(JSON_CARD_SIDE_GAP.saturating_sub(2));
+                draw_json_card_tag_row(
+                    canvas,
+                    font_collection,
+                    emoji_cache,
+                    frame.x + card_padding,
+                    cursor_y,
+                    line,
+                    tag_icon,
+                    meta_size,
+                    font_weight_body,
+                    color_muted,
+                );
+            }
+        }
+        "news" => {
+            let side_slot = json_card_has_side_media_slot(view, media);
+            if side_slot {
+                draw_json_card_image(
+                    canvas,
+                    media,
+                    Rect::from_xywh(
+                        (frame.x + card_padding) as f32,
+                        side_y as f32,
+                        JSON_CARD_QR_SIZE as f32,
+                        JSON_CARD_QR_SIZE as f32,
+                    ),
+                    4.0,
+                );
+            }
+
+            let title_x = frame
+                .x
+                .saturating_add(card_padding)
+                .saturating_add(json_card_side_media_space(view, side_slot));
+            let title_block_height = (title_lines.len() as u32)
+                .saturating_mul(card_line_height)
+                .max(card_line_height);
+            let mut baseline =
+                side_y + JSON_CARD_QR_SIZE.saturating_sub(title_block_height) / 2 + card_title_size;
+            for line in title_lines {
+                draw_text_line(
+                    canvas,
+                    font_collection,
+                    emoji_cache,
+                    line,
+                    title_x as f32,
+                    baseline as f32,
+                    card_title_size,
+                    font_weight_title,
+                    color_text,
+                );
+                baseline = baseline.saturating_add(card_line_height);
+            }
+
+            let body_x = frame.x + card_padding;
+            let body_top = side_y
+                + JSON_CARD_QR_SIZE
+                + JSON_CARD_SIDE_GAP.saturating_sub(2)
+                + JSON_CARD_SIDE_GAP.saturating_sub(4);
+            baseline = body_top + meta_size;
+            for line in desc_lines {
+                draw_text_line(
+                    canvas,
+                    font_collection,
+                    emoji_cache,
+                    line,
+                    body_x as f32,
+                    baseline as f32,
+                    meta_size,
+                    font_weight_body,
+                    color_meta,
+                );
+                baseline = baseline.saturating_add(file_meta_height);
+            }
+            if let Some(line) = footer_line.filter(|line| !line.is_empty()) {
+                let tag_top = if desc_lines.is_empty() {
+                    body_top
+                } else {
+                    body_top
+                        + (desc_lines.len() as u32).saturating_mul(file_meta_height)
+                        + file_meta_gap
+                };
+                draw_json_card_tag_row(
+                    canvas,
+                    font_collection,
+                    emoji_cache,
+                    body_x,
+                    tag_top,
+                    line,
+                    tag_icon,
+                    meta_size,
+                    font_weight_body,
+                    color_muted,
+                );
+            }
+        }
+        "contact" => {
+            let text_x = frame.x + card_padding;
+            let side_slot = json_card_has_side_media_slot(view, media);
+            if side_slot {
+                draw_json_card_image(
+                    canvas,
+                    media,
+                    Rect::from_xywh(
+                        text_x as f32,
+                        side_y as f32,
+                        JSON_CARD_QR_SIZE as f32,
+                        JSON_CARD_QR_SIZE as f32,
+                    ),
+                    4.0,
+                );
+            } else if view.media_source.is_none() {
+                draw_text_line(
+                    canvas,
+                    font_collection,
+                    emoji_cache,
+                    "avatar",
+                    text_x as f32,
+                    (side_y + 34) as f32,
+                    font_size,
+                    font_weight_body,
+                    color_text,
+                );
+            }
+            let text_x = text_x.saturating_add(json_card_side_media_space(view, side_slot));
+            let mut baseline = frame.y + card_padding + card_title_size;
+            for line in title_lines {
+                draw_text_line(
+                    canvas,
+                    font_collection,
+                    emoji_cache,
+                    line,
+                    text_x as f32,
+                    baseline as f32,
+                    card_title_size,
+                    font_weight_title,
+                    color_text,
+                );
+                baseline = baseline.saturating_add(card_line_height);
+            }
+            for line in desc_lines {
+                draw_text_line(
+                    canvas,
+                    font_collection,
+                    emoji_cache,
+                    line,
+                    text_x as f32,
+                    baseline as f32,
+                    meta_size,
+                    font_weight_body,
+                    color_meta,
+                );
+                baseline = baseline.saturating_add(file_meta_height);
+            }
+            if let Some(line) = footer_line.filter(|line| !line.is_empty()) {
+                draw_text_line(
+                    canvas,
+                    font_collection,
+                    emoji_cache,
+                    line,
+                    text_x as f32,
+                    baseline as f32,
+                    meta_size,
+                    font_weight_body,
+                    color_muted,
+                );
+            }
+        }
+        _ => {
+            let text_x = frame.x + card_padding;
+            let preview_h = json_card_preview_height(view, media, frame.width, card_padding);
+            let mut cursor_y = frame.y + card_padding;
+            if preview_h > 0 {
+                draw_json_card_image(
+                    canvas,
+                    media,
+                    Rect::from_xywh(
+                        text_x as f32,
+                        cursor_y as f32,
+                        frame.width.saturating_sub(card_padding * 2) as f32,
+                        preview_h as f32,
+                    ),
+                    0.0,
+                );
+                cursor_y = cursor_y.saturating_add(preview_h + card_padding);
+            }
+
+            let mut baseline = cursor_y + card_title_size;
+            if preview_h == 0 {
+                baseline = baseline.saturating_sub(JSON_CARD_VERTICAL_TEXT_BASELINE_RAISE_PX);
+            }
+            for line in title_lines {
+                draw_text_line(
+                    canvas,
+                    font_collection,
+                    emoji_cache,
+                    line,
+                    text_x as f32,
+                    baseline as f32,
+                    card_title_size,
+                    font_weight_title,
+                    color_text,
+                );
+                baseline = baseline.saturating_add(card_line_height);
+            }
+            for line in desc_lines {
+                draw_text_line(
+                    canvas,
+                    font_collection,
+                    emoji_cache,
+                    line,
+                    text_x as f32,
+                    baseline as f32,
+                    meta_size,
+                    font_weight_body,
+                    color_meta,
+                );
+                baseline = baseline.saturating_add(file_meta_height);
+            }
+            if let Some(line) = footer_line.filter(|line| !line.is_empty()) {
+                draw_json_card_tag_row(
+                    canvas,
+                    font_collection,
+                    emoji_cache,
+                    text_x,
+                    baseline.saturating_sub(meta_size),
+                    line,
+                    tag_icon,
+                    meta_size,
+                    font_weight_body,
+                    color_muted,
+                );
+            }
+        }
+    }
+
+    if let Some(url) = qr_text.filter(|_| bottom_qr) {
+        let qr_y = frame
+            .y
+            .saturating_add(frame.height)
+            .saturating_sub(card_padding + JSON_CARD_QR_SIZE + JSON_CARD_BOTTOM_QR_RAISE_PX);
+        draw_qr_code(
+            canvas,
+            url,
+            Rect::from_xywh(
+                (frame.x + card_padding) as f32,
+                qr_y as f32,
+                JSON_CARD_QR_SIZE as f32,
+                JSON_CARD_QR_SIZE as f32,
+            ),
+            color_white,
+            color_text,
+        );
+    }
+}
+
+struct ForwardDrawContext<'a> {
+    canvas: &'a Canvas,
+    font_collection: &'a FontCollection,
+    emoji_cache: &'a mut EmojiRenderCache,
+    text_measurer: &'a mut TextMeasurer,
+    face_cache: &'a mut HashMap<String, ResolvedImage>,
+    face_image_cache: &'a mut HashMap<String, Option<Image>>,
+    file_icon_cache: &'a mut HashMap<&'static str, Option<Image>>,
+    bubble_pad_left: u32,
+    bubble_pad_right: u32,
+    bubble_pad_top: u32,
+    bubble_pad_bottom: u32,
+    font_size: u32,
+    line_height: u32,
+    face_size: u32,
+    font_weight_title: u32,
+    font_weight_body: u32,
+    meta_size: u32,
+    card_title_size: u32,
+    card_padding: u32,
+    card_line_height: u32,
+    file_padding: u32,
+    file_line_height: u32,
+    file_meta_height: u32,
+    file_meta_gap: u32,
+    file_icon_size: u32,
+    radius_lg: u32,
+    forward_line_gap: u32,
+    color_white: Color4f,
+    color_border: Color4f,
+    color_text: Color4f,
+    color_meta: Color4f,
+    color_muted: Color4f,
+}
+
+impl ForwardDrawContext<'_> {
+    fn draw_forward(&mut self, frame: BlockFrame, items: &[ForwardLayoutItem]) {
+        let title = "合并转发聊天记录";
+        let title_y = frame.y.saturating_add(self.meta_size).saturating_sub(1);
+        draw_text_line(
+            self.canvas,
+            self.font_collection,
+            self.emoji_cache,
+            title,
+            frame.x as f32,
+            title_y as f32,
+            self.meta_size,
+            self.font_weight_body,
+            self.color_meta,
+        );
+
+        let first_child_y = items
+            .iter()
+            .flat_map(|item| item.blocks.iter().map(|child| child.y))
+            .min()
+            .unwrap_or(frame.y);
+        let top = first_child_y.saturating_sub(self.forward_line_gap);
+        let bottom = frame.y.saturating_add(frame.height).saturating_add(2);
+        let mut accent = Paint::default();
+        accent.set_color4f(color_from_hex(0x71A1CC), None);
+        accent.set_anti_alias(true);
+        self.canvas.draw_rect(
+            Rect::from_xywh(
+                frame.x as f32,
+                top as f32,
+                3.0,
+                bottom.saturating_sub(top) as f32,
+            ),
+            &accent,
+        );
+
+        for item in items {
+            for child in item.blocks.iter().cloned() {
+                self.draw_child(child);
+            }
+        }
+    }
+
+    fn draw_child(&mut self, child: BlockLayout) {
+        let frame = BlockFrame::from_layout(&child);
+        match child.kind {
+            BlockKind::Text { lines } => self.draw_text_bubble(frame, &lines),
+            BlockKind::FileCard {
+                name_lines,
+                meta_line,
+                icon_path,
+                icon_text,
+            } => self.draw_file_card(
+                frame,
+                &name_lines,
+                meta_line.as_deref(),
+                icon_path,
+                &icon_text,
+            ),
+            BlockKind::JsonCard {
+                qr_url,
+                view,
+                title_lines,
+                desc_lines,
+                footer_line,
+                media,
+                tag_icon,
+                brand_icon,
+            } => self.draw_json_card(
+                frame,
+                qr_url.as_deref(),
+                &view,
+                &title_lines,
+                &desc_lines,
+                footer_line.as_deref(),
+                media.as_ref(),
+                tag_icon.as_ref(),
+                brand_icon.as_ref(),
+            ),
+            BlockKind::Image { image } => {
+                draw_image_preview_frame(
+                    self.canvas,
+                    image.as_ref(),
+                    frame.rect(),
+                    self.radius_lg as f32,
+                    self.color_white,
+                    self.color_border,
+                );
+            }
+            BlockKind::VideoPreview { image } => {
+                let bg = if image.as_ref().filter(|img| img.has_bytes()).is_some() {
+                    self.color_white
+                } else {
+                    color_from_hex(0x262626)
+                };
+                let rect = frame.rect();
+                draw_image_preview_frame(
+                    self.canvas,
+                    image.as_ref(),
+                    rect,
+                    self.radius_lg as f32,
+                    bg,
+                    self.color_border,
+                );
+                draw_video_play_triangle(self.canvas, rect);
+            }
+            BlockKind::MediaCard { media_kind, .. } => {
+                draw_text_line(
+                    self.canvas,
+                    self.font_collection,
+                    self.emoji_cache,
+                    media_label(media_kind),
+                    frame.x as f32,
+                    (frame.y + self.font_size) as f32,
+                    self.font_size,
+                    self.font_weight_body,
+                    self.color_text,
+                );
+            }
+            BlockKind::Reply {
+                meta_lines,
+                body_lines,
+            } => self.draw_reply(frame, &meta_lines, &body_lines),
+            BlockKind::Poke { image } => self.draw_poke(frame, image.as_ref()),
+            BlockKind::Forward { items } => self.draw_forward(frame, &items),
+        }
+    }
+
+    fn draw_text_bubble(&mut self, frame: BlockFrame, lines: &[InlineLine]) {
+        let rr = RRect::new_rect_xy(frame.rect(), self.radius_lg as f32, self.radius_lg as f32);
+        draw_shadowed_rrect(self.canvas, rr, SHADOW_SM_BLUR_PX, SHADOW_SM_ALPHA);
+
+        let mut bubble_bg = Paint::default();
+        bubble_bg.set_color4f(self.color_white, None);
+        bubble_bg.set_anti_alias(true);
+        self.canvas.draw_rrect(rr, &bubble_bg);
+
+        let line_x = frame.x + self.bubble_pad_left;
+        let line_y = frame.y + self.bubble_pad_top + self.font_size;
+        for (idx, line) in lines.iter().enumerate() {
+            let baseline_y = line_y + self.line_height.saturating_mul(idx as u32);
+            self.draw_inline_line(line, line_x, baseline_y);
+        }
+    }
+
+    fn draw_inline_line(&mut self, line: &InlineLine, line_x: u32, baseline_y: u32) {
+        let mut cursor_x = line_x;
+        for run in &line.runs {
+            match run {
+                InlineRun::Text(text) => {
+                    if !text.is_empty() {
+                        draw_text_line(
+                            self.canvas,
+                            self.font_collection,
+                            self.emoji_cache,
+                            text,
+                            cursor_x as f32,
+                            baseline_y as f32,
+                            self.font_size,
+                            self.font_weight_body,
+                            self.color_text,
+                        );
+                        cursor_x = cursor_x.saturating_add(measure_inline_text_width(
+                            text,
+                            self.font_size,
+                            self.font_weight_body,
+                            self.text_measurer,
+                            self.emoji_cache,
+                        ));
+                    }
+                }
+                InlineRun::Face { id } => {
+                    if let Some(face) = resolve_face_image(id, self.face_cache) {
+                        let line_top = baseline_y.saturating_sub(self.font_size);
+                        let face_y = line_top
+                            .saturating_add(self.line_height.saturating_sub(self.face_size) / 2);
+                        let face_x = cursor_x;
+                        let face_image = self
+                            .face_image_cache
+                            .entry(id.clone())
+                            .or_insert_with(|| decode_image(&face));
+                        if let Some(image) = face_image.as_ref() {
+                            draw_image_cover_rounded(
+                                self.canvas,
+                                image,
+                                Rect::from_xywh(
+                                    face_x as f32,
+                                    face_y as f32,
+                                    self.face_size as f32,
+                                    self.face_size as f32,
+                                ),
+                                3.0,
+                            );
+                        }
+                        cursor_x = cursor_x.saturating_add(self.face_size);
+                    }
+                }
+                InlineRun::Emoji { glyph_id } => {
+                    let line_top = baseline_y.saturating_sub(self.font_size);
+                    let emoji_y = line_top
+                        .saturating_add(self.line_height.saturating_sub(self.face_size) / 2);
+                    if let Some(image) = self.emoji_cache.resolve_image_by_gid(*glyph_id) {
+                        draw_image_stretch(
+                            self.canvas,
+                            &image,
+                            Rect::from_xywh(
+                                cursor_x as f32,
+                                emoji_y as f32,
+                                self.face_size as f32,
+                                self.face_size as f32,
+                            ),
+                        );
+                    }
+                    cursor_x = cursor_x.saturating_add(self.face_size);
+                }
+            }
+        }
+    }
+
+    fn draw_file_card(
+        &mut self,
+        frame: BlockFrame,
+        name_lines: &[String],
+        meta_line: Option<&str>,
+        icon_path: Option<&'static str>,
+        icon_text: &str,
+    ) {
+        let rr = RRect::new_rect_xy(frame.rect(), self.radius_lg as f32, self.radius_lg as f32);
+        draw_shadowed_rrect(self.canvas, rr, SHADOW_SM_BLUR_PX, SHADOW_SM_ALPHA);
+
+        let mut card_bg = Paint::default();
+        card_bg.set_color4f(self.color_white, None);
+        card_bg.set_anti_alias(true);
+        self.canvas.draw_rrect(rr, &card_bg);
+
+        let icon_x = frame.x
+            + frame
+                .width
+                .saturating_sub(self.file_padding + self.file_icon_size);
+        let icon_y = frame.y + (frame.height - self.file_icon_size) / 2;
+        let mut drew_icon = false;
+        if let Some(path) = icon_path {
+            let icon_image = self.file_icon_cache.entry(path).or_insert_with(|| {
+                resolved_image_from_path(path).and_then(|img| decode_image(&img))
+            });
+            if let Some(image) = icon_image.as_ref() {
+                draw_image_stretch(
+                    self.canvas,
+                    image,
+                    Rect::from_xywh(
+                        icon_x as f32,
+                        icon_y as f32,
+                        self.file_icon_size as f32,
+                        self.file_icon_size as f32,
+                    ),
+                );
+                drew_icon = true;
+            }
+        }
+        if !drew_icon {
+            let icon_center_x = icon_x + self.file_icon_size / 2;
+            let icon_center_y = icon_y + self.file_icon_size / 2;
+            if let Some((paragraph, metrics)) = build_line_paragraph(
+                self.font_collection,
+                icon_text,
+                11,
+                self.font_weight_body,
+                self.color_meta,
+            ) {
+                let icon_baseline = center_baseline(icon_center_y as f32, &metrics);
+                let icon_x = icon_center_x as f32 - metrics.width * 0.5;
+                paragraph.paint(self.canvas, (icon_x, icon_baseline - metrics.baseline));
+            }
+        }
+
+        let text_x = frame.x + self.file_padding;
+        let name_height = name_lines.len() as u32 * self.file_line_height;
+        let meta_height = if meta_line.is_some() {
+            self.file_meta_height + self.file_meta_gap
+        } else {
+            0
+        };
+        let text_height = name_height + meta_height;
+        let content_height = self.file_icon_size.max(text_height);
+        let text_top = frame.y + self.file_padding + (content_height - text_height) / 2 - 4;
+        let file_name_size = self.font_size.saturating_sub(2).max(self.meta_size);
+        let text_baseline = text_top + file_name_size;
+
+        for (idx, line) in name_lines.iter().enumerate() {
+            let baseline = text_baseline + self.file_line_height.saturating_mul(idx as u32);
+            draw_text_line(
+                self.canvas,
+                self.font_collection,
+                self.emoji_cache,
+                line,
+                text_x as f32,
+                baseline as f32,
+                file_name_size,
+                self.font_weight_body,
+                self.color_text,
+            );
+        }
+        if let Some(meta) = meta_line {
+            let meta_font_size = 11u32;
+            let meta_y = text_top + name_height + self.file_meta_gap + meta_font_size + 6;
+            draw_text_line(
+                self.canvas,
+                self.font_collection,
+                self.emoji_cache,
+                meta,
+                text_x as f32,
+                meta_y as f32,
+                meta_font_size,
+                self.font_weight_body,
+                self.color_muted,
+            );
+        }
+    }
+
+    fn draw_json_card(
+        &mut self,
+        frame: BlockFrame,
+        qr_url: Option<&str>,
+        view: &JsonCardView,
+        title_lines: &[String],
+        desc_lines: &[String],
+        footer_line: Option<&str>,
+        media: Option<&ResolvedImage>,
+        tag_icon: Option<&ResolvedImage>,
+        brand_icon: Option<&ResolvedImage>,
+    ) {
+        draw_json_card_frame(
+            self.canvas,
+            self.font_collection,
+            self.emoji_cache,
+            frame,
+            self.radius_lg,
+            self.card_padding,
+            self.font_size,
+            self.meta_size,
+            self.card_title_size,
+            self.card_line_height,
+            self.file_meta_height,
+            self.file_meta_gap,
+            self.font_weight_title,
+            self.font_weight_body,
+            self.color_white,
+            self.color_text,
+            self.color_meta,
+            self.color_muted,
+            qr_url,
+            view,
+            title_lines,
+            desc_lines,
+            footer_line,
+            media,
+            tag_icon,
+            brand_icon,
+        );
+    }
+
+    fn draw_reply(&mut self, frame: BlockFrame, meta_lines: &[String], body_lines: &[String]) {
+        let rr = RRect::new_rect_xy(frame.rect(), self.radius_lg as f32, self.radius_lg as f32);
+        draw_shadowed_rrect(self.canvas, rr, SHADOW_SM_BLUR_PX, SHADOW_SM_ALPHA);
+        let mut bubble_bg = Paint::default();
+        bubble_bg.set_color4f(self.color_white, None);
+        bubble_bg.set_anti_alias(true);
+        self.canvas.draw_rrect(rr, &bubble_bg);
+
+        let reply_accent_width = 3u32;
+        let reply_inner_pad_x = self.card_padding;
+        let reply_inner_pad_y = 6u32;
+        let reply_meta_size = self.font_size.saturating_sub(2).max(self.meta_size);
+        let reply_body_size = self.font_size;
+        let reply_meta_line_height = self.file_line_height;
+        let reply_body_line_height = self.line_height;
+        let inner_x = frame.x + self.bubble_pad_left;
+        let inner_y = frame
+            .y
+            .saturating_add(self.bubble_pad_top)
+            .saturating_sub(REPLY_INNER_Y_RAISE_PX);
+        let inner_width = frame
+            .width
+            .saturating_sub(self.bubble_pad_left + self.bubble_pad_right);
+        let inner_height = frame
+            .height
+            .saturating_sub(self.bubble_pad_top + self.bubble_pad_bottom);
+        let inner_rect = Rect::from_xywh(
+            inner_x as f32,
+            inner_y as f32,
+            inner_width as f32,
+            inner_height as f32,
+        );
+        let inner_rr = RRect::new_rect_xy(inner_rect, 4.0, 4.0);
+        let mut bg = Paint::default();
+        bg.set_color4f(color_from_hex(0xFAFAFA), None);
+        bg.set_anti_alias(true);
+        self.canvas.draw_rrect(inner_rr, &bg);
+        let mut accent = Paint::default();
+        accent.set_color4f(self.color_border, None);
+        accent.set_anti_alias(true);
+        self.canvas.draw_rect(
+            Rect::from_xywh(
+                inner_x as f32,
+                inner_y as f32,
+                reply_accent_width as f32,
+                inner_height as f32,
+            ),
+            &accent,
+        );
+
+        let text_x = inner_x + reply_accent_width + reply_inner_pad_x;
+        let mut baseline = inner_y + reply_inner_pad_y + reply_meta_size;
+        for line in meta_lines {
+            draw_text_line(
+                self.canvas,
+                self.font_collection,
+                self.emoji_cache,
+                line,
+                text_x as f32,
+                baseline as f32,
+                reply_meta_size,
+                self.font_weight_body,
+                self.color_meta,
+            );
+            baseline = baseline.saturating_add(reply_meta_line_height);
+        }
+        baseline = inner_y
+            + reply_inner_pad_y
+            + meta_lines.len() as u32 * reply_meta_line_height
+            + self.file_meta_gap
+            + reply_body_size
+            + REPLY_BODY_BASELINE_OFFSET_PX;
+        for line in body_lines {
+            draw_text_line(
+                self.canvas,
+                self.font_collection,
+                self.emoji_cache,
+                line,
+                text_x as f32,
+                baseline as f32,
+                reply_body_size,
+                self.font_weight_body,
+                color_from_hex(0x333333),
+            );
+            baseline = baseline.saturating_add(reply_body_line_height);
+        }
+    }
+
+    fn draw_poke(&mut self, frame: BlockFrame, image: Option<&ResolvedImage>) {
+        let rect = frame.rect();
+        if let Some(img) = image.filter(|img| img.has_bytes()) {
+            if let Some(decoded) = decode_image(img) {
+                draw_image_stretch(self.canvas, &decoded, rect);
+                return;
+            }
+        }
+        draw_text_line(
+            self.canvas,
+            self.font_collection,
+            self.emoji_cache,
+            "[戳一戳]",
+            frame.x as f32,
+            (frame.y + self.font_size) as f32,
+            self.font_size,
+            self.font_weight_body,
+            self.color_text,
+        );
+    }
 }
 
 fn draw_watermark_layer(
@@ -2787,36 +5189,65 @@ fn draw_watermark_layer(
     text: &str,
 ) {
     let opacity = 0.12f32;
-    let angle = -24f32;
+    let angle = 24f32;
     let font_size = 40u32;
-    let font_weight = 400u32;
-    let tile = 320f32;
+    let font_weight = 500u32;
+    let tile = 480f32;
     let jitter = 10f32;
     let color = Color4f::new(0.0, 0.0, 0.0, opacity);
+    let (text_width, metrics) =
+        build_line_paragraph(font_collection, text, font_size, font_weight, color)
+            .map(|(_, metrics)| (metrics.width, metrics))
+            .unwrap_or_else(|| {
+                (
+                    text.len() as f32 * font_size as f32 * 0.55,
+                    LineMetricsSnapshot {
+                        baseline: font_size as f32,
+                        ascent: font_size as f32,
+                        descent: 0.0,
+                        width: 0.0,
+                    },
+                )
+            });
+    let text_height = font_size as f32;
+    let radians = angle.to_radians();
+    let stamp_w = text_width * radians.cos().abs() + text_height * radians.sin().abs();
+    let stamp_h = text_width * radians.sin().abs() + text_height * radians.cos().abs();
+    let pad_x = (stamp_w * 0.5).ceil();
+    let pad_y = (stamp_h * 0.5).ceil();
 
     let mut rng = DeterministicRng::new(watermark_seed(header, text));
-    let cols = ((width as f32) / tile).ceil().max(1.0) as i32 + 1;
-    let rows = ((height as f32) / tile).ceil().max(1.0) as i32 + 1;
-    let first_cx = width as f32 * 0.5 - ((cols - 1) as f32 * tile) * 0.5 + 120.0;
-    let first_cy = height as f32 * 0.5 - ((rows - 1) as f32 * tile) * 0.5;
+    let cols = (((width as f32 - pad_x * 2.0) / tile).floor() as i32 + 1).max(1);
+    let rows = (((height as f32 - pad_y * 2.0) / tile).floor() as i32 + 1).max(1);
+    let center_x = width as f32 * 0.5;
+    let grid_span_x = (cols - 1) as f32 * tile;
+    let first_cx = center_x - grid_span_x * 0.5;
+    let first_cy = pad_y + stamp_h * 0.5;
+    let max_x = (width as f32 - stamp_w).max(0.0);
+    let max_y = (height as f32 - stamp_h).max(0.0);
 
     for row in 0..rows {
         for col in 0..cols {
             let jx = rng.jitter(jitter);
             let jy = rng.jitter(jitter);
-            let x = first_cx + col as f32 * tile + jx;
-            let y = first_cy + row as f32 * tile + jy;
+            let stagger = if row % 2 == 0 { 0.0 } else { tile * 0.5 };
+            let cx = first_cx + col as f32 * tile + stagger;
+            let cy = first_cy + row as f32 * tile;
+            let x = (cx + jx - stamp_w * 0.5).round().clamp(0.0, max_x);
+            let y = (cy + jy - stamp_h * 0.5).round().clamp(0.0, max_y);
+            let draw_cx = x + text_width * 0.5;
+            let draw_cy = y + text_height * 0.5;
 
             canvas.save();
-            canvas.translate((x, y));
-            canvas.rotate(angle, None);
+            canvas.translate((draw_cx, draw_cy));
+            canvas.rotate(-angle, None);
             draw_text_line(
                 canvas,
                 font_collection,
                 emoji_cache,
                 text,
-                0.0,
-                font_size as f32,
+                -text_width * 0.5,
+                -text_height * 0.5 + metrics.baseline,
                 font_size,
                 font_weight,
                 color,
@@ -3072,6 +5503,13 @@ fn build_text_style(font_size: u32, font_weight: u32, color: Color4f) -> TextSty
     ts.set_font_style(font_style);
     let mut paint = Paint::default();
     paint.set_color4f(color, None);
+    paint.set_style(skia_safe::paint::Style::StrokeAndFill);
+    let stroke_width = if font_size == 16 {
+        0.015
+    } else {
+        TEXT_RASTER_STROKE_PX
+    };
+    paint.set_stroke_width(stroke_width);
     ts.set_foreground_paint(&paint);
     ts
 }
@@ -3188,7 +5626,11 @@ fn draw_shadowed_rrect(canvas: &Canvas, rr: RRect, blur: f32, alpha: f32) {
 }
 
 fn draw_qr_code(canvas: &Canvas, text: &str, dst: Rect, bg: Color4f, fg: Color4f) {
-    let Ok(code) = QrCode::new(text.as_bytes()) else {
+    let Some((colors, width)) = legacy_qr_colors(text).or_else(|| {
+        QrCode::with_error_correction_level(text.as_bytes(), EcLevel::L)
+            .ok()
+            .map(|code| (code.to_colors(), code.width()))
+    }) else {
         return;
     };
     let mut bg_paint = Paint::default();
@@ -3196,29 +5638,200 @@ fn draw_qr_code(canvas: &Canvas, text: &str, dst: Rect, bg: Color4f, fg: Color4f
     bg_paint.set_anti_alias(true);
     canvas.draw_rect(dst, &bg_paint);
 
-    let width = code.width().max(1) as f32;
-    let module = (dst.width().min(dst.height()) / width).max(1.0);
-    let qr_size = module * width;
-    let origin_x = dst.x() + (dst.width() - qr_size) * 0.5;
-    let origin_y = dst.y() + (dst.height() - qr_size) * 0.5;
+    let module_px = 3u32;
+    let width = width.max(1) as u32;
+    let qr_px = width.saturating_mul(module_px).max(1);
+    let Some(mut surface) = skia_safe::surfaces::raster_n32_premul((qr_px as i32, qr_px as i32))
+    else {
+        return;
+    };
+    let qr_canvas = surface.canvas();
+    qr_canvas.draw_rect(
+        Rect::from_xywh(0.0, 0.0, qr_px as f32, qr_px as f32),
+        &bg_paint,
+    );
+
     let mut fg_paint = Paint::default();
     fg_paint.set_color4f(fg, None);
     fg_paint.set_anti_alias(false);
-    for y in 0..code.width() {
-        for x in 0..code.width() {
-            if code[(x, y)] == QrColor::Dark {
-                canvas.draw_rect(
+    for y in 0..width as usize {
+        for x in 0..width as usize {
+            if colors[y * width as usize + x] == QrColor::Dark {
+                qr_canvas.draw_rect(
                     Rect::from_xywh(
-                        origin_x + x as f32 * module,
-                        origin_y + y as f32 * module,
-                        module,
-                        module,
+                        (x as u32 * module_px) as f32,
+                        (y as u32 * module_px) as f32,
+                        module_px as f32,
+                        module_px as f32,
                     ),
                     &fg_paint,
                 );
             }
         }
     }
+    let image = surface.image_snapshot();
+    let sampling = SamplingOptions {
+        filter: skia_safe::FilterMode::Linear,
+        mipmap: skia_safe::MipmapMode::None,
+        ..SamplingOptions::default()
+    };
+    let paint = Paint::default();
+    canvas.draw_image_rect_with_sampling_options(&image, None, dst, sampling, &paint);
+}
+
+fn legacy_qr_colors(text: &str) -> Option<(Vec<QrColor>, usize)> {
+    let bits = bits::encode_auto(text.as_bytes(), EcLevel::L).ok()?;
+    let version = bits.version();
+    let data = bits.into_bytes();
+    let (encoded_data, ec_data) = ec::construct_codewords(&data, version, EcLevel::L).ok()?;
+    let mut canvas = QrCanvas::new(version, EcLevel::L);
+    canvas.draw_all_functional_patterns();
+    canvas.draw_data(&encoded_data, &ec_data);
+    let width = usize::try_from(version.width()).ok()?;
+    if let Some(pattern) = legacy_qr_mask_pattern_override() {
+        canvas.apply_mask(pattern);
+        return Some((canvas.into_colors(), width));
+    }
+    let (_pattern, colors) = libqrencode_best_qr_mask(&canvas, width);
+    Some((colors, width))
+}
+
+fn legacy_qr_mask_pattern_override() -> Option<MaskPattern> {
+    match std::env::var("OQQWALL_RENDER_QR_MASK").ok().as_deref() {
+        Some("0") | Some("checkerboard") => Some(MaskPattern::Checkerboard),
+        Some("1") | Some("horizontal") => Some(MaskPattern::HorizontalLines),
+        Some("2") | Some("vertical") => Some(MaskPattern::VerticalLines),
+        Some("3") | Some("diagonal") => Some(MaskPattern::DiagonalLines),
+        Some("4") | Some("large_checkerboard") => Some(MaskPattern::LargeCheckerboard),
+        Some("5") | Some("fields") => Some(MaskPattern::Fields),
+        Some("6") | Some("diamonds") => Some(MaskPattern::Diamonds),
+        Some("7") | Some("meadow") => Some(MaskPattern::Meadow),
+        _ => None,
+    }
+}
+
+fn libqrencode_best_qr_mask(canvas: &QrCanvas, width: usize) -> (MaskPattern, Vec<QrColor>) {
+    const PATTERNS: [MaskPattern; 8] = [
+        MaskPattern::Checkerboard,
+        MaskPattern::HorizontalLines,
+        MaskPattern::VerticalLines,
+        MaskPattern::DiagonalLines,
+        MaskPattern::LargeCheckerboard,
+        MaskPattern::Fields,
+        MaskPattern::Diamonds,
+        MaskPattern::Meadow,
+    ];
+
+    let mut best_pattern = MaskPattern::HorizontalLines;
+    let mut best_colors = Vec::new();
+    let mut best_score = i32::MAX;
+
+    for pattern in PATTERNS {
+        let mut masked = canvas.clone();
+        masked.apply_mask(pattern);
+        let colors = masked.into_colors();
+        let score = libqrencode_qr_demerit(&colors, width);
+        if score < best_score {
+            best_score = score;
+            best_pattern = pattern;
+            best_colors = colors;
+        }
+    }
+
+    (best_pattern, best_colors)
+}
+
+fn libqrencode_qr_demerit(colors: &[QrColor], width: usize) -> i32 {
+    const N2: i32 = 3;
+    const N4: i32 = 10;
+
+    let blacks = colors
+        .iter()
+        .filter(|&&color| color == QrColor::Dark)
+        .count() as i32;
+    let w2 = width.saturating_mul(width) as i32;
+    let bratio = (200 * blacks + w2) / w2 / 2;
+    let mut demerit = ((bratio - 50).abs() / 5) * N4;
+
+    for y in 1..width {
+        for x in 1..width {
+            let current = qr_color_is_dark(colors, width, x, y);
+            if current == qr_color_is_dark(colors, width, x - 1, y)
+                && current == qr_color_is_dark(colors, width, x, y - 1)
+                && current == qr_color_is_dark(colors, width, x - 1, y - 1)
+            {
+                demerit += N2;
+            }
+        }
+    }
+
+    for y in 0..width {
+        let run_lengths = (0..width)
+            .map(|x| qr_color_is_dark(colors, width, x, y))
+            .collect::<Vec<_>>();
+        demerit += libqrencode_qr_run_demerit(&run_lengths);
+    }
+    for x in 0..width {
+        let run_lengths = (0..width)
+            .map(|y| qr_color_is_dark(colors, width, x, y))
+            .collect::<Vec<_>>();
+        demerit += libqrencode_qr_run_demerit(&run_lengths);
+    }
+
+    demerit
+}
+
+fn libqrencode_qr_run_demerit(line: &[bool]) -> i32 {
+    const N1: i32 = 3;
+    const N3: i32 = 40;
+
+    if line.is_empty() {
+        return 0;
+    }
+
+    let mut runs = Vec::with_capacity(line.len() + 1);
+    if line[0] {
+        runs.push(-1);
+    }
+    let mut previous = line[0];
+    let mut current_len = 1i32;
+    for &current in &line[1..] {
+        if current != previous {
+            runs.push(current_len);
+            current_len = 1;
+            previous = current;
+        } else {
+            current_len += 1;
+        }
+    }
+    runs.push(current_len);
+
+    let mut demerit = 0;
+    for i in 0..runs.len() {
+        if runs[i] >= 5 {
+            demerit += N1 + (runs[i] - 5);
+        }
+        if (i & 1) == 1 && i >= 3 && i < runs.len().saturating_sub(2) && runs[i] % 3 == 0 {
+            let fact = runs[i] / 3;
+            if runs[i - 2] == fact
+                && runs[i - 1] == fact
+                && runs[i + 1] == fact
+                && runs[i + 2] == fact
+            {
+                if i == 3 || runs[i - 3] >= 4 * fact {
+                    demerit += N3;
+                } else if i + 4 >= runs.len() || runs[i + 3] >= 4 * fact {
+                    demerit += N3;
+                }
+            }
+        }
+    }
+
+    demerit
+}
+
+fn qr_color_is_dark(colors: &[QrColor], width: usize, x: usize, y: usize) -> bool {
+    colors[y * width + x] == QrColor::Dark
 }
 
 fn draw_text_line(
@@ -3354,7 +5967,80 @@ fn decode_image(image: &ResolvedImage) -> Option<Image> {
     let bytes = image.bytes.as_ref()?;
     debug_log!("image decode: bytes={}", bytes.len());
     let data = Data::new_copy(bytes.as_ref());
+    if let Some(image) = Image::from_encoded(data) {
+        return Some(image);
+    }
+    let bytes = transcode_image_to_png(bytes.as_ref())?;
+    debug_log!("image decode fallback png: bytes={}", bytes.len());
+    let data = Data::new_copy(&bytes);
     Image::from_encoded(data)
+}
+
+fn transcode_image_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    let image = image::load_from_memory(bytes).ok()?;
+    let mut encoded = Cursor::new(Vec::new());
+    image.write_to(&mut encoded, image::ImageFormat::Png).ok()?;
+    Some(encoded.into_inner())
+}
+
+fn draw_image_preview_frame(
+    canvas: &Canvas,
+    image: Option<&ResolvedImage>,
+    rect: Rect,
+    radius: f32,
+    bg_color: Color4f,
+    border_color: Color4f,
+) {
+    let rr = RRect::new_rect_xy(rect, radius, radius);
+    draw_shadowed_rrect(canvas, rr, 3.0, 0.20);
+
+    let mut bg = Paint::default();
+    bg.set_color4f(bg_color, None);
+    bg.set_anti_alias(true);
+    canvas.draw_rrect(rr, &bg);
+
+    let mut border = Paint::default();
+    border.set_color4f(border_color, None);
+    border.set_style(skia_safe::paint::Style::Stroke);
+    border.set_stroke_width(1.0);
+    border.set_anti_alias(true);
+    canvas.draw_rrect(rr, &border);
+
+    if let Some(decoded) = image.filter(|img| img.has_bytes()).and_then(decode_image) {
+        draw_image_cover_rounded(canvas, &decoded, rect, radius);
+    }
+}
+
+fn draw_video_play_triangle(canvas: &Canvas, rect: Rect) {
+    let size = rect.width().min(rect.height()).min(42.0).max(18.0);
+    let tri_w = size * 0.42;
+    let tri_h = size * 0.52;
+    let cx = rect.x() + rect.width() * 0.5 + tri_w * 0.08;
+    let cy = rect.y() + rect.height() * 0.5;
+    let left = cx - tri_w * 0.45;
+    let top = cy - tri_h * 0.5;
+
+    let mut shadow = PathBuilder::new();
+    shadow.move_to((left + 1.5, top + 1.5));
+    shadow.line_to((left + 1.5, top + tri_h + 1.5));
+    shadow.line_to((left + tri_w + 1.5, cy + 1.5));
+    shadow.close();
+    let shadow = shadow.detach();
+    let mut shadow_paint = Paint::default();
+    shadow_paint.set_color4f(Color4f::new(0.0, 0.0, 0.0, 0.40), None);
+    shadow_paint.set_anti_alias(true);
+    canvas.draw_path(&shadow, &shadow_paint);
+
+    let mut play = PathBuilder::new();
+    play.move_to((left, top));
+    play.line_to((left, top + tri_h));
+    play.line_to((left + tri_w, cy));
+    play.close();
+    let play = play.detach();
+    let mut play_paint = Paint::default();
+    play_paint.set_color4f(Color4f::new(1.0, 1.0, 1.0, 0.88), None);
+    play_paint.set_anti_alias(true);
+    canvas.draw_path(&play, &play_paint);
 }
 
 fn draw_image_cover_rounded(canvas: &Canvas, img: &Image, dst: Rect, radius: f32) {
@@ -3426,23 +6112,49 @@ async fn resolve_image_sources(
     image_cache: &mut ImageMemoryCache,
 ) -> (RenderImageSources, HashSet<ImageCacheKey>) {
     let mut block_images = vec![None; draft.blocks.len()];
+    let mut block_tag_icons = vec![None; draft.blocks.len()];
+    let mut block_brand_icons = vec![None; draft.blocks.len()];
     let mut block_labels = vec![None; draft.blocks.len()];
     let mut used_keys = HashSet::new();
     for (idx, block) in draft.blocks.iter().enumerate() {
-        if let DraftBlock::Attachment {
-            kind, reference, ..
-        } = block
-        {
-            if is_renderable_image(*kind) {
-                block_images[idx] = resolve_media_reference_for_image(
-                    reference,
-                    state,
-                    image_cache,
-                    &mut used_keys,
-                );
-            } else {
-                block_labels[idx] = resolve_media_reference_for_label(reference, state);
+        match block {
+            DraftBlock::Attachment {
+                kind, reference, ..
+            } => {
+                if is_renderable_image(*kind) {
+                    block_images[idx] = resolve_media_reference_for_image(
+                        reference,
+                        state,
+                        image_cache,
+                        &mut used_keys,
+                    );
+                } else if is_video_media(*kind) {
+                    block_images[idx] = resolve_media_reference_for_video_preview(
+                        reference,
+                        state,
+                        image_cache,
+                        &mut used_keys,
+                    );
+                } else {
+                    block_labels[idx] = resolve_media_reference_for_label(reference, state);
+                }
             }
+            DraftBlock::JsonCard { raw } => {
+                let view = parse_json_card_view(raw);
+                if let Some(source) = view.media_source {
+                    block_images[idx] =
+                        resolve_json_card_media_source(&source, image_cache, &mut used_keys).await;
+                }
+                if let Some(source) = view.tag_icon_source {
+                    block_tag_icons[idx] =
+                        resolve_json_card_media_source(&source, image_cache, &mut used_keys).await;
+                }
+                if let Some(source) = view.brand_icon_source {
+                    block_brand_icons[idx] =
+                        resolve_json_card_media_source(&source, image_cache, &mut used_keys).await;
+                }
+            }
+            _ => {}
         }
     }
     let avatar = resolve_avatar_image(header, cmd_tx, image_cache, &mut used_keys).await;
@@ -3450,6 +6162,8 @@ async fn resolve_image_sources(
         RenderImageSources {
             avatar,
             block_images,
+            block_tag_icons,
+            block_brand_icons,
             block_labels,
         },
         used_keys,
@@ -3459,6 +6173,8 @@ async fn resolve_image_sources(
 fn render_preview_image_sources(draft: &Draft) -> RenderImageSources {
     let mut image_cache = ImageMemoryCache::default();
     let mut block_images = vec![None; draft.blocks.len()];
+    let mut block_tag_icons = vec![None; draft.blocks.len()];
+    let mut block_brand_icons = vec![None; draft.blocks.len()];
     let mut block_labels = vec![None; draft.blocks.len()];
 
     for (idx, block) in draft.blocks.iter().enumerate() {
@@ -3474,6 +6190,11 @@ fn render_preview_image_sources(draft: &Draft) -> RenderImageSources {
                     block_images[idx] = image_cache.get_or_load_source(url);
                 }
             }
+            MediaReference::RemoteUrl { url } if is_video_media(*kind) => {
+                if !is_remote_http(url) {
+                    block_images[idx] = image_cache.get_or_load_video_preview_source(url);
+                }
+            }
             MediaReference::RemoteUrl { url } => {
                 block_labels[idx] = Some(url.clone());
             }
@@ -3481,10 +6202,50 @@ fn render_preview_image_sources(draft: &Draft) -> RenderImageSources {
         }
     }
 
+    for (idx, block) in draft.blocks.iter().enumerate() {
+        let DraftBlock::JsonCard { raw } = block else {
+            continue;
+        };
+        let view = parse_json_card_view(raw);
+        if let Some(source) = view.media_source {
+            if !is_remote_http(&source) {
+                block_images[idx] = image_cache.get_or_load_source(&source);
+            }
+        }
+        if let Some(source) = view.tag_icon_source {
+            if !is_remote_http(&source) {
+                block_tag_icons[idx] = image_cache.get_or_load_source(&source);
+            }
+        }
+        if let Some(source) = view.brand_icon_source {
+            if !is_remote_http(&source) {
+                block_brand_icons[idx] = image_cache.get_or_load_source(&source);
+            }
+        }
+    }
+
     RenderImageSources {
         avatar: image_cache.get_or_load_source(DEFAULT_AVATAR_PATH),
         block_images,
+        block_tag_icons,
+        block_brand_icons,
         block_labels,
+    }
+}
+
+async fn resolve_json_card_media_source(
+    source: &str,
+    image_cache: &mut ImageMemoryCache,
+    used_keys: &mut HashSet<ImageCacheKey>,
+) -> Option<ResolvedImage> {
+    if is_remote_http(source) {
+        let key = ImageCacheKey::Source(source.to_string());
+        used_keys.insert(key);
+        image_cache.get_or_fetch_remote_source(source).await
+    } else {
+        let key = ImageCacheKey::Source(source.to_string());
+        used_keys.insert(key);
+        image_cache.get_or_load_source(source)
     }
 }
 
@@ -3514,6 +6275,30 @@ fn resolve_media_reference_for_image(
     }
 }
 
+fn resolve_media_reference_for_video_preview(
+    reference: &MediaReference,
+    state: &StateView,
+    image_cache: &mut ImageMemoryCache,
+    used_keys: &mut HashSet<ImageCacheKey>,
+) -> Option<ResolvedImage> {
+    match reference {
+        MediaReference::Blob { blob_id } => {
+            let key = ImageCacheKey::Source(format!("video-preview:blob:{}", id128_hex(blob_id.0)));
+            used_keys.insert(key);
+            image_cache.get_or_load_video_preview_blob(state, *blob_id)
+        }
+        MediaReference::RemoteUrl { url } => {
+            if is_remote_http(url) {
+                debug_log!("video preview load blocked remote url: {}", url);
+                return None;
+            }
+            let key = ImageCacheKey::Source(format!("video-preview:{}", url));
+            used_keys.insert(key);
+            image_cache.get_or_load_video_preview_source(url)
+        }
+    }
+}
+
 fn resolve_media_reference_for_label(
     reference: &MediaReference,
     _state: &StateView,
@@ -3528,7 +6313,7 @@ fn format_size_line(size_bytes: u64) -> Option<String> {
     if size_bytes == 0 {
         return None;
     }
-    Some(format!("Size: {}", format_bytes(size_bytes)))
+    Some(format_bytes(size_bytes))
 }
 
 fn format_bytes(size_bytes: u64) -> String {
@@ -3541,6 +6326,8 @@ fn format_bytes(size_bytes: u64) -> String {
     }
     if unit_idx == 0 {
         format!("{} {}", size_bytes, UNITS[unit_idx])
+    } else if (size - size.round()).abs() < f64::EPSILON {
+        format!("{:.0} {}", size, UNITS[unit_idx])
     } else if size >= 10.0 {
         format!("{:.0} {}", size.round(), UNITS[unit_idx])
     } else {
@@ -3653,15 +6440,136 @@ fn resolve_source_to_image(source: &str) -> Option<ResolvedImage> {
     None
 }
 
+async fn fetch_remote_image(source: &str) -> Option<ResolvedImage> {
+    debug_log!("image fetch remote url: {}", source);
+    let client = reqwest::Client::builder()
+        .timeout(CARD_REMOTE_IMAGE_TIMEOUT)
+        .user_agent("Mozilla/5.0 OQQWall_RUST renderer")
+        .build()
+        .ok()?;
+    let response = match client.get(source).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            debug_log!("image fetch failed: {} err={}", source, err);
+            return None;
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        debug_log!("image fetch http status: {} status={}", source, status);
+        return None;
+    }
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            debug_log!("image fetch read failed: {} err={}", source, err);
+            return None;
+        }
+    };
+    if bytes.len() > CARD_REMOTE_IMAGE_MAX_BYTES {
+        debug_log!(
+            "image fetch too large: {} bytes={} max={}",
+            source,
+            bytes.len(),
+            CARD_REMOTE_IMAGE_MAX_BYTES
+        );
+        return None;
+    }
+    Some(ResolvedImage::from_bytes(bytes.to_vec()))
+}
+
+fn resolve_source_to_video_preview(source: &str) -> Option<ResolvedImage> {
+    if let Some(image) = resolve_source_to_image(source).filter(|image| image.width.is_some()) {
+        return Some(image);
+    }
+    let path = source_to_local_path(source)?;
+    extract_video_frame_image(&path)
+}
+
+fn resolve_blob_video_preview(state: &StateView, blob_id: BlobId) -> Option<ResolvedImage> {
+    if let Some(entry) = blob_cache::get_entry(blob_id) {
+        let image = ResolvedImage::from_arc(entry.bytes);
+        if image.width.is_some() {
+            return Some(image);
+        }
+    }
+    let path = state
+        .blobs
+        .get(&blob_id)
+        .and_then(|meta| meta.persisted_path.as_deref())?;
+    extract_video_frame_image(Path::new(path))
+}
+
+fn source_to_local_path(source: &str) -> Option<PathBuf> {
+    if source.starts_with("data:") || source.starts_with("base64://") || is_remote_http(source) {
+        return None;
+    }
+    if let Some(path) = source.strip_prefix("file://") {
+        return Some(PathBuf::from(path));
+    }
+    let path = Path::new(source);
+    if let Some(resolved) = resolve_res_disk_path(path) {
+        return Some(resolved);
+    }
+    path.exists().then(|| path.to_path_buf())
+}
+
+fn extract_video_frame_image(path: &Path) -> Option<ResolvedImage> {
+    if !path.exists() {
+        return None;
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let out_path = std::env::temp_dir().join(format!(
+        "oqqwall-video-frame-{}-{}.png",
+        std::process::id(),
+        stamp
+    ));
+    let status = ProcessCommand::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-i")
+        .arg(path)
+        .arg("-frames:v")
+        .arg("1")
+        .arg(&out_path)
+        .status()
+        .ok()?;
+    if !status.success() {
+        let _ = fs::remove_file(&out_path);
+        return None;
+    }
+    let bytes = fs::read(&out_path).ok()?;
+    let _ = fs::remove_file(&out_path);
+    Some(ResolvedImage::from_bytes(bytes))
+}
+
 fn resolved_image_from_path(path: &str) -> Option<ResolvedImage> {
     let path_obj = Path::new(path);
     if let Some(resolved) = resolve_res_disk_path(path_obj) {
         debug_log!("image load disk: {} -> {}", path, resolved.display());
-        let bytes = fs::read(resolved).ok()?;
+        let bytes = match fs::read(&resolved) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                debug_log!("image load disk failed: {} err={}", resolved.display(), err);
+                return None;
+            }
+        };
         return Some(ResolvedImage::from_bytes(bytes));
     }
     debug_log!("image load disk: {}", path);
-    let bytes = fs::read(path_obj).ok()?;
+    let bytes = match fs::read(path_obj) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            debug_log!("image load disk failed: {} err={}", path_obj.display(), err);
+            return None;
+        }
+    };
     Some(ResolvedImage::from_bytes(bytes))
 }
 
@@ -3676,10 +6584,13 @@ fn resolved_image_from_base64_url(url: &str) -> Option<ResolvedImage> {
 }
 
 fn image_size_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
-    let size = imagesize::blob_size(bytes).ok()?;
-    let width = u32::try_from(size.width).ok()?;
-    let height = u32::try_from(size.height).ok()?;
-    Some((width, height))
+    if let Ok(size) = imagesize::blob_size(bytes) {
+        let width = u32::try_from(size.width).ok()?;
+        let height = u32::try_from(size.height).ok()?;
+        return Some((width, height));
+    }
+    let image = image::load_from_memory(bytes).ok()?;
+    Some((image.width(), image.height()))
 }
 
 fn parse_data_url(source: &str) -> Option<(Option<String>, Vec<u8>)> {
@@ -4317,8 +7228,12 @@ fn persist_blob(
     Ok((path.to_string_lossy().to_string(), size_bytes))
 }
 
-fn render_blob_id(post_id: PostId) -> oqqwall_rust_core::BlobId {
-    derive_blob_id(&[&post_id.to_be_bytes(), b"png"])
+fn render_blob_id(post_id: PostId, page_index: usize) -> oqqwall_rust_core::BlobId {
+    if page_index == 0 {
+        return derive_blob_id(&[&post_id.to_be_bytes(), b"png"]);
+    }
+    let page_index = page_index.to_string();
+    derive_blob_id(&[&post_id.to_be_bytes(), b"png-page", page_index.as_bytes()])
 }
 
 fn id128_hex(value: u128) -> String {
@@ -4814,12 +7729,215 @@ async fn render_png_async(
     header: &HeaderInfo,
     image_sources: &RenderImageSources,
     config: &RendererRuntimeConfig,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<Vec<u8>>, String> {
     let draft = draft.clone();
     let header = header.clone();
     let image_sources = image_sources.clone();
     let config = config.clone();
-    tokio::task::spawn_blocking(move || render_png(&draft, &header, &image_sources, &config))
+    tokio::task::spawn_blocking(move || render_png_pages(&draft, &header, &image_sources, &config))
         .await
         .map_err(|err| format!("png task failed: {}", err))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_png_pages_splits_long_text() {
+        let draft = Draft {
+            blocks: (0..80)
+                .map(|idx| DraftBlock::Paragraph {
+                    text: format!("forward line {idx}: content must stay rendered"),
+                })
+                .collect(),
+        };
+        let header = HeaderInfo::from(RenderPreviewHeader::default());
+        let image_sources = RenderImageSources {
+            avatar: None,
+            block_images: Vec::new(),
+            block_tag_icons: Vec::new(),
+            block_brand_icons: Vec::new(),
+            block_labels: Vec::new(),
+        };
+        let config = RendererRuntimeConfig {
+            max_height_px: 420,
+            ..RendererRuntimeConfig::default()
+        };
+
+        let pages = render_png_pages(&draft, &header, &image_sources, &config).unwrap();
+
+        assert!(
+            pages.len() > 1,
+            "expected multiple pages, got {}",
+            pages.len()
+        );
+        assert!(
+            pages
+                .iter()
+                .all(|page| page.starts_with(b"\x89PNG\r\n\x1a\n"))
+        );
+    }
+
+    #[test]
+    fn render_preview_video_uses_image_like_preview_source() {
+        let draft = Draft {
+            blocks: vec![DraftBlock::Attachment {
+                kind: MediaKind::Video,
+                name: Some("clip.mp4".to_string()),
+                reference: MediaReference::RemoteUrl {
+                    url: DEFAULT_AVATAR_PATH.to_string(),
+                },
+                size_bytes: None,
+            }],
+        };
+
+        let image_sources = render_preview_image_sources(&draft);
+
+        let image = image_sources.block_images[0]
+            .as_ref()
+            .expect("video should resolve an image-like preview source");
+        assert!(image.has_bytes());
+        assert!(image.width.zip(image.height).is_some());
+        assert!(image_sources.block_labels[0].is_none());
+
+        let pages = render_png_pages(
+            &draft,
+            &HeaderInfo::from(RenderPreviewHeader::default()),
+            &image_sources,
+            &RendererRuntimeConfig::default(),
+        )
+        .unwrap();
+        assert!(pages[0].starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn local_progressive_jpeg_fixture_resolves_size() {
+        let path = Path::new("data/render-fixtures/latest-post/assets/asset_001.jpg");
+        if !path.exists() {
+            return;
+        }
+        let bytes = fs::read(path).expect("read fixture image");
+
+        assert_eq!(image_size_from_bytes(&bytes), Some((1920, 1080)));
+        assert!(transcode_image_to_png(&bytes).is_some());
+    }
+
+    #[test]
+    fn video_preview_extracts_first_frame_from_file_url_when_ffmpeg_is_available() {
+        let ffmpeg_available = ProcessCommand::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !ffmpeg_available {
+            return;
+        }
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let temp_dir = std::env::temp_dir().join(format!(
+            "oqqwall-video-preview-test-{}-{}",
+            std::process::id(),
+            stamp
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let video_path = temp_dir.join("clip.avi");
+
+        let created = ProcessCommand::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-y")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("color=c=red:s=16x12:d=0.2")
+            .arg("-frames:v")
+            .arg("1")
+            .arg("-c:v")
+            .arg("mjpeg")
+            .arg(&video_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !created {
+            let _ = fs::remove_dir_all(&temp_dir);
+            return;
+        }
+
+        let file_url = format!("file://{}", video_path.to_string_lossy());
+        let image = resolve_source_to_video_preview(&file_url);
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let image = image.expect("video preview should extract first frame");
+        assert_eq!(image.width, Some(16));
+        assert_eq!(image.height, Some(12));
+    }
+
+    #[test]
+    fn embedded_forward_blocks_expand_recursively_inside_forward_items() {
+        let draft = Draft {
+            blocks: vec![DraftBlock::Forward {
+                items: vec![ForwardItem {
+                    sender_name: Some("Outer".to_string()),
+                    blocks: vec![
+                        DraftBlock::Paragraph {
+                            text: "before".to_string(),
+                        },
+                        DraftBlock::Forward {
+                            items: vec![ForwardItem {
+                                sender_name: Some("Inner".to_string()),
+                                blocks: vec![DraftBlock::Paragraph {
+                                    text: "deep content".to_string(),
+                                }],
+                            }],
+                        },
+                        DraftBlock::Paragraph {
+                            text: "after".to_string(),
+                        },
+                    ],
+                }],
+            }],
+        };
+
+        let normalized = normalize_embedded_forward_draft(&draft);
+
+        let DraftBlock::Forward { items } = &normalized.blocks[0] else {
+            panic!("top-level forward should stay a forward block");
+        };
+        let blocks = &items[0].blocks;
+        let text = blocks
+            .iter()
+            .filter_map(|block| match block {
+                DraftBlock::Paragraph { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(text, vec!["before", "after"]);
+
+        let nested_items = blocks
+            .iter()
+            .find_map(|block| match block {
+                DraftBlock::Forward { items } => Some(items),
+                _ => None,
+            })
+            .expect("nested forward should keep its container layout");
+        let nested_text = nested_items[0]
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                DraftBlock::Paragraph { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(nested_text, vec!["deep content"]);
+    }
 }
