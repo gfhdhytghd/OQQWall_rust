@@ -2163,7 +2163,13 @@ async fn webview_static(
 }
 
 fn serve_static_path(req_path: &str) -> axum::response::Response {
-    let asset = find_asset(&req_path).or_else(|| find_asset("/index.html"));
+    let asset = find_asset(req_path).or_else(|| {
+        if req_path == "/" || !req_path.contains('.') {
+            find_asset("/index.html")
+        } else {
+            None
+        }
+    });
     if let Some(asset) = asset {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2181,6 +2187,17 @@ fn serve_static_path(req_path: &str) -> axum::response::Response {
             HeaderValue::from_str(cache).unwrap_or_else(|_| HeaderValue::from_static("no-cache")),
         );
         return (StatusCode::OK, headers, asset.bytes).into_response();
+    }
+    if req_path.starts_with("/assets/") || req_path.contains('.') {
+        return (
+            StatusCode::NOT_FOUND,
+            [(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            "asset not found",
+        )
+            .into_response();
     }
     (
         StatusCode::SERVICE_UNAVAILABLE,

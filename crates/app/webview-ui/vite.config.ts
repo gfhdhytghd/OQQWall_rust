@@ -5,6 +5,7 @@ import tailwindcss from '@tailwindcss/vite'
 const webviewBackend = process.env.VITE_WEBVIEW_BACKEND ?? 'http://127.0.0.1:10924'
 
 export default defineConfig({
+  base: './',
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
