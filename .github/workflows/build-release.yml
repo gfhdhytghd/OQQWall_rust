@@ -72,7 +72,9 @@ jobs:
 
       - name: 校验 WebView 前端产物
         run: |
-          bash ./scripts/verify_webview_dist.sh
+          test -f crates/app/webview-ui/dist/index.html
+          test -d crates/app/webview-ui/dist/assets
+          find crates/app/webview-ui/dist/assets -type f | grep -q .
 
       - name: 缓存 Cargo 依赖
         uses: actions/cache@v4
