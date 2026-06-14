@@ -68,17 +68,7 @@ jobs:
 
       - name: 执行拆分打包脚本
         run: |
-          docker run --rm --network host \
-            --user "$(id -u):$(id -g)" \
-            -v "$PWD:/work" -w /work \
-            -v "$HOME/.cargo/registry:/root/.cargo/registry" \
-            -v "$HOME/.cargo/git:/root/.cargo/git" \
-            rust-glibc231:20.04-oqqwall \
-            bash -c '
-              export PATH="/usr/local/cargo/bin:$PATH"
-              cargo --version
-              bash ./scripts/package_split_release.sh
-            '
+          bash ./scripts/package_split_release.sh
 
       - name: 重命名多架构产物
         id: artifacts
