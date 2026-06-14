@@ -152,6 +152,9 @@ jobs:
     if: ${{ needs.prepare-release.outputs.release_tag != '' }}
     runs-on: ubuntu-22.04
     steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
       - name: 下载 amd64 产物
         uses: actions/download-artifact@v4
         with:
