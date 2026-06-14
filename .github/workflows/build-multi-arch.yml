@@ -86,30 +86,13 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          res_packages=(dist/OQQWall_RUST-res-*.tar.gz)
-          if [[ "${#res_packages[@]}" -ne 1 ]]; then
-            echo "期望找到 1 个资源包，实际找到 ${#res_packages[@]} 个" >&2
-            printf '%s\n' "${res_packages[@]}" >&2
-            exit 1
-          fi
-
           bin_src="dist/OQQWall_RUST"
-          res_src="${res_packages[0]}"
           bin_dst="dist/OQQWall_RUST-linux-${ARCH}"
-          res_dst="dist/OQQWall_RUST-res-linux-${ARCH}.tar.gz"
-          sums_dst="dist/SHA256SUMS-linux-${ARCH}.txt"
 
           mv "$bin_src" "$bin_dst"
-          mv "$res_src" "$res_dst"
-          sha256sum "$bin_dst" "$res_dst" > "$sums_dst"
 
           echo "bin_path=$bin_dst" >> "$GITHUB_OUTPUT"
           echo "bin_name=$(basename "$bin_dst")" >> "$GITHUB_OUTPUT"
-          echo "res_path=$res_dst" >> "$GITHUB_OUTPUT"
-          echo "res_name=$(basename "$res_dst")" >> "$GITHUB_OUTPUT"
-          echo "sums_path=$sums_dst" >> "$GITHUB_OUTPUT"
-          echo "sums_name=$(basename "$sums_dst")" >> "$GITHUB_OUTPUT"
 
       - name: 上传可执行文件
         uses: actions/upload-artifact@v4
@@ -119,18 +102,27 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
+  res-package:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 打包公共资源
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tmp_tar="dist/.res-build.tar"
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -C . -cf "$tmp_tar" res
+          gzip -n -f "$tmp_tar"
+          mv "${tmp_tar}.gz" "dist/OQQWall_RUST-res.tar.gz"
+
       - name: 上传资源包
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.artifacts.outputs.res_name }}
-          path: ${{ steps.artifacts.outputs.res_path }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: 上传校验文件
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.artifacts.outputs.sums_name }}
-          path: ${{ steps.artifacts.outputs.sums_path }}
+          name: OQQWall_RUST-res
+          path: dist/OQQWall_RUST-res.tar.gz
           compression-level: 0
           if-no-files-found: error
