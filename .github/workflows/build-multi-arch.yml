@@ -1,0 +1,134 @@
+name: build-multi-arch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  linux-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs_on: ubuntu-22.04
+          - arch: arm64
+            runs_on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 安装 Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: 安装 WebView 前端依赖
+        working-directory: crates/app/webview-ui
+        run: |
+          if [[ -f bun.lock || -f bun.lockb ]]; then
+            bun install --frozen-lockfile
+          else
+            bun install
+          fi
+
+      - name: 构建 WebView 前端
+        working-directory: crates/app/webview-ui
+        run: |
+          bun run build
+
+      - name: 校验 WebView 前端产物
+        run: |
+          bash ./scripts/verify_webview_dist.sh
+
+      - name: 缓存 Cargo 依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: 构建固定工具链镜像
+        run: |
+          docker build --network host -t rust-glibc231:20.04-oqqwall -f Dockerfile.rust-glibc231-toolchain .
+
+      - name: 执行拆分打包脚本
+        run: |
+          docker run --rm --network host \
+            --user "$(id -u):$(id -g)" \
+            -v "$PWD:/work" -w /work \
+            -v "$HOME/.cargo/registry:/root/.cargo/registry" \
+            -v "$HOME/.cargo/git:/root/.cargo/git" \
+            rust-glibc231:20.04-oqqwall \
+            bash -c '
+              export PATH="/usr/local/cargo/bin:$PATH"
+              cargo --version
+              bash ./scripts/package_split_release.sh
+            '
+
+      - name: 重命名多架构产物
+        id: artifacts
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          res_packages=(dist/OQQWall_RUST-res-*.tar.gz)
+          if [[ "${#res_packages[@]}" -ne 1 ]]; then
+            echo "期望找到 1 个资源包，实际找到 ${#res_packages[@]} 个" >&2
+            printf '%s\n' "${res_packages[@]}" >&2
+            exit 1
+          fi
+
+          bin_src="dist/OQQWall_RUST"
+          res_src="${res_packages[0]}"
+          bin_dst="dist/OQQWall_RUST-linux-${ARCH}"
+          res_dst="dist/OQQWall_RUST-res-linux-${ARCH}.tar.gz"
+          sums_dst="dist/SHA256SUMS-linux-${ARCH}.txt"
+
+          mv "$bin_src" "$bin_dst"
+          mv "$res_src" "$res_dst"
+          sha256sum "$bin_dst" "$res_dst" > "$sums_dst"
+
+          echo "bin_path=$bin_dst" >> "$GITHUB_OUTPUT"
+          echo "bin_name=$(basename "$bin_dst")" >> "$GITHUB_OUTPUT"
+          echo "res_path=$res_dst" >> "$GITHUB_OUTPUT"
+          echo "res_name=$(basename "$res_dst")" >> "$GITHUB_OUTPUT"
+          echo "sums_path=$sums_dst" >> "$GITHUB_OUTPUT"
+          echo "sums_name=$(basename "$sums_dst")" >> "$GITHUB_OUTPUT"
+
+      - name: 上传可执行文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifacts.outputs.bin_name }}
+          path: ${{ steps.artifacts.outputs.bin_path }}
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: 上传资源包
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifacts.outputs.res_name }}
+          path: ${{ steps.artifacts.outputs.res_path }}
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: 上传校验文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifacts.outputs.sums_name }}
+          path: ${{ steps.artifacts.outputs.sums_path }}
+          compression-level: 0
+          if-no-files-found: error
