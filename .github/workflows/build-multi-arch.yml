@@ -2,15 +2,41 @@ name: build-multi-arch
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "要发布的版本号，例如 v0.3.1；留空则只构建产物"
+        required: false
+        type: string
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  prepare-release:
+    runs-on: ubuntu-22.04
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+    steps:
+      - name: 校验版本号
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
+        run: |
+          release_tag=""
+          if [[ -n "$RELEASE_TAG" ]]; then
+            release_tag="$RELEASE_TAG"
+            if [[ ! "$release_tag" =~ ^v[0-9]+(\.[0-9]+)*([-.][0-9A-Za-z]+)?$ ]]; then
+              echo "版本号必须以 v 开头，例如 v0.3.1，当前值：$release_tag" >&2
+              exit 1
+            fi
+          fi
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
   linux-build:
+    needs: prepare-release
     strategy:
       fail-fast: false
       matrix:
@@ -117,3 +143,43 @@ jobs:
           path: dist/OQQWall_RUST-res.tar.gz
           compression-level: 0
           if-no-files-found: error
+
+  publish-release:
+    needs:
+      - prepare-release
+      - linux-build
+      - res-package
+    if: ${{ needs.prepare-release.outputs.release_tag != '' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 下载 amd64 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: OQQWall_RUST-linux-amd64
+          path: release-dist
+
+      - name: 下载 arm64 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: OQQWall_RUST-linux-arm64
+          path: release-dist
+
+      - name: 下载资源包
+        uses: actions/download-artifact@v4
+        with:
+          name: OQQWall_RUST-res
+          path: release-dist
+
+      - name: 发布到 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_TAG" \
+            --generate-notes \
+            --target "${GITHUB_SHA}" \
+            release-dist/OQQWall_RUST-linux-amd64 \
+            release-dist/OQQWall_RUST-linux-arm64 \
+            release-dist/OQQWall_RUST-res.tar.gz
