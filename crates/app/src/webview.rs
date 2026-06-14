@@ -40,6 +40,7 @@ struct WebviewState {
     cmd_tx: tokio::sync::mpsc::Sender<Command>,
     state: Arc<RwLock<StateView>>,
     auth: Arc<RwLock<WebviewAuthStore>>,
+    admin: Arc<RwLock<WebviewAdminStore>>,
     tz_offset_minutes: i32,
     session_ttl_sec: i64,
 }
@@ -61,6 +62,54 @@ struct WebviewSession {
 struct WebviewAuthStore {
     users: HashMap<String, Vec<WebviewAdminAccount>>,
     sessions: HashMap<String, WebviewSession>,
+}
+
+#[derive(Default)]
+struct WebviewAdminStore {
+    audit_entries: Vec<WebviewAuditEntry>,
+    saved_filters: HashMap<String, Vec<SavedFilterPreset>>,
+}
+
+#[derive(Clone)]
+struct WebviewAuditEntry {
+    audit_id: String,
+    operator: String,
+    action: String,
+    target_type: String,
+    target_id: String,
+    group_id: Option<String>,
+    summary: String,
+    status: String,
+    created_at_ms: i64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedFilterQuery {
+    #[serde(default)]
+    stage: Option<String>,
+    #[serde(default)]
+    keyword: Option<String>,
+    #[serde(default)]
+    group_id: Option<String>,
+    #[serde(default)]
+    sort_by: Option<String>,
+    #[serde(default)]
+    sort_order: Option<String>,
+    #[serde(default)]
+    only_error: bool,
+    #[serde(default)]
+    only_actionable: bool,
+    #[serde(default)]
+    page_size: Option<usize>,
+}
+
+#[derive(Clone)]
+struct SavedFilterPreset {
+    preset_id: String,
+    name: String,
+    query: SavedFilterQuery,
+    created_at_ms: i64,
+    updated_at_ms: i64,
 }
 
 #[derive(Serialize)]
@@ -168,6 +217,125 @@ struct StatsResponse {
 }
 
 #[derive(Serialize)]
+struct GroupHealthResponse {
+    items: Vec<GroupHealthItem>,
+}
+
+#[derive(Serialize)]
+struct GroupHealthItem {
+    group_id: String,
+    total_count: usize,
+    pending_count: usize,
+    actionable_count: usize,
+    error_count: usize,
+    failed_count: usize,
+    sent_count: usize,
+    today_count: usize,
+    avg_review_time_ms: Option<i64>,
+    last_created_at_ms: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct FailureListResponse {
+    summary: FailureSummary,
+    items: Vec<FailureItem>,
+}
+
+#[derive(Serialize)]
+struct FailureSummary {
+    total_count: usize,
+    stage_failed_count: usize,
+    post_error_count: usize,
+    render_error_count: usize,
+    review_publish_error_count: usize,
+}
+
+#[derive(Serialize)]
+struct FailureItem {
+    post_id: String,
+    review_id: Option<String>,
+    review_code: Option<u32>,
+    group_id: String,
+    stage: String,
+    source: String,
+    error: String,
+    created_at_ms: i64,
+    sender_id: Option<String>,
+    preview_text: Option<String>,
+}
+
+#[derive(Serialize)]
+struct BlacklistListResponse {
+    items: Vec<BlacklistItem>,
+    total: usize,
+}
+
+#[derive(Serialize)]
+struct BlacklistItem {
+    group_id: String,
+    sender_id: String,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateBlacklistRequest {
+    group_id: String,
+    sender_id: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PostCollectionResponse {
+    items: Vec<PostListItem>,
+    total: usize,
+}
+
+#[derive(Serialize)]
+struct SimilarPostResponse {
+    items: Vec<SimilarPostItem>,
+    total: usize,
+}
+
+#[derive(Serialize)]
+struct SimilarPostItem {
+    post: PostListItem,
+    similarity_reason: String,
+}
+
+#[derive(Serialize)]
+struct AuditListResponse {
+    items: Vec<AuditListItem>,
+}
+
+#[derive(Serialize)]
+struct AuditListItem {
+    audit_id: String,
+    operator: String,
+    action: String,
+    target_type: String,
+    target_id: String,
+    group_id: Option<String>,
+    summary: String,
+    status: String,
+    created_at_ms: i64,
+}
+
+#[derive(Serialize)]
+struct SavedFilterListResponse {
+    items: Vec<SavedFilterPresetResponse>,
+}
+
+#[derive(Clone, Serialize)]
+struct SavedFilterPresetResponse {
+    preset_id: String,
+    name: String,
+    query: SavedFilterQuery,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+#[derive(Serialize)]
 struct DailyTrendItem {
     date: String,
     submitted: usize,
@@ -199,6 +367,16 @@ struct PostDetailResponse {
     blocks: Vec<PostBlock>,
     render_png_blob_id: Option<String>,
     last_error: Option<String>,
+    timeline: Vec<PostTimelineItem>,
+    sender_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PostTimelineItem {
+    label: String,
+    status: String,
+    at_ms: Option<i64>,
+    detail: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -264,6 +442,59 @@ struct ReviewFailure {
     reason: String,
 }
 
+#[derive(Deserialize)]
+struct ListBlacklistQuery {
+    #[serde(default)]
+    group_id: Option<String>,
+    #[serde(default)]
+    keyword: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ListFailuresQuery {
+    #[serde(default)]
+    group_id: Option<String>,
+    #[serde(default)]
+    keyword: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SenderPostsQuery {
+    sender_id: String,
+    #[serde(default)]
+    group_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SimilarPostsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    #[serde(default)]
+    group_id: Option<String>,
+    #[serde(default)]
+    operator: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SaveFilterPresetRequest {
+    #[serde(default)]
+    preset_id: Option<String>,
+    name: String,
+    query: SavedFilterQuery,
+}
+
 pub fn spawn_webview(handle: &EngineHandle, config: &AppConfig) {
     if !config.webview_enabled {
         debug_log!("webview disabled by config");
@@ -288,6 +519,7 @@ pub fn spawn_webview(handle: &EngineHandle, config: &AppConfig) {
             users,
             sessions: HashMap::new(),
         })),
+        admin: Arc::new(RwLock::new(WebviewAdminStore::default())),
         tz_offset_minutes: config.tz_offset_minutes,
         session_ttl_sec: config.webview_session_ttl_sec,
     };
@@ -297,9 +529,23 @@ pub fn spawn_webview(handle: &EngineHandle, config: &AppConfig) {
         .route("/auth/logout", post(webview_logout))
         .route("/auth/me", get(webview_me))
         .route("/api/stats", get(webview_get_stats))
+        .route("/api/overview/groups", get(webview_get_group_health))
+        .route("/api/failures", get(webview_list_failures))
         .route("/api/posts", get(webview_list_posts))
         .route("/api/posts/{post_id}", get(webview_get_post))
+        .route("/api/posts/{post_id}/similar", get(webview_get_similar_posts))
+        .route("/api/posts/by-sender", get(webview_list_sender_posts))
         .route("/api/blobs/{blob_id}", get(webview_get_blob))
+        .route("/api/blacklist", get(webview_list_blacklist).post(webview_create_blacklist))
+        .route(
+            "/api/blacklist/{group_id}/{sender_id}",
+            post(webview_delete_blacklist),
+        )
+        .route("/api/audit", get(webview_list_audit))
+        .route(
+            "/api/filter-presets",
+            get(webview_list_filter_presets).post(webview_save_filter_preset),
+        )
         .route("/api/reviews/ids", get(webview_list_review_ids))
         .route(
             "/api/reviews/{review_id}/decision",
@@ -582,6 +828,235 @@ async fn webview_get_stats(
             hourly_distribution,
             avg_review_time_ms,
         }),
+    )
+        .into_response()
+}
+
+async fn webview_get_group_health(
+    State(state): State<WebviewState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let session = match authenticate_webview(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let allowed_groups = allowed_groups(&session.identity);
+    let guard = match state.state.read() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "state unavailable",
+            );
+        }
+    };
+
+    let mut groups: HashMap<String, GroupHealthItem> = HashMap::new();
+    let mut review_elapsed: HashMap<String, (i64, usize)> = HashMap::new();
+
+    for (_, meta) in &guard.posts {
+        if !can_access_group(allowed_groups.as_ref(), &meta.group_id) {
+            continue;
+        }
+        let entry = groups.entry(meta.group_id.clone()).or_insert(GroupHealthItem {
+            group_id: meta.group_id.clone(),
+            total_count: 0,
+            pending_count: 0,
+            actionable_count: 0,
+            error_count: 0,
+            failed_count: 0,
+            sent_count: 0,
+            today_count: 0,
+            avg_review_time_ms: None,
+            last_created_at_ms: None,
+        });
+        entry.total_count = entry.total_count.saturating_add(1);
+        if meta.stage == PostStage::ReviewPending {
+            entry.pending_count = entry.pending_count.saturating_add(1);
+        }
+        if meta.review_id.is_some() {
+            entry.actionable_count = entry.actionable_count.saturating_add(1);
+        }
+        if meta.last_error.is_some() {
+            entry.error_count = entry.error_count.saturating_add(1);
+        }
+        if meta.stage == PostStage::Failed {
+            entry.failed_count = entry.failed_count.saturating_add(1);
+        }
+        if meta.stage == PostStage::Sent {
+            entry.sent_count = entry.sent_count.saturating_add(1);
+        }
+        if meta.created_at_ms >= local_day_start_ms(now_ms(), state.tz_offset_minutes) {
+            entry.today_count = entry.today_count.saturating_add(1);
+        }
+        entry.last_created_at_ms = Some(
+            entry
+                .last_created_at_ms
+                .map(|current| current.max(meta.created_at_ms))
+                .unwrap_or(meta.created_at_ms),
+        );
+
+        if let Some(review_id) = meta.review_id {
+            if let Some(review) = guard.reviews.get(&review_id) {
+                if let Some(decided_at_ms) = review.decided_at_ms {
+                    let elapsed = decided_at_ms.saturating_sub(meta.created_at_ms);
+                    let slot = review_elapsed.entry(meta.group_id.clone()).or_insert((0, 0));
+                    slot.0 = slot.0.saturating_add(elapsed.max(0));
+                    slot.1 = slot.1.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    for item in groups.values_mut() {
+        if let Some((elapsed, count)) = review_elapsed.get(&item.group_id) {
+            if *count > 0 {
+                item.avg_review_time_ms = Some(*elapsed / *count as i64);
+            }
+        }
+    }
+
+    let mut items = groups.into_values().collect::<Vec<_>>();
+    items.sort_by(|a, b| {
+        b.pending_count
+            .cmp(&a.pending_count)
+            .then_with(|| b.error_count.cmp(&a.error_count))
+            .then_with(|| a.group_id.cmp(&b.group_id))
+    });
+
+    (StatusCode::OK, Json(GroupHealthResponse { items })).into_response()
+}
+
+async fn webview_list_failures(
+    State(state): State<WebviewState>,
+    headers: HeaderMap,
+    Query(query): Query<ListFailuresQuery>,
+) -> impl IntoResponse {
+    let session = match authenticate_webview(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let allowed_groups = allowed_groups(&session.identity);
+    let keyword = query
+        .keyword
+        .as_ref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let group_filter = query
+        .group_id
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    let source_filter = query
+        .source
+        .as_ref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let limit = query.limit.unwrap_or(100).clamp(1, 300);
+
+    let guard = match state.state.read() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "state unavailable",
+            );
+        }
+    };
+
+    let mut summary = FailureSummary {
+        total_count: 0,
+        stage_failed_count: 0,
+        post_error_count: 0,
+        render_error_count: 0,
+        review_publish_error_count: 0,
+    };
+    let mut items = Vec::new();
+
+    for (post_id, meta) in &guard.posts {
+        if !can_access_group(allowed_groups.as_ref(), &meta.group_id) {
+            continue;
+        }
+        if group_filter.map(|value| value != meta.group_id).unwrap_or(false) {
+            continue;
+        }
+
+        let sender_id = primary_sender_id(&guard, meta);
+        let preview_text = post_preview_text(&guard, *post_id);
+        let review_code = meta
+            .review_id
+            .and_then(|id| guard.reviews.get(&id).map(|review| review.review_code));
+
+        let mut push_item = |source: &str, error: String| {
+            if source_filter
+                .as_deref()
+                .map(|value| value != source)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            let haystack = format!(
+                "{} {} {} {}",
+                meta.group_id,
+                sender_id.clone().unwrap_or_default(),
+                preview_text.clone().unwrap_or_default(),
+                error
+            )
+            .to_ascii_lowercase();
+            if keyword
+                .as_deref()
+                .map(|needle| !haystack.contains(needle))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            summary.total_count = summary.total_count.saturating_add(1);
+            items.push(FailureItem {
+                post_id: id_to_string(*post_id),
+                review_id: meta.review_id.map(id_to_string),
+                review_code,
+                group_id: meta.group_id.clone(),
+                stage: stage_to_string(meta.stage),
+                source: source.to_string(),
+                error,
+                created_at_ms: meta.created_at_ms,
+                sender_id: sender_id.clone(),
+                preview_text: preview_text.clone(),
+            });
+        };
+
+        if meta.stage == PostStage::Failed {
+            summary.stage_failed_count = summary.stage_failed_count.saturating_add(1);
+        }
+        if let Some(error) = meta.last_error.clone() {
+            summary.post_error_count = summary.post_error_count.saturating_add(1);
+            push_item("post", error);
+        }
+        if let Some(render) = guard.render.get(post_id) {
+            if let Some(error) = render.last_error.clone() {
+                summary.render_error_count = summary.render_error_count.saturating_add(1);
+                push_item("render", error);
+            }
+        }
+        if let Some(review_id) = meta.review_id {
+            if let Some(review) = guard.reviews.get(&review_id) {
+                if let Some(error) = review.publish_last_error.clone() {
+                    summary.review_publish_error_count =
+                        summary.review_publish_error_count.saturating_add(1);
+                    push_item("review_publish", error);
+                }
+            }
+        }
+    }
+
+    items.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    items.truncate(limit);
+
+    (
+        StatusCode::OK,
+        Json(FailureListResponse { summary, items }),
     )
         .into_response()
 }
@@ -918,12 +1393,8 @@ async fn webview_get_post(
             .get(&id)
             .and_then(|review| review.decision_reason.clone())
     });
-    let sender_id = guard
-        .session_ingress
-        .get(&meta.session_id)
-        .and_then(|ids| ids.first())
-        .and_then(|id| guard.ingress_meta.get(id))
-        .map(|ingress| ingress.user_id.clone());
+    let sender_id = primary_sender_id(&guard, meta);
+    let sender_name = primary_sender_name(&guard, meta);
     let blocks = guard
         .drafts
         .get(&post_id)
@@ -981,6 +1452,7 @@ async fn webview_get_post(
                 .or_else(|| render.png_blobs.first().copied())
         })
         .map(id_to_string);
+    let timeline = build_post_timeline(&guard, meta);
 
     (
         StatusCode::OK,
@@ -1000,6 +1472,8 @@ async fn webview_get_post(
             blocks,
             render_png_blob_id,
             last_error: meta.last_error.clone(),
+            timeline,
+            sender_name,
         }),
     )
         .into_response()
@@ -1061,6 +1535,503 @@ async fn webview_get_blob(
         HeaderValue::from_static("private, max-age=60"),
     );
     (StatusCode::OK, response_headers, bytes).into_response()
+}
+
+async fn webview_list_blacklist(
+    State(state): State<WebviewState>,
+    headers: HeaderMap,
+    Query(query): Query<ListBlacklistQuery>,
+) -> impl IntoResponse {
+    let session = match authenticate_webview(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let allowed_groups = allowed_groups(&session.identity);
+    let keyword = query
+        .keyword
+        .as_ref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let group_filter = query
+        .group_id
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+
+    let guard = match state.state.read() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "state unavailable",
+            );
+        }
+    };
+
+    let mut items = Vec::new();
+    for (group_id, group) in &guard.blacklist {
+        if !can_access_group(allowed_groups.as_ref(), group_id) {
+            continue;
+        }
+        if group_filter.map(|value| value != group_id).unwrap_or(false) {
+            continue;
+        }
+        for (sender_id, reason) in group {
+            let haystack = format!(
+                "{} {} {}",
+                group_id,
+                sender_id,
+                reason.clone().unwrap_or_default()
+            )
+            .to_ascii_lowercase();
+            if keyword
+                .as_deref()
+                .map(|needle| !haystack.contains(needle))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            items.push(BlacklistItem {
+                group_id: group_id.clone(),
+                sender_id: sender_id.clone(),
+                reason: reason.clone(),
+            });
+        }
+    }
+    items.sort_by(|a, b| {
+        a.group_id
+            .cmp(&b.group_id)
+            .then_with(|| a.sender_id.cmp(&b.sender_id))
+    });
+
+    let total = items.len();
+    (
+        StatusCode::OK,
+        Json(BlacklistListResponse { items, total }),
+    )
+        .into_response()
+}
+
+async fn webview_create_blacklist(
+    State(state): State<WebviewState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateBlacklistRequest>,
+) -> impl IntoResponse {
+    let session = match authenticate_webview(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let allowed = allowed_groups(&session.identity);
+    if !can_access_group(allowed.as_ref(), &req.group_id) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "PERMISSION_DENIED",
+            "permission denied",
+        );
+    }
+    let cmd = Command::GlobalAction(oqqwall_rust_core::GlobalActionCommand {
+        group_id: req.group_id.clone(),
+        action: oqqwall_rust_core::GlobalAction::BlacklistAdd {
+            sender_id: req.sender_id.clone(),
+            reason: req.reason.clone(),
+        },
+        operator_id: format!("webview:{}", session.identity.username),
+        now_ms: now_ms(),
+        tz_offset_minutes: state.tz_offset_minutes,
+    });
+    if state.cmd_tx.send(cmd).await.is_err() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UNAVAILABLE",
+            "engine command channel closed",
+        );
+    }
+    append_audit_entry(
+        &state,
+        WebviewAuditEntry {
+            audit_id: random_hex32(),
+            operator: session.identity.username,
+            action: "blacklist_add".to_string(),
+            target_type: "sender".to_string(),
+            target_id: req.sender_id,
+            group_id: Some(req.group_id),
+            summary: "已从后台加入黑名单".to_string(),
+            status: "submitted".to_string(),
+            created_at_ms: now_ms(),
+        },
+    );
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn webview_delete_blacklist(
+    State(state): State<WebviewState>,
+    Path((group_id, sender_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let session = match authenticate_webview(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let allowed = allowed_groups(&session.identity);
+    if !can_access_group(allowed.as_ref(), &group_id) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "PERMISSION_DENIED",
+            "permission denied",
+        );
+    }
+    let cmd = Command::GlobalAction(oqqwall_rust_core::GlobalActionCommand {
+        group_id,
+        action: oqqwall_rust_core::GlobalAction::BlacklistRemove {
+            sender_id: sender_id.clone(),
+        },
+        operator_id: format!("webview:{}", session.identity.username),
+        now_ms: now_ms(),
+        tz_offset_minutes: state.tz_offset_minutes,
+    });
+    if state.cmd_tx.send(cmd).await.is_err() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UNAVAILABLE",
+            "engine command channel closed",
+        );
+    }
+    append_audit_entry(
+        &state,
+        WebviewAuditEntry {
+            audit_id: random_hex32(),
+            operator: session.identity.username,
+            action: "blacklist_remove".to_string(),
+            target_type: "sender".to_string(),
+            target_id: sender_id,
+            group_id: Some(group_id),
+            summary: "已从后台移出黑名单".to_string(),
+            status: "submitted".to_string(),
+            created_at_ms: now_ms(),
+        },
+    );
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn webview_list_sender_posts(
+    State(state): State<WebviewState>,
+    headers: HeaderMap,
+    Query(query): Query<SenderPostsQuery>,
+) -> impl IntoResponse {
+    let session = match authenticate_webview(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let allowed_groups = allowed_groups(&session.identity);
+    let sender_id = query.sender_id.trim();
+    if sender_id.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", "sender_id required");
+    }
+    let group_filter = query
+        .group_id
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let guard = match state.state.read() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "state unavailable",
+            );
+        }
+    };
+
+    let mut items = guard
+        .posts
+        .iter()
+        .filter(|(_, meta)| can_access_group(allowed_groups.as_ref(), &meta.group_id))
+        .filter(|(_, meta)| {
+            group_filter
+                .map(|value| value == meta.group_id)
+                .unwrap_or(true)
+        })
+        .filter(|(_, meta)| sender_matches(&guard, meta, sender_id))
+        .map(|(post_id, meta)| build_post_list_item(&guard, *post_id, meta))
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    let total = items.len();
+    items.truncate(limit);
+
+    (
+        StatusCode::OK,
+        Json(PostCollectionResponse { items, total }),
+    )
+        .into_response()
+}
+
+async fn webview_get_similar_posts(
+    State(state): State<WebviewState>,
+    Path(post_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<SimilarPostsQuery>,
+) -> impl IntoResponse {
+    let session = match authenticate_webview(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let allowed_groups = allowed_groups(&session.identity);
+    let Some(post_id) = parse_id128(&post_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", "invalid post_id");
+    };
+    let limit = query.limit.unwrap_or(10).clamp(1, 30);
+    let guard = match state.state.read() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "state unavailable",
+            );
+        }
+    };
+    let Some(base_meta) = guard.posts.get(&post_id) else {
+        return error_response(StatusCode::NOT_FOUND, "NOT_FOUND", "post not found");
+    };
+    if !can_access_group(allowed_groups.as_ref(), &base_meta.group_id) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "PERMISSION_DENIED",
+            "permission denied",
+        );
+    }
+
+    let base_sender = primary_sender_id(&guard, base_meta);
+    let base_text = post_preview_text(&guard, post_id);
+    let base_group = base_meta.group_id.clone();
+    let mut items = guard
+        .posts
+        .iter()
+        .filter(|(candidate_id, candidate_meta)| **candidate_id != post_id)
+        .filter(|(_, candidate_meta)| can_access_group(allowed_groups.as_ref(), &candidate_meta.group_id))
+        .filter(|(_, candidate_meta)| {
+            candidate_meta.group_id == base_group
+                || sender_matches(&guard, candidate_meta, base_sender.as_deref().unwrap_or(""))
+        })
+        .map(|(candidate_id, candidate_meta)| {
+            let mut score = 0usize;
+            let mut reason = Vec::new();
+            if candidate_meta.group_id == base_group {
+                score = score.saturating_add(2);
+                reason.push("同组");
+            }
+            let candidate_sender = primary_sender_id(&guard, candidate_meta);
+            if base_sender.is_some() && candidate_sender == base_sender {
+                score = score.saturating_add(3);
+                reason.push("同投稿人");
+            }
+            if let (Some(base), Some(candidate)) = (&base_text, post_preview_text(&guard, *candidate_id)) {
+                if text_similarity(base, &candidate) {
+                    score = score.saturating_add(4);
+                    reason.push("内容相近");
+                }
+            }
+            (
+                score,
+                SimilarPostItem {
+                    post: build_post_list_item(&guard, *candidate_id, candidate_meta),
+                    similarity_reason: if reason.is_empty() {
+                        "弱相关".to_string()
+                    } else {
+                        reason.join("，")
+                    },
+                },
+            )
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    let total = items.len();
+    let items = items
+        .into_iter()
+        .take(limit)
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
+
+    (
+        StatusCode::OK,
+        Json(SimilarPostResponse { items, total }),
+    )
+        .into_response()
+}
+
+async fn webview_list_audit(
+    State(state): State<WebviewState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditQuery>,
+) -> impl IntoResponse {
+    let session = match authenticate_webview(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let allowed_groups = allowed_groups(&session.identity);
+    let keyword = query
+        .operator
+        .as_ref()
+        .or(query.group_id.as_ref())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let limit = query.limit.unwrap_or(100).clamp(1, 300);
+    let guard = match state.admin.read() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "audit store unavailable",
+            );
+        }
+    };
+
+    let mut items = guard
+        .audit_entries
+        .iter()
+        .filter(|entry| {
+            if let Some(group_id) = query.group_id.as_deref() {
+                entry.group_id.as_deref() == Some(group_id)
+            } else {
+                true
+            }
+        })
+        .filter(|entry| {
+            if let Some(ref keyword) = keyword {
+                entry.summary.to_ascii_lowercase().contains(keyword)
+                    || entry.operator.to_ascii_lowercase().contains(keyword)
+            } else {
+                true
+            }
+        })
+        .filter(|entry| {
+            if let Some(groups) = allowed_groups.as_ref() {
+                entry
+                    .group_id
+                    .as_deref()
+                    .map(|group_id| groups.contains(group_id))
+                    .unwrap_or(true)
+            } else {
+                true
+            }
+        })
+        .map(|entry| AuditListItem {
+            audit_id: entry.audit_id.clone(),
+            operator: entry.operator.clone(),
+            action: entry.action.clone(),
+            target_type: entry.target_type.clone(),
+            target_id: entry.target_id.clone(),
+            group_id: entry.group_id.clone(),
+            summary: entry.summary.clone(),
+            status: entry.status.clone(),
+            created_at_ms: entry.created_at_ms,
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    items.truncate(limit);
+
+    (
+        StatusCode::OK,
+        Json(AuditListResponse { items }),
+    )
+        .into_response()
+}
+
+async fn webview_list_filter_presets(
+    State(state): State<WebviewState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let session = match authenticate_webview(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let guard = match state.admin.read() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "filter store unavailable",
+            );
+        }
+    };
+    let items = guard
+        .saved_filters
+        .get(&session.identity.username)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|preset| SavedFilterPresetResponse {
+            preset_id: preset.preset_id,
+            name: preset.name,
+            query: preset.query,
+            created_at_ms: preset.created_at_ms,
+            updated_at_ms: preset.updated_at_ms,
+        })
+        .collect::<Vec<_>>();
+
+    (StatusCode::OK, Json(SavedFilterListResponse { items })).into_response()
+}
+
+async fn webview_save_filter_preset(
+    State(state): State<WebviewState>,
+    headers: HeaderMap,
+    Json(req): Json<SaveFilterPresetRequest>,
+) -> impl IntoResponse {
+    let session = match authenticate_webview(&state, &headers) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let now = now_ms();
+    let mut guard = match state.admin.write() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                "filter store unavailable",
+            );
+        }
+    };
+    let items = guard
+        .saved_filters
+        .entry(session.identity.username.clone())
+        .or_default();
+    let preset_id = req.preset_id.unwrap_or_else(random_hex32);
+    if let Some(existing) = items.iter_mut().find(|preset| preset.preset_id == preset_id) {
+        existing.name = req.name.clone();
+        existing.query = req.query.clone();
+        existing.updated_at_ms = now;
+    } else {
+        items.push(SavedFilterPreset {
+            preset_id: preset_id.clone(),
+            name: req.name.clone(),
+            query: req.query.clone(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        });
+    }
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    append_audit_entry(
+        &state,
+        WebviewAuditEntry {
+            audit_id: random_hex32(),
+            operator: session.identity.username,
+            action: "filter_preset_save".to_string(),
+            target_type: "filter_preset".to_string(),
+            target_id: preset_id,
+            group_id: req.query.group_id.clone(),
+            summary: format!("已保存筛选器：{}", req.name),
+            status: "saved".to_string(),
+            created_at_ms: now,
+        },
+    );
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn webview_decide_review(
@@ -1460,6 +2431,215 @@ fn post_keyword_matches(
             })
         })
         .unwrap_or(false)
+}
+
+fn build_post_list_item(snapshot: &StateView, post_id: Id128, meta: &PostMeta) -> PostListItem {
+    let sender_id = primary_sender_id(snapshot, meta);
+    let review_code = meta
+        .review_id
+        .and_then(|id| snapshot.reviews.get(&id).map(|review| review.review_code));
+    let preview_text = post_preview_text(snapshot, post_id);
+    let preview_image_urls = post_preview_images(snapshot, post_id);
+    let preview_image_url = preview_image_urls.first().cloned();
+    let preview_image_count = preview_image_urls.len();
+
+    PostListItem {
+        post_id: id_to_string(meta.post_id),
+        review_id: meta.review_id.map(id_to_string),
+        group_id: meta.group_id.clone(),
+        stage: stage_to_string(meta.stage),
+        external_code: snapshot.external_code_by_post.get(&meta.post_id).copied(),
+        internal_code: review_code,
+        sender_id,
+        created_at_ms: meta.created_at_ms,
+        last_error: meta.last_error.clone(),
+        preview_text,
+        preview_image_url,
+        preview_image_urls,
+        preview_image_count,
+    }
+}
+
+fn primary_sender_id(snapshot: &StateView, meta: &PostMeta) -> Option<String> {
+    snapshot
+        .session_ingress
+        .get(&meta.session_id)
+        .and_then(|ids| ids.first())
+        .and_then(|id| snapshot.ingress_meta.get(id))
+        .map(|ingress| ingress.user_id.clone())
+}
+
+fn primary_sender_name(snapshot: &StateView, meta: &PostMeta) -> Option<String> {
+    snapshot
+        .session_ingress
+        .get(&meta.session_id)
+        .and_then(|ids| ids.first())
+        .and_then(|id| snapshot.ingress_meta.get(id))
+        .and_then(|ingress| ingress.sender_name.clone())
+}
+
+fn sender_matches(snapshot: &StateView, meta: &PostMeta, sender_id: &str) -> bool {
+    if sender_id.is_empty() {
+        return false;
+    }
+    primary_sender_id(snapshot, meta)
+        .map(|value| value == sender_id)
+        .unwrap_or(false)
+}
+
+fn post_preview_text(snapshot: &StateView, post_id: Id128) -> Option<String> {
+    snapshot.drafts.get(&post_id).and_then(|draft| {
+        draft.blocks.iter().find_map(|block| match block {
+            oqqwall_rust_core::draft::DraftBlock::Paragraph { text } => {
+                Some(text.chars().take(100).collect::<String>())
+            }
+            oqqwall_rust_core::draft::DraftBlock::Reply { preview } => {
+                Some(format!("[回复] {}", preview.body.chars().take(80).collect::<String>()))
+            }
+            _ => None,
+        })
+    })
+}
+
+fn post_preview_images(snapshot: &StateView, post_id: Id128) -> Vec<String> {
+    let draft_image_urls = snapshot
+        .drafts
+        .get(&post_id)
+        .map(|draft| {
+            draft
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    oqqwall_rust_core::draft::DraftBlock::Attachment {
+                        reference,
+                        kind: oqqwall_rust_core::draft::MediaKind::Image,
+                        ..
+                    } => match reference {
+                        MediaReference::Blob { blob_id } => {
+                            Some(format!("/api/blobs/{}", id_to_string(*blob_id)))
+                        }
+                        MediaReference::RemoteUrl { url } => Some(url.clone()),
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let render_blob_ids = snapshot
+        .render
+        .get(&post_id)
+        .map(|render| {
+            if render.png_blobs.is_empty() {
+                render.png_blob.into_iter().collect::<Vec<_>>()
+            } else {
+                render.png_blobs.clone()
+            }
+        })
+        .unwrap_or_default();
+
+    let mut preview_image_urls = render_blob_ids
+        .into_iter()
+        .map(|blob_id| format!("/api/blobs/{}", id_to_string(blob_id)))
+        .collect::<Vec<_>>();
+    preview_image_urls.extend(draft_image_urls);
+    preview_image_urls
+}
+
+fn build_post_timeline(snapshot: &StateView, meta: &PostMeta) -> Vec<PostTimelineItem> {
+    let mut items = vec![PostTimelineItem {
+        label: "稿件创建".to_string(),
+        status: "done".to_string(),
+        at_ms: Some(meta.created_at_ms),
+        detail: Some(stage_to_string(meta.stage)),
+    }];
+
+    if let Some(render) = snapshot.render.get(&meta.post_id) {
+        items.push(PostTimelineItem {
+            label: "渲染阶段".to_string(),
+            status: if render.last_error.is_some() {
+                "error".to_string()
+            } else if render.png_blob.is_some() || !render.png_blobs.is_empty() {
+                "done".to_string()
+            } else {
+                "waiting".to_string()
+            },
+            at_ms: None,
+            detail: render.last_error.clone(),
+        });
+    }
+
+    if let Some(review_id) = meta.review_id {
+        if let Some(review) = snapshot.reviews.get(&review_id) {
+            items.push(PostTimelineItem {
+                label: "审核发布".to_string(),
+                status: if review.publish_last_error.is_some() {
+                    "error".to_string()
+                } else if review.audit_msg_id.is_some() {
+                    "done".to_string()
+                } else {
+                    "waiting".to_string()
+                },
+                at_ms: None,
+                detail: review.publish_last_error.clone(),
+            });
+            items.push(PostTimelineItem {
+                label: "审核决策".to_string(),
+                status: if review.decision.is_some() {
+                    "done".to_string()
+                } else {
+                    "waiting".to_string()
+                },
+                at_ms: review.decided_at_ms,
+                detail: review
+                    .decision_reason
+                    .clone()
+                    .or_else(|| review.decided_by.clone()),
+            });
+        }
+    }
+
+    if meta.stage == PostStage::Sent {
+        items.push(PostTimelineItem {
+            label: "发送完成".to_string(),
+            status: "done".to_string(),
+            at_ms: snapshot.last_ts_ms,
+            detail: None,
+        });
+    } else if meta.stage == PostStage::Failed || meta.last_error.is_some() {
+        items.push(PostTimelineItem {
+            label: "异常状态".to_string(),
+            status: "error".to_string(),
+            at_ms: snapshot.last_ts_ms,
+            detail: meta.last_error.clone(),
+        });
+    }
+
+    items
+}
+
+fn text_similarity(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    if left == right {
+        return true;
+    }
+    let left_short = left.chars().take(24).collect::<String>();
+    let right_short = right.chars().take(24).collect::<String>();
+    left.contains(&right_short) || right.contains(&left_short)
+}
+
+fn append_audit_entry(state: &WebviewState, entry: WebviewAuditEntry) {
+    if let Ok(mut guard) = state.admin.write() {
+        guard.audit_entries.push(entry);
+        if guard.audit_entries.len() > 500 {
+            let overflow = guard.audit_entries.len() - 500;
+            guard.audit_entries.drain(0..overflow);
+        }
+    }
 }
 
 fn parse_review_action(req: &ReviewDecisionRequest) -> Result<ReviewAction, &'static str> {

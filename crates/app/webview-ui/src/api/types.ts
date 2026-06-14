@@ -62,10 +62,125 @@ export interface StatsResponse {
   avg_review_time_ms: number | null
 }
 
+export interface GroupHealthItem {
+  group_id: string
+  total_count: number
+  pending_count: number
+  actionable_count: number
+  error_count: number
+  failed_count: number
+  sent_count: number
+  today_count: number
+  avg_review_time_ms: number | null
+  last_created_at_ms: number | null
+}
+
+export interface GroupHealthResponse {
+  items: GroupHealthItem[]
+}
+
+export interface FailureSummary {
+  total_count: number
+  stage_failed_count: number
+  post_error_count: number
+  render_error_count: number
+  review_publish_error_count: number
+}
+
+export interface FailureItem {
+  post_id: string
+  review_id: string | null
+  review_code: number | null
+  group_id: string
+  stage: Stage
+  source: string
+  error: string
+  created_at_ms: number
+  sender_id: string | null
+  preview_text: string | null
+}
+
+export interface FailureListResponse {
+  summary: FailureSummary
+  items: FailureItem[]
+}
+
+export interface BlacklistItem {
+  group_id: string
+  sender_id: string
+  reason: string | null
+}
+
+export interface BlacklistListResponse {
+  items: BlacklistItem[]
+  total: number
+}
+
+export interface PostTimelineItem {
+  label: string
+  status: string
+  at_ms: number | null
+  detail: string | null
+}
+
 export interface ListPostsResponse {
   items: PostItem[]
   next_cursor: number | null
   total: number
+}
+
+export interface PostCollectionResponse {
+  items: PostItem[]
+  total: number
+}
+
+export interface SimilarPostItem {
+  post: PostItem
+  similarity_reason: string
+}
+
+export interface SimilarPostResponse {
+  items: SimilarPostItem[]
+  total: number
+}
+
+export interface AuditListItem {
+  audit_id: string
+  operator: string
+  action: string
+  target_type: string
+  target_id: string
+  group_id: string | null
+  summary: string
+  status: string
+  created_at_ms: number
+}
+
+export interface AuditListResponse {
+  items: AuditListItem[]
+}
+
+export interface SavedFilterQuery {
+  stage?: string | null
+  keyword?: string | null
+  group_id?: string | null
+  sort_by?: string | null
+  sort_order?: string | null
+  only_error: boolean
+  only_actionable: boolean
+  page_size?: number | null
+}
+
+export interface SavedFilterPreset {
+  preset_id: string
+  name: string
+  query: SavedFilterQuery
+  created_at_ms: number
+  updated_at_ms: number
+}
+
+export interface SavedFilterListResponse {
+  items: SavedFilterPreset[]
 }
 
 export interface ListReviewIdsResponse {
@@ -98,6 +213,8 @@ export interface PostDetail {
   >
   render_png_blob_id: string | null
   last_error: string | null
+  timeline: PostTimelineItem[]
+  sender_name: string | null
 }
 
 export interface ApiErrorBody {
