@@ -92,6 +92,7 @@ jobs:
 
       - name: 执行拆分打包脚本
         run: |
+          export OQQWALL_DOCKER_DATA_DIR="$(dirname "$GITHUB_WORKSPACE")"
           bash ./scripts/package_split_release.sh
 
       - name: 生成校验文件
