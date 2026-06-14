@@ -1681,6 +1681,7 @@ async fn webview_delete_blacklist(
             "permission denied",
         );
     }
+    let audit_group_id = group_id.clone();
     let cmd = Command::GlobalAction(oqqwall_rust_core::GlobalActionCommand {
         group_id,
         action: oqqwall_rust_core::GlobalAction::BlacklistRemove {
@@ -1705,7 +1706,7 @@ async fn webview_delete_blacklist(
             action: "blacklist_remove".to_string(),
             target_type: "sender".to_string(),
             target_id: sender_id,
-            group_id: Some(group_id),
+            group_id: Some(audit_group_id),
             summary: "已从后台移出黑名单".to_string(),
             status: "submitted".to_string(),
             created_at_ms: now_ms(),
@@ -1810,7 +1811,7 @@ async fn webview_get_similar_posts(
     let mut items = guard
         .posts
         .iter()
-        .filter(|(candidate_id, candidate_meta)| **candidate_id != post_id)
+        .filter(|(candidate_id, _candidate_meta)| **candidate_id != post_id)
         .filter(|(_, candidate_meta)| can_access_group(allowed_groups.as_ref(), &candidate_meta.group_id))
         .filter(|(_, candidate_meta)| {
             candidate_meta.group_id == base_group
@@ -2017,6 +2018,7 @@ async fn webview_save_filter_preset(
         });
     }
     items.sort_by(|a, b| a.name.cmp(&b.name));
+    drop(guard);
     append_audit_entry(
         &state,
         WebviewAuditEntry {
