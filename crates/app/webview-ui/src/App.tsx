@@ -1269,7 +1269,7 @@ function PostCard({
         <Card.Header className="post-card-head">
           <button className="post-card-title-button" type="button" onClick={() => onOpen(post.post_id)}>
             <Card.Title>#{post.internal_code ?? post.external_code ?? '-'}</Card.Title>
-            <Card.Description>{post.sender_id ?? '未知投稿人'}</Card.Description>
+            <Card.Description>{post.sender_name || post.sender_id || '未知投稿人'}</Card.Description>
           </button>
           <div className="post-card-head-actions">
             <StageChip stage={post.stage} />
@@ -1279,11 +1279,18 @@ function PostCard({
               </Chip>
             )}
             {post.review_id && (
-              <Checkbox
+              <button
+                type="button"
+                className={selectAllTotal !== null || selected.includes(post.review_id) ? 'list-checkbox checked' : 'list-checkbox'}
                 aria-label={`选择 ${post.internal_code ?? post.external_code ?? post.post_id}`}
-                isSelected={selectAllTotal !== null || selected.includes(post.review_id)}
-                onChange={(checked) => onToggle(post.review_id!, checked)}
-              />
+                aria-pressed={selectAllTotal !== null || selected.includes(post.review_id)}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onToggle(post.review_id!, !(selectAllTotal !== null || selected.includes(post.review_id!)))
+                }}
+              >
+                <Check size={14} />
+              </button>
             )}
           </div>
         </Card.Header>
@@ -1447,15 +1454,15 @@ function PostTable({
                   <StageChip stage={post.stage} />
                 </td>
                 <td>
-                  <div className="list-preview">
-                    {post.preview_image_url ? <img className="list-preview-thumb" src={post.preview_image_url} alt="稿件缩略图" /> : null}
-                    <div className="list-preview-text">
-                      <div className="preview">{post.preview_text || (post.preview_image_url ? '[图片]' : '-')}</div>
-                      <span>
-                        {post.group_id} · {post.sender_id ?? '未知投稿人'}
-                      </span>
+                    <div className="list-preview">
+                      {post.preview_image_url ? <img className="list-preview-thumb" src={post.preview_image_url} alt="稿件缩略图" /> : null}
+                      <div className="list-preview-text">
+                        <div className="preview">{post.preview_text || (post.preview_image_url ? '[图片]' : '-')}</div>
+                        <span>
+                        {post.group_id} · {post.sender_name || post.sender_id || '未知投稿人'}
+                        </span>
+                      </div>
                     </div>
-                  </div>
                 </td>
                 <td>{formatDateTime(post.created_at_ms)}</td>
                 <td>
@@ -2109,9 +2116,14 @@ function AuditView({ notify }: { notify: (kind: ToastKind, text: string) => void
                 <div key={item.audit_id} className="audit-row">
                   <div>
                     <strong>{item.summary}</strong>
-                    <span>
-                      {item.operator} · {item.action} · {item.group_id || '全局'}
-                    </span>
+                    <span>{item.operator} · {item.action} · {item.group_id || '全局'}</span>
+                    {(item.subject_code || item.subject_sender || item.subject_preview) && (
+                      <small className="audit-readable">
+                        {item.subject_code || '-'}
+                        {item.subject_sender ? ` · ${item.subject_sender}` : ''}
+                        {item.subject_preview ? ` · ${item.subject_preview}` : ''}
+                      </small>
+                    )}
                   </div>
                   <div className="audit-row-side">
                     <small>{formatDateTime(item.created_at_ms)}</small>

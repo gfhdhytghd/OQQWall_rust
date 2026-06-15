@@ -79,6 +79,9 @@ struct WebviewAuditEntry {
     target_id: String,
     group_id: Option<String>,
     summary: String,
+    subject_code: Option<String>,
+    subject_sender: Option<String>,
+    subject_preview: Option<String>,
     status: String,
     created_at_ms: i64,
 }
@@ -182,6 +185,7 @@ struct PostListItem {
     external_code: Option<u64>,
     internal_code: Option<u32>,
     sender_id: Option<String>,
+    sender_name: Option<String>,
     created_at_ms: i64,
     last_error: Option<String>,
     preview_text: Option<String>,
@@ -317,6 +321,9 @@ struct AuditListItem {
     target_id: String,
     group_id: Option<String>,
     summary: String,
+    subject_code: Option<String>,
+    subject_sender: Option<String>,
+    subject_preview: Option<String>,
     status: String,
     created_at_ms: i64,
 }
@@ -1159,12 +1166,8 @@ async fn webview_list_posts(
         .skip(cursor)
         .take(limit)
         .map(|(_, meta)| {
-            let sender_id = guard
-                .session_ingress
-                .get(&meta.session_id)
-                .and_then(|ids| ids.first())
-                .and_then(|id| guard.ingress_meta.get(id))
-                .map(|ingress| ingress.user_id.clone());
+            let sender_id = primary_sender_id(&guard, meta);
+            let sender_name = primary_sender_name(&guard, meta);
             let review_code = meta
                 .review_id
                 .and_then(|id| guard.reviews.get(&id).map(|review| review.review_code));
@@ -1227,6 +1230,7 @@ async fn webview_list_posts(
                 external_code: guard.external_code_by_post.get(&meta.post_id).copied(),
                 internal_code: review_code,
                 sender_id,
+                sender_name,
                 created_at_ms: meta.created_at_ms,
                 last_error: meta.last_error.clone(),
                 preview_text,
@@ -1929,6 +1933,9 @@ async fn webview_list_audit(
             target_id: entry.target_id.clone(),
             group_id: entry.group_id.clone(),
             summary: entry.summary.clone(),
+            subject_code: entry.subject_code.clone(),
+            subject_sender: entry.subject_sender.clone(),
+            subject_preview: entry.subject_preview.clone(),
             status: entry.status.clone(),
             created_at_ms: entry.created_at_ms,
         })
@@ -2029,6 +2036,9 @@ async fn webview_save_filter_preset(
             target_id: preset_id,
             group_id: req.query.group_id.clone(),
             summary: format!("已保存筛选器：{}", req.name),
+            subject_code: None,
+            subject_sender: None,
+            subject_preview: None,
             status: "saved".to_string(),
             created_at_ms: now,
         },
@@ -2077,15 +2087,45 @@ async fn webview_decide_review(
         );
     }
     let audit_action = req.action.clone();
-    let summary = format!("执行稿件操作：{} #{}", audit_action, id_to_string(review_id));
-    let audit_group_id = match state.state.read() {
-        Ok(guard) => guard
-            .reviews
-            .get(&review_id)
-            .and_then(|review| guard.posts.get(&review.post_id))
-            .map(|post| post.group_id.clone()),
-        Err(_) => None,
+    let (audit_group_id, subject_code, subject_sender, subject_preview) = match state.state.read() {
+        Ok(guard) => {
+            if let Some(review) = guard.reviews.get(&review_id) {
+                if let Some(post) = guard.posts.get(&review.post_id) {
+                    (
+                        Some(post.group_id.clone()),
+                        guard
+                            .external_code_by_post
+                            .get(&post.post_id)
+                            .map(|code| format!("#{}", code))
+                            .or_else(|| Some(format!("#{}", review.review_code))),
+                        primary_sender_name(&guard, post).or_else(|| primary_sender_id(&guard, post)),
+                        post_preview_text(&guard, post.post_id),
+                    )
+                } else {
+                    (None, None, None, None)
+                }
+            } else {
+                (None, None, None, None)
+            }
+        }
+        Err(_) => (None, None, None, None),
     };
+    let summary = format!(
+        "{} {}{}{}",
+        ACTION_LABELS
+            .get(audit_action.as_str())
+            .copied()
+            .unwrap_or(audit_action.as_str()),
+        subject_code.clone().unwrap_or_else(|| format!("#{}", id_to_string(review_id))),
+        subject_sender
+            .as_ref()
+            .map(|sender| format!(" · {}", sender))
+            .unwrap_or_default(),
+        subject_preview
+            .as_ref()
+            .map(|preview| format!(" · {}", preview.chars().take(22).collect::<String>()))
+            .unwrap_or_default()
+    );
     append_audit_entry(
         &state,
         WebviewAuditEntry {
@@ -2096,6 +2136,9 @@ async fn webview_decide_review(
             target_id: id_to_string(review_id),
             group_id: audit_group_id,
             summary,
+            subject_code,
+            subject_sender,
+            subject_preview,
             status: "applied".to_string(),
             created_at_ms: now_ms(),
         },
@@ -2136,6 +2179,9 @@ async fn webview_decide_review_batch(
     let mut failed = Vec::new();
     let requested_count = req.review_ids.len();
     let mut batch_group_ids = HashSet::new();
+    let mut batch_subject_codes = Vec::new();
+    let mut batch_subject_senders = Vec::new();
+    let mut batch_subject_previews = Vec::new();
     for raw_review_id in req.review_ids {
         let Some(review_id) = parse_id128(&raw_review_id) else {
             failed.push(ReviewFailure {
@@ -2148,6 +2194,25 @@ async fn webview_decide_review_batch(
             if let Some(review) = guard.reviews.get(&review_id) {
                 if let Some(post) = guard.posts.get(&review.post_id) {
                     batch_group_ids.insert(post.group_id.clone());
+                    if batch_subject_codes.len() < 3 {
+                        batch_subject_codes.push(
+                            guard
+                                .external_code_by_post
+                                .get(&post.post_id)
+                                .map(|code| format!("#{}", code))
+                                .unwrap_or_else(|| format!("#{}", review.review_code)),
+                        );
+                    }
+                    if batch_subject_senders.len() < 3 {
+                        if let Some(sender) = primary_sender_name(&guard, post).or_else(|| primary_sender_id(&guard, post)) {
+                            batch_subject_senders.push(sender);
+                        }
+                    }
+                    if batch_subject_previews.len() < 2 {
+                        if let Some(preview) = post_preview_text(&guard, post.post_id) {
+                            batch_subject_previews.push(preview);
+                        }
+                    }
                 }
             }
         }
@@ -2189,7 +2254,30 @@ async fn webview_decide_review_batch(
             } else {
                 None
             },
-            summary: format!("批量执行 {}，成功 {} 条，失败 {} 条", requested_action, accepted, failed.len()),
+            summary: format!(
+                "批量{} {} 条 · {}",
+                ACTION_LABELS
+                    .get(requested_action.as_str())
+                    .copied()
+                    .unwrap_or(requested_action.as_str()),
+                accepted,
+                batch_subject_codes.iter().take(3).cloned().collect::<Vec<_>>().join("、")
+            ),
+            subject_code: if batch_subject_codes.is_empty() {
+                None
+            } else {
+                Some(batch_subject_codes.iter().take(3).cloned().collect::<Vec<_>>().join("、"))
+            },
+            subject_sender: if batch_subject_senders.is_empty() {
+                None
+            } else {
+                Some(batch_subject_senders.iter().take(3).cloned().collect::<Vec<_>>().join("、"))
+            },
+            subject_preview: if batch_subject_previews.is_empty() {
+                None
+            } else {
+                Some(batch_subject_previews.iter().take(2).cloned().collect::<Vec<_>>().join(" / "))
+            },
             status: if failed.is_empty() {
                 "applied".to_string()
             } else {
@@ -2510,6 +2598,7 @@ fn post_keyword_matches(
 
 fn build_post_list_item(snapshot: &StateView, post_id: Id128, meta: &PostMeta) -> PostListItem {
     let sender_id = primary_sender_id(snapshot, meta);
+    let sender_name = primary_sender_name(snapshot, meta);
     let review_code = meta
         .review_id
         .and_then(|id| snapshot.reviews.get(&id).map(|review| review.review_code));
@@ -2526,6 +2615,7 @@ fn build_post_list_item(snapshot: &StateView, post_id: Id128, meta: &PostMeta) -
         external_code: snapshot.external_code_by_post.get(&meta.post_id).copied(),
         internal_code: review_code,
         sender_id,
+        sender_name,
         created_at_ms: meta.created_at_ms,
         last_error: meta.last_error.clone(),
         preview_text,
