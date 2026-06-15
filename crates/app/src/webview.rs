@@ -2076,27 +2076,22 @@ async fn webview_decide_review(
             "engine command channel closed",
         );
     }
-    let summary = format!(
-        "执行稿件操作：{} #{}",
-        req.action,
-        id_to_string(review_id)
-    );
-    let audit_group_id = {
-        let Ok(guard) = state.state.read() else {
-            None
-        };
-        guard
+    let audit_action = req.action.clone();
+    let summary = format!("执行稿件操作：{} #{}", audit_action, id_to_string(review_id));
+    let audit_group_id = match state.state.read() {
+        Ok(guard) => guard
             .reviews
             .get(&review_id)
             .and_then(|review| guard.posts.get(&review.post_id))
-            .map(|post| post.group_id.clone())
+            .map(|post| post.group_id.clone()),
+        Err(_) => None,
     };
     append_audit_entry(
         &state,
         WebviewAuditEntry {
             audit_id: random_hex32(),
             operator: session.identity.username,
-            action: req.action.clone(),
+            action: audit_action,
             target_type: "review".to_string(),
             target_id: id_to_string(review_id),
             group_id: audit_group_id,
@@ -2124,8 +2119,9 @@ async fn webview_decide_review_batch(
         Ok(session) => session,
         Err(resp) => return resp,
     };
+    let requested_action = req.action.clone();
     let action_req = ReviewDecisionRequest {
-        action: req.action,
+        action: requested_action.clone(),
         comment: req.comment,
         delay_ms: req.delay_ms,
         text: req.text,
@@ -2138,7 +2134,6 @@ async fn webview_decide_review_batch(
     };
     let mut accepted = 0usize;
     let mut failed = Vec::new();
-    let requested_action = req.action.clone();
     let requested_count = req.review_ids.len();
     let mut batch_group_ids = HashSet::new();
     for raw_review_id in req.review_ids {
