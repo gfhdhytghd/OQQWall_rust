@@ -1661,6 +1661,9 @@ async fn webview_create_blacklist(
             target_id: req.sender_id,
             group_id: Some(req.group_id),
             summary: "已从后台加入黑名单".to_string(),
+            subject_code: None,
+            subject_sender: None,
+            subject_preview: None,
             status: "submitted".to_string(),
             created_at_ms: now_ms(),
         },
@@ -1712,6 +1715,9 @@ async fn webview_delete_blacklist(
             target_id: sender_id,
             group_id: Some(audit_group_id),
             summary: "已从后台移出黑名单".to_string(),
+            subject_code: None,
+            subject_sender: None,
+            subject_preview: None,
             status: "submitted".to_string(),
             created_at_ms: now_ms(),
         },
@@ -2112,10 +2118,7 @@ async fn webview_decide_review(
     };
     let summary = format!(
         "{} {}{}{}",
-        ACTION_LABELS
-            .get(audit_action.as_str())
-            .copied()
-            .unwrap_or(audit_action.as_str()),
+        review_action_label(audit_action.as_str()),
         subject_code.clone().unwrap_or_else(|| format!("#{}", id_to_string(review_id))),
         subject_sender
             .as_ref()
@@ -2256,10 +2259,7 @@ async fn webview_decide_review_batch(
             },
             summary: format!(
                 "批量{} {} 条 · {}",
-                ACTION_LABELS
-                    .get(requested_action.as_str())
-                    .copied()
-                    .unwrap_or(requested_action.as_str()),
+                review_action_label(requested_action.as_str()),
                 accepted,
                 batch_subject_codes.iter().take(3).cloned().collect::<Vec<_>>().join("、")
             ),
@@ -2978,6 +2978,28 @@ fn media_kind_to_string(kind: oqqwall_rust_core::draft::MediaKind) -> String {
         oqqwall_rust_core::draft::MediaKind::Sticker => "sticker",
     }
     .to_string()
+}
+
+fn review_action_label(action: &str) -> &str {
+    match action {
+        "approve" => "通过",
+        "reject" => "拒绝",
+        "delete" => "删除",
+        "defer" => "暂缓",
+        "skip" => "跳过",
+        "immediate" => "立即发送",
+        "refresh" => "刷新",
+        "rerender" => "重渲染",
+        "toggle_anonymous" => "切换匿名",
+        "expand_audit" => "展开审核",
+        "show" => "展示",
+        "comment" => "评论",
+        "reply" => "回复",
+        "blacklist" => "拉黑",
+        "quick_reply" => "快捷回复",
+        "merge" => "合并",
+        _ => action,
+    }
 }
 
 fn error_response(
