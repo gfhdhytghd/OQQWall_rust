@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::future::Future;
@@ -16,10 +16,13 @@ use oqqwall_rust_core::draft::{
     poke_marker, reply_marker,
 };
 use oqqwall_rust_core::event::{
-    BlobEvent, DraftEvent, Event, IngressEvent, InputStatusKind, MediaEvent, RenderEvent,
-    ReviewDecision, ReviewEvent, ReviewSubmitterNoticeKind, ScheduleEvent, SendEvent, SendPriority,
+    BlobEvent, DraftEvent, Event, IngressEvent, InputStatusKind, MediaEvent, QzonePublicationItem,
+    RenderEvent, ReviewDecision, ReviewEvent, ReviewSubmitterNoticeKind, ScheduleEvent, SendEvent,
+    SendPriority,
 };
-use oqqwall_rust_core::ids::{BlobId, ExternalCode, IngressId, PostId, ReviewCode, ReviewId};
+use oqqwall_rust_core::ids::{
+    AccountId, BlobId, ExternalCode, IngressId, PostId, RemotePostId, ReviewCode, ReviewId,
+};
 use oqqwall_rust_core::{Command, IngressCommand, StateView, derive_blob_id, derive_ingress_id};
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use std::path::{Path, PathBuf};
@@ -112,6 +115,13 @@ struct SendingInfo {
     started_at_ms: i64,
     batch_leader: PostId,
     batch_label: String,
+}
+
+#[derive(Debug, Clone)]
+struct QzonePublicationInfo {
+    group_id: String,
+    pending_withdraw: bool,
+    withdrawn: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +227,8 @@ struct NapCatState {
     blacklist: HashMap<String, HashMap<String, Option<String>>>,
     send_plans: HashMap<PostId, SendPlanInfo>,
     sending: HashMap<PostId, SendingInfo>,
+    qzone_publications_by_post:
+        HashMap<PostId, HashMap<(AccountId, RemotePostId), QzonePublicationInfo>>,
     audit_msg_to_review: HashMap<String, ReviewId>,
     processed_reviews: HashSet<ReviewId>,
     pending: HashMap<String, PendingAction>,
@@ -384,12 +396,80 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
             },
         );
     }
+    for (key, publication) in &view.qzone_publications {
+        register_qzone_publication(
+            &mut state,
+            &publication.group_id,
+            &key.account_id,
+            &key.remote_id,
+            &publication.items,
+            &publication.withdrawn_posts,
+            &publication.pending_withdrawn_posts,
+        );
+    }
     for (blob_id, meta) in &view.blobs {
         if let Some(path) = meta.persisted_path.as_ref() {
             state.blob_paths.insert(*blob_id, path.clone());
         }
     }
     state
+}
+
+fn register_qzone_publication(
+    state: &mut NapCatState,
+    group_id: &str,
+    account_id: &AccountId,
+    remote_id: &RemotePostId,
+    items: &[QzonePublicationItem],
+    withdrawn_posts: &BTreeSet<PostId>,
+    pending_withdrawn_posts: &BTreeSet<PostId>,
+) {
+    for item in items {
+        let publication = state
+            .qzone_publications_by_post
+            .entry(item.post_id)
+            .or_default()
+            .entry((account_id.clone(), remote_id.clone()))
+            .or_insert_with(|| QzonePublicationInfo {
+                group_id: group_id.to_string(),
+                pending_withdraw: false,
+                withdrawn: false,
+            });
+        publication.group_id = group_id.to_string();
+        publication.pending_withdraw |= pending_withdrawn_posts.contains(&item.post_id);
+        publication.withdrawn |= withdrawn_posts.contains(&item.post_id);
+    }
+}
+
+fn mark_qzone_publication_withdraw(
+    state: &mut NapCatState,
+    account_id: &AccountId,
+    remote_id: &RemotePostId,
+    post_ids: &[PostId],
+    pending_withdraw: bool,
+    withdrawn: Option<bool>,
+) {
+    let key = (account_id.clone(), remote_id.clone());
+    for post_id in post_ids {
+        let Some(publications) = state.qzone_publications_by_post.get_mut(post_id) else {
+            continue;
+        };
+        let Some(publication) = publications.get_mut(&key) else {
+            continue;
+        };
+        publication.pending_withdraw = pending_withdraw;
+        if let Some(withdrawn) = withdrawn {
+            publication.withdrawn = withdrawn;
+        }
+    }
+}
+
+fn effective_withdrawn_post_ids(post_id: PostId, withdrawn_post_ids: &[PostId]) -> Vec<PostId> {
+    if withdrawn_post_ids.is_empty() {
+        vec![post_id]
+    } else {
+        withdrawn_post_ids.to_vec()
+    }
 }
 
 #[derive(Clone)]
@@ -1569,6 +1649,50 @@ async fn build_action_from_event(
             });
             Some(payload.to_string())
         }
+        Event::Send(SendEvent::QzonePostPublished {
+            group_id,
+            account_id,
+            remote_id,
+            items,
+            ..
+        }) => {
+            let mut guard = state.lock().await;
+            register_qzone_publication(
+                &mut guard,
+                &group_id,
+                &account_id,
+                &remote_id,
+                &items,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            );
+            None
+        }
+        Event::Send(SendEvent::QzonePostWithdrawRequested {
+            post_id,
+            group_id,
+            account_id,
+            remote_id,
+            items,
+            withdrawn_post_ids,
+            ..
+        }) => {
+            let pending_withdrawn_posts =
+                effective_withdrawn_post_ids(post_id, &withdrawn_post_ids)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+            let mut guard = state.lock().await;
+            register_qzone_publication(
+                &mut guard,
+                &group_id,
+                &account_id,
+                &remote_id,
+                &items,
+                &BTreeSet::new(),
+                &pending_withdrawn_posts,
+            );
+            None
+        }
         Event::Send(SendEvent::SendSucceeded { post_id, .. }) => {
             let (group_id, send_code, submitter_id, _batch_label, _notify_group) = {
                 let mut guard = state.lock().await;
@@ -1779,9 +1903,24 @@ async fn build_action_from_event(
             });
             Some(payload.to_string())
         }
-        Event::Send(SendEvent::QzonePostWithdrawSucceeded { post_id, .. }) => {
+        Event::Send(SendEvent::QzonePostWithdrawSucceeded {
+            post_id,
+            account_id,
+            remote_id,
+            withdrawn_post_ids,
+            ..
+        }) => {
             let (group_id, label) = {
-                let guard = state.lock().await;
+                let mut guard = state.lock().await;
+                let effective_post_ids = effective_withdrawn_post_ids(post_id, &withdrawn_post_ids);
+                mark_qzone_publication_withdraw(
+                    &mut guard,
+                    &account_id,
+                    &remote_id,
+                    &effective_post_ids,
+                    false,
+                    Some(true),
+                );
                 let group_id = guard.post_group.get(&post_id).cloned().unwrap_or_default();
                 let label = post_code_text(&guard, post_id)
                     .map(|code| format!("#{}", code))
@@ -1804,9 +1943,24 @@ async fn build_action_from_event(
             });
             Some(payload.to_string())
         }
-        Event::Send(SendEvent::QzonePostWithdrawFailed { post_id, error, .. }) => {
+        Event::Send(SendEvent::QzonePostWithdrawFailed {
+            post_id,
+            account_id,
+            remote_id,
+            withdrawn_post_ids,
+            error,
+        }) => {
             let (group_id, label) = {
-                let guard = state.lock().await;
+                let mut guard = state.lock().await;
+                let effective_post_ids = effective_withdrawn_post_ids(post_id, &withdrawn_post_ids);
+                mark_qzone_publication_withdraw(
+                    &mut guard,
+                    &account_id,
+                    &remote_id,
+                    &effective_post_ids,
+                    false,
+                    None,
+                );
                 let group_id = guard.post_group.get(&post_id).cloned().unwrap_or_default();
                 let label = post_code_text(&guard, post_id)
                     .map(|code| format!("#{}", code))
@@ -3877,6 +4031,13 @@ fn validate_global_action(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QzoneWithdrawStatus {
+    Available,
+    AlreadyWithdrawnOrPending,
+    Missing,
+}
+
 fn validate_withdraw_action(
     state: &NapCatState,
     group_id: &str,
@@ -3891,16 +4052,51 @@ fn validate_withdraw_action(
     if info.group_id != group_id {
         return Err("无权限操作该稿件");
     }
-    let Some(plan) = state.send_plans.get(&info.post_id) else {
-        return Err("该稿件不在暂存区");
+    if let Some(plan) = state.send_plans.get(&info.post_id) {
+        if plan.group_id != group_id {
+            return Err("无权限操作该稿件");
+        }
+        if !state.post_external_code.contains_key(&info.post_id) {
+            return Err("该稿件缺少外部编号");
+        }
+        return Ok(());
+    }
+
+    match qzone_withdraw_status(state, group_id, info.post_id) {
+        QzoneWithdrawStatus::Available => {
+            if !state.post_external_code.contains_key(&info.post_id) {
+                return Err("该稿件缺少外部编号");
+            }
+            Ok(())
+        }
+        QzoneWithdrawStatus::AlreadyWithdrawnOrPending => Err("该稿件已撤回或正在撤回"),
+        QzoneWithdrawStatus::Missing => Err("该稿件不在暂存区且没有可撤回的空间动态"),
+    }
+}
+
+fn qzone_withdraw_status(
+    state: &NapCatState,
+    group_id: &str,
+    post_id: PostId,
+) -> QzoneWithdrawStatus {
+    let Some(publications) = state.qzone_publications_by_post.get(&post_id) else {
+        return QzoneWithdrawStatus::Missing;
     };
-    if plan.group_id != group_id {
-        return Err("无权限操作该稿件");
+    let mut has_current_group_publication = false;
+    for publication in publications.values() {
+        if publication.group_id != group_id {
+            continue;
+        }
+        has_current_group_publication = true;
+        if !publication.pending_withdraw && !publication.withdrawn {
+            return QzoneWithdrawStatus::Available;
+        }
     }
-    if !state.post_external_code.contains_key(&info.post_id) {
-        return Err("该稿件缺少外部编号");
+    if has_current_group_publication {
+        QzoneWithdrawStatus::AlreadyWithdrawnOrPending
+    } else {
+        QzoneWithdrawStatus::Missing
     }
-    Ok(())
 }
 
 fn build_pending_list_text(state: &NapCatState, group_id: &str) -> String {
@@ -4688,7 +4884,7 @@ const HELP_TEXT: &str = r#"全局指令:
 用法：调出 <review_code>
 
 撤回:
-将暂存区中的稿件撤回到待处理，并重排后续待发送稿件的外部编号
+将暂存区中的稿件撤回到待处理；已发送稿件会从对应空间动态移除图片并追加删除标记
 用法：撤回 <review_code>
 
 信息:
@@ -5393,7 +5589,7 @@ mod tests {
 
         assert_eq!(
             validate_withdraw_action(&state, "group-a", 42),
-            Err("该稿件不在暂存区")
+            Err("该稿件不在暂存区且没有可撤回的空间动态")
         );
 
         state.send_plans.insert(
@@ -5412,5 +5608,110 @@ mod tests {
 
         state.post_external_code.insert(post_id, 1001);
         assert_eq!(validate_withdraw_action(&state, "group-a", 42), Ok(()));
+    }
+
+    #[test]
+    fn validate_withdraw_accepts_published_post_with_external_code() {
+        let review_id = ReviewId::from_u128(10);
+        let post_id = PostId::from_u128(20);
+        let mut state = NapCatState::default();
+        state.review_by_code.insert(42, review_id);
+        state.review_info.insert(
+            review_id,
+            ReviewInfo {
+                review_code: 42,
+                post_id,
+                group_id: "group-a".to_string(),
+            },
+        );
+        state.post_external_code.insert(post_id, 1001);
+
+        register_qzone_publication(
+            &mut state,
+            "group-a",
+            &"account-a".to_string(),
+            &"tid-a".to_string(),
+            &[QzonePublicationItem {
+                post_id,
+                external_code: 1001,
+                image_offset: 0,
+                image_count: 1,
+            }],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(validate_withdraw_action(&state, "group-a", 42), Ok(()));
+    }
+
+    #[test]
+    fn validate_withdraw_rejects_published_post_without_external_code() {
+        let review_id = ReviewId::from_u128(10);
+        let post_id = PostId::from_u128(20);
+        let mut state = NapCatState::default();
+        state.review_by_code.insert(42, review_id);
+        state.review_info.insert(
+            review_id,
+            ReviewInfo {
+                review_code: 42,
+                post_id,
+                group_id: "group-a".to_string(),
+            },
+        );
+        register_qzone_publication(
+            &mut state,
+            "group-a",
+            &"account-a".to_string(),
+            &"tid-a".to_string(),
+            &[QzonePublicationItem {
+                post_id,
+                external_code: 1001,
+                image_offset: 0,
+                image_count: 1,
+            }],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(
+            validate_withdraw_action(&state, "group-a", 42),
+            Err("该稿件缺少外部编号")
+        );
+    }
+
+    #[test]
+    fn validate_withdraw_rejects_published_post_already_withdrawing() {
+        let review_id = ReviewId::from_u128(10);
+        let post_id = PostId::from_u128(20);
+        let mut state = NapCatState::default();
+        state.review_by_code.insert(42, review_id);
+        state.review_info.insert(
+            review_id,
+            ReviewInfo {
+                review_code: 42,
+                post_id,
+                group_id: "group-a".to_string(),
+            },
+        );
+        state.post_external_code.insert(post_id, 1001);
+        register_qzone_publication(
+            &mut state,
+            "group-a",
+            &"account-a".to_string(),
+            &"tid-a".to_string(),
+            &[QzonePublicationItem {
+                post_id,
+                external_code: 1001,
+                image_offset: 0,
+                image_count: 1,
+            }],
+            &BTreeSet::new(),
+            &BTreeSet::from([post_id]),
+        );
+
+        assert_eq!(
+            validate_withdraw_action(&state, "group-a", 42),
+            Err("该稿件已撤回或正在撤回")
+        );
     }
 }
