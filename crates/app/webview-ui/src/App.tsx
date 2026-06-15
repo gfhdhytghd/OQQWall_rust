@@ -25,23 +25,28 @@ import {
   Spinner,
   Switch,
   TextArea,
+  Toast,
   ToggleButton,
   ToggleButtonGroup,
-  Toast,
   toast,
 } from '@heroui/react'
 import {
   AlertCircle,
   BarChart3,
   Ban,
+  Bookmark,
   Check,
   CheckCircle2,
   Clock3,
   Eye,
+  FileClock,
+  FileSearch,
   FileText,
   HelpCircle,
+  History,
   Inbox,
   LayoutGrid,
+  LayoutDashboard,
   List,
   LogOut,
   MessageSquare,
@@ -51,29 +56,55 @@ import {
   Search,
   Send,
   ShieldCheck,
+  Sparkles,
   Trash2,
   UserRound,
+  Users,
   X,
   Zap,
 } from 'lucide-react'
 import { api } from './api/client'
 import {
   ACTION_LABELS,
+  AuditListResponse,
+  BlacklistItem,
+  BlacklistListResponse,
+  FailureItem,
+  FailureListResponse,
+  GroupHealthItem,
+  GroupHealthResponse,
   ListPostsResponse,
   ListReviewIdsResponse,
   MeResponse,
+  PostCollectionResponse,
   PostDetail,
   PostItem,
-  STAGE_LABELS,
+  SavedFilterListResponse,
+  SavedFilterPreset,
+  SimilarPostResponse,
   Stage,
   StatsResponse,
+  STAGE_LABELS,
 } from './api/types'
 
-type ViewKey = 'review' | 'stats'
+type ViewKey = 'overview' | 'review' | 'failures' | 'blacklist' | 'audit' | 'stats'
 type PostViewMode = 'cards' | 'list'
 type ToastKind = 'info' | 'success' | 'error'
 type SortOrder = 'asc' | 'desc'
 type SelectOption<T extends string = string> = { value: T; label: string }
+
+type ReviewFilters = {
+  stage: Stage
+  keyword: string
+  groupId: string
+  sortBy: string
+  sortOrder: SortOrder
+  onlyError: boolean
+  onlyActionable: boolean
+  page: number
+  pageSize: number
+}
+
 type PostQuerySnapshot = {
   stage: Stage
   keyword: string
@@ -86,8 +117,6 @@ type PostQuerySnapshot = {
   onlyActionable: boolean
 }
 
-const ACTIVE_EXCLUDED = new Set(['rejected', 'deleted', 'withdrawn', 'skipped', 'failed'])
-const PAGE_SIZES = [20, 50, 100, 200]
 const STAGE_OPTIONS: Array<SelectOption<Stage>> = [
   { value: '__active__', label: '全部活跃' },
   { value: '', label: '全部' },
@@ -103,12 +132,17 @@ const STAGE_OPTIONS: Array<SelectOption<Stage>> = [
   { value: 'manual', label: '人工处理' },
   { value: 'failed', label: '失败' },
 ]
+
 const SORT_OPTIONS: Array<SelectOption> = [
   { value: 'created_at:desc', label: '最新优先' },
   { value: 'created_at:asc', label: '最早优先' },
   { value: 'code:desc', label: '编号优先' },
   { value: 'stage:asc', label: '状态排序' },
+  { value: 'group_id:asc', label: '分组排序' },
 ]
+
+const PAGE_SIZES = [20, 50, 100, 200]
+const ACTIVE_EXCLUDED = new Set(['rejected', 'deleted', 'withdrawn', 'skipped', 'failed'])
 const BATCH_ACTIONS = ['approve', 'reject', 'delete', 'skip', 'immediate', 'refresh', 'rerender']
 const DANGEROUS_ACTIONS = new Set(['reject', 'delete', 'blacklist'])
 const LIST_PRIMARY_ACTIONS = ['approve', 'reject', 'delete'] as const
@@ -134,6 +168,8 @@ const DETAIL_ACTIONS = [
   'refresh',
   'rerender',
   'toggle_anonymous',
+  'expand_audit',
+  'show',
   'comment',
   'reply',
   'blacklist',
@@ -144,7 +180,7 @@ const DETAIL_ACTIONS = [
 function App() {
   const [me, setMe] = useState<MeResponse | null>(null)
   const [authChecked, setAuthChecked] = useState(false)
-  const [view, setView] = useState<ViewKey>('review')
+  const [view, setView] = useState<ViewKey>('overview')
 
   useEffect(() => {
     api<MeResponse>('/auth/me')
@@ -180,34 +216,15 @@ function App() {
 
   return (
     <HeroShell>
-      <div className="app-shell">
-        <aside className="sidebar">
-          <Brand />
-          <nav className="nav" aria-label="主导航">
-            <Button
-              className="nav-button"
-              variant={view === 'review' ? 'primary' : 'tertiary'}
-              fullWidth
-              onClick={() => setView('review')}
-            >
-              <Eye size={18} />
-              审核
-            </Button>
-            <Button
-              className="nav-button"
-              variant={view === 'stats' ? 'primary' : 'tertiary'}
-              fullWidth
-              onClick={() => setView('stats')}
-            >
-              <BarChart3 size={18} />
-              统计
-            </Button>
-          </nav>
+      <div className="admin-shell">
+        <aside className="admin-sidebar">
+          <Brand large />
+          <SidebarNav current={view} onChange={setView} />
           <Card className="account-card" variant="secondary">
             <Card.Content>
               <div className="account-name">{me.username}</div>
               <div className="account-role">
-                {me.role === 'global_admin' ? '全局管理员' : me.groups.join(', ')}
+                {me.role === 'global_admin' ? '全局管理员' : me.groups.join('、')}
               </div>
               <Button size="sm" variant="secondary" fullWidth onClick={logout}>
                 <LogOut size={16} />
@@ -217,10 +234,16 @@ function App() {
           </Card>
         </aside>
 
-        <main className="main">
-          {view === 'review' ? <ReviewView notify={notify} /> : <StatsView notify={notify} />}
+        <main className="admin-main">
+          {view === 'overview' && <OverviewView onJump={setView} notify={notify} />}
+          {view === 'review' && <ReviewView notify={notify} />}
+          {view === 'failures' && <FailuresView notify={notify} />}
+          {view === 'blacklist' && <BlacklistView notify={notify} />}
+          {view === 'audit' && <AuditView notify={notify} />}
+          {view === 'stats' && <StatsView notify={notify} />}
         </main>
       </div>
+      <MobileTabbar current={view} onChange={setView} />
     </HeroShell>
   )
 }
@@ -239,9 +262,75 @@ function Brand({ large = false }: { large?: boolean }) {
     <div className={large ? 'brand brand-large' : 'brand'}>
       <div>
         <strong>OQQWall</strong>
-        <span>审核后台</span>
+        <span>稿件管理后台</span>
       </div>
     </div>
+  )
+}
+
+function SidebarNav({
+  current,
+  onChange,
+}: {
+  current: ViewKey
+  onChange: (value: ViewKey) => void
+}) {
+  const items: Array<{ key: ViewKey; label: string; icon: React.ReactNode }> = [
+    { key: 'overview', label: '概览', icon: <LayoutDashboard size={18} /> },
+    { key: 'review', label: '主操作台', icon: <Eye size={18} /> },
+    { key: 'failures', label: '失败中心', icon: <AlertCircle size={18} /> },
+    { key: 'blacklist', label: '黑名单', icon: <Ban size={18} /> },
+    { key: 'audit', label: '操作审计', icon: <History size={18} /> },
+    { key: 'stats', label: '运行统计', icon: <BarChart3 size={18} /> },
+  ]
+
+  return (
+    <nav className="nav" aria-label="后台导航">
+      {items.map((item) => (
+        <Button
+          key={item.key}
+          className="nav-button"
+          variant={current === item.key ? 'primary' : 'tertiary'}
+          fullWidth
+          onClick={() => onChange(item.key)}
+        >
+          {item.icon}
+          {item.label}
+        </Button>
+      ))}
+    </nav>
+  )
+}
+
+function MobileTabbar({
+  current,
+  onChange,
+}: {
+  current: ViewKey
+  onChange: (value: ViewKey) => void
+}) {
+  const items: Array<{ key: ViewKey; label: string; icon: React.ReactNode }> = [
+    { key: 'overview', label: '概览', icon: <LayoutDashboard size={18} /> },
+    { key: 'review', label: '操作', icon: <Eye size={18} /> },
+    { key: 'failures', label: '失败', icon: <AlertCircle size={18} /> },
+    { key: 'blacklist', label: '黑名单', icon: <Ban size={18} /> },
+    { key: 'audit', label: '更多', icon: <History size={18} /> },
+  ]
+
+  return (
+    <nav className="mobile-tabbar" aria-label="移动端底部导航">
+      {items.map((item) => (
+        <button
+          key={item.key}
+          type="button"
+          className={current === item.key ? 'mobile-tab active' : 'mobile-tab'}
+          onClick={() => onChange(item.key)}
+        >
+          {item.icon}
+          <span>{item.label}</span>
+        </button>
+      ))}
+    </nav>
   )
 }
 
@@ -305,6 +394,182 @@ function LoginView({
   )
 }
 
+function OverviewView({
+  onJump,
+  notify,
+}: {
+  onJump: (value: ViewKey) => void
+  notify: (kind: ToastKind, text: string) => void
+}) {
+  const [stats, setStats] = useState<StatsResponse | null>(null)
+  const [groups, setGroups] = useState<GroupHealthItem[]>([])
+  const [failures, setFailures] = useState<FailureItem[]>([])
+  const [latestPosts, setLatestPosts] = useState<PostItem[]>([])
+  const [loading, setLoading] = useState(false)
+
+  async function loadOverview() {
+    setLoading(true)
+    try {
+      const [statsResult, groupsResult, failuresResult] = await Promise.all([
+        api<StatsResponse>('/api/stats'),
+        api<GroupHealthResponse>('/api/overview/groups'),
+        api<FailureListResponse>('/api/failures?limit=6'),
+      ])
+      setStats(statsResult)
+      setGroups(groupsResult.items)
+      setFailures(failuresResult.items)
+      const latestPostsResult = await api<ListPostsResponse>('/api/posts?active_only=true&limit=4&sort_by=created_at&sort_order=desc')
+      setLatestPosts(latestPostsResult.items)
+    } catch (error) {
+      notify('error', (error as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadOverview()
+  }, [])
+
+  return (
+    <div className="workspace">
+      <header className="page-head">
+        <div>
+          <h1>后台概览</h1>
+          <p>运营视角下的稿件健康、处理压力与异常告警</p>
+        </div>
+        <Button size="sm" variant="secondary" onClick={loadOverview}>
+          <RefreshCcw size={16} />
+          刷新概览
+        </Button>
+      </header>
+
+      {loading && !stats ? (
+        <LoadingPanel text="正在加载概览" />
+      ) : !stats ? (
+        <EmptyPanel icon={<LayoutDashboard size={28} />} text="暂无概览数据" />
+      ) : (
+        <>
+          <section className="metrics overview-metrics">
+            <Metric label="待审核" value={stats.pending_count} tone="warn" icon={<Clock3 size={18} />} />
+            <Metric label="今日投稿" value={stats.today_count} tone="good" icon={<Inbox size={18} />} />
+            <Metric label="异常告警" value={stats.error_count} tone="bad" icon={<AlertCircle size={18} />} />
+            <Metric label="可操作" value={stats.actionable_count} tone="neutral" icon={<Sparkles size={18} />} />
+          </section>
+
+          <section className="overview-grid">
+            <Card className="panel-card wide-card">
+              <Card.Header>
+                <Card.Title>快捷入口</Card.Title>
+              </Card.Header>
+              <Card.Content>
+                <div className="quick-entry-grid">
+                  <QuickEntryCard title="主操作台" text="直接进入高频审核工作区" icon={<Eye size={18} />} onClick={() => onJump('review')} />
+                  <QuickEntryCard title="失败中心" text="查看渲染、发布、状态异常" icon={<AlertCircle size={18} />} onClick={() => onJump('failures')} />
+                  <QuickEntryCard title="黑名单" text="维护风险投稿人与原因" icon={<Ban size={18} />} onClick={() => onJump('blacklist')} />
+                  <QuickEntryCard title="操作审计" text="回看人工管理动作" icon={<History size={18} />} onClick={() => onJump('audit')} />
+                </div>
+              </Card.Content>
+            </Card>
+
+            <Card className="panel-card">
+              <Card.Header>
+                <Card.Title>组别健康度</Card.Title>
+              </Card.Header>
+              <Card.Content>
+                <div className="list-stack">
+                  {groups.slice(0, 6).map((item) => (
+                    <div key={item.group_id} className="group-health-row">
+                      <div>
+                        <strong>{item.group_id}</strong>
+                        <span>
+                          待审 {item.pending_count} · 异常 {item.error_count} · 已发 {item.sent_count}
+                        </span>
+                      </div>
+                      <Chip size="sm" variant="soft">
+                        {formatDuration(item.avg_review_time_ms)}
+                      </Chip>
+                    </div>
+                  ))}
+                </div>
+              </Card.Content>
+            </Card>
+
+            <Card className="panel-card">
+              <Card.Header>
+                <Card.Title>最近告警</Card.Title>
+              </Card.Header>
+              <Card.Content>
+                <div className="list-stack">
+                  {failures.length ? (
+                    failures.map((item) => (
+                      <div key={`${item.post_id}-${item.source}`} className="failure-row">
+                        <div>
+                          <strong>#{item.review_code ?? '-'}</strong>
+                          <span>{item.group_id} · {item.source}</span>
+                        </div>
+                        <p>{item.error}</p>
+                      </div>
+                    ))
+                  ) : (
+                    <EmptyInline text="当前没有异常稿件" />
+                  )}
+                </div>
+              </Card.Content>
+            </Card>
+
+            <Card className="panel-card wide-card">
+              <Card.Header>
+                <Card.Title>最新稿件预览</Card.Title>
+              </Card.Header>
+              <Card.Content>
+                <div className="overview-preview-grid">
+                  {latestPosts.length ? (
+                    latestPosts.map((post) => (
+                      <article key={post.post_id} className="overview-preview-card">
+                        {post.preview_image_url ? (
+                          <img className="overview-preview-image" src={post.preview_image_url} alt="稿件预览" />
+                        ) : (
+                          <div className="overview-preview-fallback">
+                            <FileImageIcon />
+                          </div>
+                        )}
+                        <div className="overview-preview-meta">
+                          <strong>#{post.internal_code ?? post.external_code ?? '-'}</strong>
+                          <span>{post.group_id}</span>
+                          <p>{post.preview_text || '该稿件暂无文本预览'}</p>
+                        </div>
+                      </article>
+                    ))
+                  ) : (
+                    <EmptyInline text="当前没有可展示的最新稿件" />
+                  )}
+                </div>
+              </Card.Content>
+            </Card>
+
+            <Card className="panel-card wide-card">
+              <Card.Header>
+                <Card.Title>阶段分布</Card.Title>
+              </Card.Header>
+              <Card.Content>
+                <div className="stage-list">
+                  {Object.entries(stats.stage_breakdown).map(([stage, count]) => (
+                    <div key={stage}>
+                      <span>{STAGE_LABELS[stage] ?? stage}</span>
+                      <strong>{count}</strong>
+                    </div>
+                  ))}
+                </div>
+              </Card.Content>
+            </Card>
+          </section>
+        </>
+      )}
+    </div>
+  )
+}
+
 function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => void }) {
   const [posts, setPosts] = useState<PostItem[]>([])
   const [total, setTotal] = useState(0)
@@ -328,7 +593,10 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
   const [actionText, setActionText] = useState('')
   const [actionDelay, setActionDelay] = useState(180000)
   const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null)
-  const [postView, setPostView] = useState<PostViewMode>('cards')
+  const [postView, setPostView] = useState<PostViewMode>('list')
+  const [savedFilters, setSavedFilters] = useState<SavedFilterPreset[]>([])
+  const [recentOps, setRecentOps] = useState<Array<{ time: number; text: string }>>([])
+  const [presetName, setPresetName] = useState('')
   const compactDetail = useMediaQuery('(max-width: 980px)')
 
   const groups = useMemo(() => [...new Set(posts.map((post) => post.group_id))].sort(), [posts])
@@ -349,12 +617,16 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
   const showDetailPanel = !compactDetail && (!!detail || detailLoading)
 
   useEffect(() => {
-    loadPosts()
+    void loadPosts()
   }, [stage, groupId, sortBy, sortOrder, page, pageSize, onlyError, onlyActionable])
 
   useEffect(() => {
+    void loadSavedFilters()
+  }, [])
+
+  useEffect(() => {
     if (!autoRefresh) return
-    const id = window.setInterval(() => loadPosts(), 30000)
+    const id = window.setInterval(() => void loadPosts(), 30000)
     return () => window.clearInterval(id)
   }, [autoRefresh, stage, groupId, sortBy, sortOrder, page, pageSize, keyword, onlyError, onlyActionable])
 
@@ -402,6 +674,15 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
       notify('error', (error as Error).message)
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function loadSavedFilters() {
+    try {
+      const result = await api<SavedFilterListResponse>('/api/filter-presets')
+      setSavedFilters(result.items)
+    } catch {
+      // ignore
     }
   }
 
@@ -494,6 +775,7 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
         method: 'POST',
         body: JSON.stringify(buildActionPayload(action, textOverride ?? '', actionDelay)),
       })
+      pushRecentOp(`执行 ${ACTION_LABELS[action] ?? action}`)
       notify('success', `已执行：${ACTION_LABELS[action] ?? action}`)
       setActionText('')
       await loadPosts({ resetSelection: true })
@@ -517,6 +799,7 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
           ...buildActionPayload(batchAction, actionText, actionDelay),
         }),
       })
+      pushRecentOp(`批量执行 ${ACTION_LABELS[batchAction] ?? batchAction}（${currentSelectedCount} 条）`)
       notify('success', `批量执行完成：${ACTION_LABELS[batchAction] ?? batchAction}`)
       setSelected([])
       setSelectAllTotal(null)
@@ -527,6 +810,54 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
     } finally {
       setActionLoading(false)
     }
+  }
+
+  async function saveCurrentFilter() {
+    if (!presetName.trim()) {
+      notify('info', '请先填写筛选器名称')
+      return
+    }
+    try {
+      await api('/api/filter-presets', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: presetName.trim(),
+          query: {
+            stage,
+            keyword,
+            group_id: groupId,
+            sort_by: sortBy,
+            sort_order: sortOrder,
+            only_error: onlyError,
+            only_actionable: onlyActionable,
+            page_size: pageSize,
+          },
+        }),
+      })
+      setPresetName('')
+      await loadSavedFilters()
+      notify('success', '筛选器已保存')
+    } catch (error) {
+      notify('error', (error as Error).message)
+    }
+  }
+
+  function pushRecentOp(text: string) {
+    setRecentOps((prev) => [{ time: Date.now(), text }, ...prev].slice(0, 8))
+  }
+
+  function applyPreset(preset: SavedFilterPreset) {
+    setStage((preset.query.stage as Stage) || '__active__')
+    setKeyword(preset.query.keyword || '')
+    setGroupId(preset.query.group_id || '')
+    setSortBy(preset.query.sort_by || 'created_at')
+    setSortOrder((preset.query.sort_order as SortOrder) || 'desc')
+    setOnlyError(preset.query.only_error)
+    setOnlyActionable(preset.query.only_actionable)
+    setPageSize(preset.query.page_size || 50)
+    setPage(0)
+    setSelected([])
+    setSelectAllTotal(null)
   }
 
   return (
@@ -544,7 +875,7 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
           <Switch isSelected={autoRefresh} onChange={setAutoRefresh} size="sm">
             自动刷新
           </Switch>
-          <Button size="sm" variant="secondary" onClick={() => loadPosts()}>
+          <Button size="sm" variant="secondary" onClick={() => void loadPosts()}>
             <RefreshCcw size={16} />
             刷新
           </Button>
@@ -627,6 +958,16 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
             <Checkbox isSelected={onlyError} onChange={setOnlyError}>
               异常
             </Checkbox>
+            <Input
+              className="preset-input"
+              placeholder="保存当前筛选为..."
+              value={presetName}
+              onChange={(event) => setPresetName(event.target.value)}
+            />
+            <Button size="sm" variant="secondary" onClick={saveCurrentFilter}>
+              <Bookmark size={16} />
+              保存筛选
+            </Button>
           </div>
         </Card.Content>
       </Card>
@@ -715,7 +1056,7 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
             </header>
             <div className="feed-content">
               {loading && !posts.length ? (
-                <EmptyPanel icon={<Spinner />} text="正在加载稿件" />
+                <LoadingPanel text="正在加载稿件" />
               ) : visiblePosts.length ? (
                 postView === 'cards' ? (
                   <PostCards
@@ -726,7 +1067,7 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
                     actionLoading={actionLoading}
                     onToggle={toggleOne}
                     onOpen={openDetail}
-                    onAction={(reviewId, action, text) => runAction(reviewId, action, text)}
+                    onAction={(reviewId, action, text) => void runAction(reviewId, action, text)}
                   />
                 ) : (
                   <PostTable
@@ -737,7 +1078,7 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
                     actionLoading={actionLoading}
                     onToggle={toggleOne}
                     onOpen={openDetail}
-                    onAction={(reviewId, action, text) => runAction(reviewId, action, text)}
+                    onAction={(reviewId, action, text) => void runAction(reviewId, action, text)}
                   />
                 )
               ) : (
@@ -794,16 +1135,19 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
               actionDelay={actionDelay}
               hasPrev={detailIndex > 0}
               hasNext={detailIndex >= 0 && detailIndex < visiblePosts.length - 1}
+              savedFilters={savedFilters}
+              recentOps={recentOps}
+              onApplyPreset={applyPreset}
               onClose={() => setDetail(null)}
               onRefresh={refreshDetail}
               onTextChange={setActionText}
               onDelayChange={setActionDelay}
-              onAction={(action) => detail?.review_id && runAction(detail.review_id, action, actionText)}
-              onPrev={() => detailIndex > 0 && openDetail(visiblePosts[detailIndex - 1].post_id)}
+              onAction={(action) => detail?.review_id && void runAction(detail.review_id, action, actionText)}
+              onPrev={() => detailIndex > 0 && void openDetail(visiblePosts[detailIndex - 1].post_id)}
               onNext={() =>
                 detailIndex >= 0 &&
                 detailIndex < visiblePosts.length - 1 &&
-                openDetail(visiblePosts[detailIndex + 1].post_id)
+                void openDetail(visiblePosts[detailIndex + 1].post_id)
               }
             />
           </aside>
@@ -823,12 +1167,12 @@ function ReviewView({ notify }: { notify: (kind: ToastKind, text: string) => voi
           onRefresh={refreshDetail}
           onTextChange={setActionText}
           onDelayChange={setActionDelay}
-          onAction={(action) => detail?.review_id && runAction(detail.review_id, action, actionText)}
-          onPrev={() => detailIndex > 0 && openDetail(visiblePosts[detailIndex - 1].post_id)}
+          onAction={(action) => detail?.review_id && void runAction(detail.review_id, action, actionText)}
+          onPrev={() => detailIndex > 0 && void openDetail(visiblePosts[detailIndex - 1].post_id)}
           onNext={() =>
             detailIndex >= 0 &&
             detailIndex < visiblePosts.length - 1 &&
-            openDetail(visiblePosts[detailIndex + 1].post_id)
+            void openDetail(visiblePosts[detailIndex + 1].post_id)
           }
         />
       )}
@@ -921,14 +1265,11 @@ function PostCard({
 
   return (
     <article className="post-card-wrap">
-      <Card
-        className={active ? 'post-card active' : 'post-card'}
-        variant="secondary"
-      >
+      <Card className={active ? 'post-card active' : 'post-card'} variant="secondary">
         <Card.Header className="post-card-head">
           <button className="post-card-title-button" type="button" onClick={() => onOpen(post.post_id)}>
             <Card.Title>#{post.internal_code ?? post.external_code ?? '-'}</Card.Title>
-            <Card.Description>{post.sender_id ?? '未知投稿人'}</Card.Description>
+            <Card.Description>{post.sender_name || post.sender_id || '未知投稿人'}</Card.Description>
           </button>
           <div className="post-card-head-actions">
             <StageChip stage={post.stage} />
@@ -938,19 +1279,24 @@ function PostCard({
               </Chip>
             )}
             {post.review_id && (
-              <Checkbox
+              <button
+                type="button"
+                className={selectAllTotal !== null || selected.includes(post.review_id) ? 'list-checkbox checked' : 'list-checkbox'}
                 aria-label={`选择 ${post.internal_code ?? post.external_code ?? post.post_id}`}
-                isSelected={selectAllTotal !== null || selected.includes(post.review_id)}
-                onChange={(checked) => onToggle(post.review_id!, checked)}
-              />
+                aria-pressed={selectAllTotal !== null || selected.includes(post.review_id)}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onToggle(post.review_id!, !(selectAllTotal !== null || selected.includes(post.review_id!)))
+                }}
+              >
+                <Check size={14} />
+              </button>
             )}
           </div>
         </Card.Header>
         <Card.Content className="post-card-content">
           <button className="post-card-body" type="button" onClick={() => onOpen(post.post_id)}>
-            {post.preview_text && imageUrls.length === 0 && (
-              <span className="post-card-preview">{post.preview_text}</span>
-            )}
+            {post.preview_text && imageUrls.length === 0 && <span className="post-card-preview">{post.preview_text}</span>}
             {imageUrls.length > 0 ? (
               <DynamicPreviewImages urls={imageUrls} totalCount={imageCount} />
             ) : (
@@ -1091,16 +1437,10 @@ function PostTable({
                     {post.review_id ? (
                       <button
                         type="button"
-                        className={
-                          selectAllTotal !== null || selected.includes(post.review_id)
-                            ? 'list-checkbox checked'
-                            : 'list-checkbox'
-                        }
+                        className={selectAllTotal !== null || selected.includes(post.review_id) ? 'list-checkbox checked' : 'list-checkbox'}
                         aria-label={`选择 ${post.internal_code ?? post.external_code ?? post.post_id}`}
                         aria-pressed={selectAllTotal !== null || selected.includes(post.review_id)}
-                        onClick={() =>
-                          onToggle(post.review_id!, !(selectAllTotal !== null || selected.includes(post.review_id!)))
-                        }
+                        onClick={() => onToggle(post.review_id!, !(selectAllTotal !== null || selected.includes(post.review_id!)))}
                       >
                         <Check size={14} />
                       </button>
@@ -1114,12 +1454,15 @@ function PostTable({
                   <StageChip stage={post.stage} />
                 </td>
                 <td>
-                  <div className="list-preview">
-                    <div className="preview">{post.preview_text || (post.preview_image_url ? '[图片]' : '-')}</div>
-                    <span>
-                      {post.group_id} · {post.sender_id ?? '未知投稿人'}
-                    </span>
-                  </div>
+                    <div className="list-preview">
+                      {post.preview_image_url ? <img className="list-preview-thumb" src={post.preview_image_url} alt="稿件缩略图" /> : null}
+                      <div className="list-preview-text">
+                        <div className="preview">{post.preview_text || (post.preview_image_url ? '[图片]' : '-')}</div>
+                        <span>
+                        {post.group_id} · {post.sender_name || post.sender_id || '未知投稿人'}
+                        </span>
+                      </div>
+                    </div>
                 </td>
                 <td>{formatDateTime(post.created_at_ms)}</td>
                 <td>
@@ -1230,6 +1573,9 @@ type DetailContentProps = {
   actionDelay: number
   hasPrev: boolean
   hasNext: boolean
+  savedFilters?: SavedFilterPreset[]
+  recentOps?: Array<{ time: number; text: string }>
+  onApplyPreset?: (preset: SavedFilterPreset) => void
   onRefresh: () => void
   onTextChange: (value: string) => void
   onDelayChange: (value: number) => void
@@ -1239,7 +1585,7 @@ type DetailContentProps = {
 }
 
 function InlineDetailPanel(props: DetailContentProps & { onClose: () => void }) {
-  const { detail, loading, onClose } = props
+  const { detail, loading, onClose, savedFilters = [], recentOps = [], onApplyPreset } = props
 
   return (
     <section className="inline-detail-panel">
@@ -1257,7 +1603,54 @@ function InlineDetailPanel(props: DetailContentProps & { onClose: () => void }) 
       </header>
       <div className="inline-detail-body">
         {loading || detail ? (
-          <DetailContent {...props} />
+          <>
+            <DetailContent {...props} />
+            <section className="detail-side-panels">
+              <Card className="panel-card">
+                <Card.Header>
+                  <Card.Title>已保存筛选</Card.Title>
+                </Card.Header>
+                <Card.Content>
+                  <div className="list-stack">
+                    {savedFilters.length ? (
+                      savedFilters.map((preset) => (
+                        <button
+                          key={preset.preset_id}
+                          type="button"
+                          className="preset-row"
+                          onClick={() => onApplyPreset?.(preset)}
+                        >
+                          <strong>{preset.name}</strong>
+                          <span>{formatDateTime(preset.updated_at_ms)}</span>
+                        </button>
+                      ))
+                    ) : (
+                      <EmptyInline text="还没有保存的筛选器" />
+                    )}
+                  </div>
+                </Card.Content>
+              </Card>
+              <Card className="panel-card">
+                <Card.Header>
+                  <Card.Title>最近操作</Card.Title>
+                </Card.Header>
+                <Card.Content>
+                  <div className="list-stack">
+                    {recentOps.length ? (
+                      recentOps.map((item) => (
+                        <div key={`${item.time}-${item.text}`} className="audit-inline-row">
+                          <strong>{item.text}</strong>
+                          <span>{formatDateTime(item.time)}</span>
+                        </div>
+                      ))
+                    ) : (
+                      <EmptyInline text="当前没有最近操作记录" />
+                    )}
+                  </div>
+                </Card.Content>
+              </Card>
+            </section>
+          </>
         ) : (
           <EmptyPanel icon={<PanelRightOpen size={28} />} text="左侧选择稿件后在这里审核" />
         )}
@@ -1298,7 +1691,7 @@ function DetailContent({
           : '内容'
 
   if (loading || !detail) {
-    return <EmptyPanel icon={<Spinner />} text="正在加载详情" />
+    return <LoadingPanel text="正在加载详情" />
   }
 
   return (
@@ -1326,6 +1719,14 @@ function DetailContent({
         </Chip>
       </div>
 
+      {detail.render_png_blob_id && (
+        <Card className="image-card" variant="secondary">
+          <Card.Content>
+            <img src={`/api/blobs/${detail.render_png_blob_id}`} alt="渲染预览" />
+          </Card.Content>
+        </Card>
+      )}
+
       <Card className="detail-card" variant="secondary">
         <Card.Content>
           <dl className="kv">
@@ -1335,7 +1736,7 @@ function DetailContent({
             </div>
             <div>
               <dt>投稿人</dt>
-              <dd className="mono">{detail.sender_id ?? '-'}</dd>
+              <dd className="mono">{detail.sender_name || detail.sender_id || '-'}</dd>
             </div>
             <div>
               <dt>时间</dt>
@@ -1407,13 +1808,22 @@ function DetailContent({
         </Card.Content>
       </Card>
 
-      {detail.render_png_blob_id && (
-        <Card className="image-card" variant="secondary">
-          <Card.Content>
-            <img src={`/api/blobs/${detail.render_png_blob_id}`} alt="渲染预览" />
-          </Card.Content>
-        </Card>
-      )}
+      <Card className="panel-card">
+        <Card.Header>
+          <Card.Title>时间线</Card.Title>
+        </Card.Header>
+        <Card.Content>
+          <div className="timeline-list">
+            {detail.timeline.map((item, index) => (
+              <div key={`${item.label}-${index}`} className={`timeline-item timeline-${item.status}`}>
+                <strong>{item.label}</strong>
+                <span>{item.at_ms ? formatDateTime(item.at_ms) : '等待中'}</span>
+                {item.detail ? <p>{item.detail}</p> : null}
+              </div>
+            ))}
+          </div>
+        </Card.Content>
+      </Card>
 
       {detail.last_error && (
         <Card className="error-card" variant="secondary">
@@ -1485,13 +1895,257 @@ function DetailDrawer({
   )
 }
 
+function FailuresView({ notify }: { notify: (kind: ToastKind, text: string) => void }) {
+  const [data, setData] = useState<FailureListResponse | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  async function loadFailures() {
+    setLoading(true)
+    try {
+      setData(await api<FailureListResponse>('/api/failures?limit=100'))
+    } catch (error) {
+      notify('error', (error as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadFailures()
+  }, [])
+
+  return (
+    <div className="workspace">
+      <header className="page-head">
+        <div>
+          <h1>失败中心</h1>
+          <p>集中查看渲染失败、发布失败和稿件异常</p>
+        </div>
+        <Button size="sm" variant="secondary" onClick={loadFailures}>
+          <RefreshCcw size={16} />
+          刷新
+        </Button>
+      </header>
+
+      {loading && !data ? (
+        <LoadingPanel text="正在加载失败中心" />
+      ) : !data ? (
+        <EmptyPanel icon={<FileClock size={28} />} text="暂无失败数据" />
+      ) : (
+        <>
+          <section className="metrics">
+            <Metric label="异常总量" value={data.summary.total_count} tone="bad" icon={<AlertCircle size={18} />} />
+            <Metric label="阶段失败" value={data.summary.stage_failed_count} tone="warn" icon={<Zap size={18} />} />
+            <Metric label="渲染异常" value={data.summary.render_error_count} tone="bad" icon={<FileText size={18} />} />
+            <Metric label="审核发布异常" value={data.summary.review_publish_error_count} tone="bad" icon={<Send size={18} />} />
+          </section>
+          <Card className="panel-card">
+            <Card.Content>
+              <div className="failure-table">
+                {data.items.map((item) => (
+                  <div key={`${item.post_id}-${item.source}`} className="failure-table-row">
+                    <div>
+                      <strong>#{item.review_code ?? '-'}</strong>
+                      <span>{item.group_id} · {item.source}</span>
+                    </div>
+                    <p>{item.error}</p>
+                    <small>{item.preview_text || '无文本预览'}</small>
+                  </div>
+                ))}
+              </div>
+            </Card.Content>
+          </Card>
+        </>
+      )}
+    </div>
+  )
+}
+
+function BlacklistView({ notify }: { notify: (kind: ToastKind, text: string) => void }) {
+  const [items, setItems] = useState<BlacklistItem[]>([])
+  const [groupId, setGroupId] = useState('')
+  const [senderId, setSenderId] = useState('')
+  const [reason, setReason] = useState('')
+  const [loading, setLoading] = useState(false)
+
+  async function loadBlacklist() {
+    setLoading(true)
+    try {
+      const result = await api<BlacklistListResponse>('/api/blacklist')
+      setItems(result.items)
+    } catch (error) {
+      notify('error', (error as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadBlacklist()
+  }, [])
+
+  async function addBlacklist() {
+    if (!groupId.trim() || !senderId.trim()) {
+      notify('info', '请填写分组和投稿人')
+      return
+    }
+    try {
+      await api('/api/blacklist', {
+        method: 'POST',
+        body: JSON.stringify({
+          group_id: groupId.trim(),
+          sender_id: senderId.trim(),
+          reason: reason.trim() || null,
+        }),
+      })
+      setSenderId('')
+      setReason('')
+      await loadBlacklist()
+      notify('success', '已加入黑名单')
+    } catch (error) {
+      notify('error', (error as Error).message)
+    }
+  }
+
+  async function removeBlacklist(item: BlacklistItem) {
+    try {
+      await api(`/api/blacklist/${encodeURIComponent(item.group_id)}/${encodeURIComponent(item.sender_id)}`, {
+        method: 'POST',
+      })
+      await loadBlacklist()
+      notify('success', '已移出黑名单')
+    } catch (error) {
+      notify('error', (error as Error).message)
+    }
+  }
+
+  return (
+    <div className="workspace">
+      <header className="page-head">
+        <div>
+          <h1>黑名单管理</h1>
+          <p>维护风险投稿人、原因和分组归属</p>
+        </div>
+        <Button size="sm" variant="secondary" onClick={loadBlacklist}>
+          <RefreshCcw size={16} />
+          刷新
+        </Button>
+      </header>
+
+      <Card className="control-card">
+        <Card.Content>
+          <div className="toolbar-grid blacklist-form">
+            <Input placeholder="分组 ID" value={groupId} onChange={(event) => setGroupId(event.target.value)} />
+            <Input placeholder="投稿人 ID" value={senderId} onChange={(event) => setSenderId(event.target.value)} />
+            <Input placeholder="拉黑原因" value={reason} onChange={(event) => setReason(event.target.value)} />
+            <Button onClick={addBlacklist}>
+              <Ban size={16} />
+              加入黑名单
+            </Button>
+          </div>
+        </Card.Content>
+      </Card>
+
+      <Card className="panel-card">
+        <Card.Content>
+          {loading ? (
+            <LoadingPanel text="正在加载黑名单" />
+          ) : items.length ? (
+            <div className="list-stack">
+              {items.map((item) => (
+                <div key={`${item.group_id}-${item.sender_id}`} className="blacklist-row">
+                  <div>
+                    <strong>{item.sender_id}</strong>
+                    <span>{item.group_id}</span>
+                    {item.reason ? <p>{item.reason}</p> : null}
+                  </div>
+                  <Button size="sm" variant="danger-soft" onClick={() => void removeBlacklist(item)}>
+                    移除
+                  </Button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyPanel icon={<Ban size={28} />} text="当前没有黑名单记录" />
+          )}
+        </Card.Content>
+      </Card>
+    </div>
+  )
+}
+
+function AuditView({ notify }: { notify: (kind: ToastKind, text: string) => void }) {
+  const [items, setItems] = useState<AuditListResponse['items']>([])
+  const [loading, setLoading] = useState(false)
+
+  async function loadAudit() {
+    setLoading(true)
+    try {
+      const result = await api<AuditListResponse>('/api/audit?limit=100')
+      setItems(result.items)
+    } catch (error) {
+      notify('error', (error as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadAudit()
+  }, [])
+
+  return (
+    <div className="workspace">
+      <header className="page-head">
+        <div>
+          <h1>操作审计</h1>
+          <p>记录后台管理动作，便于追踪黑名单和筛选器等人工操作</p>
+        </div>
+        <Button size="sm" variant="secondary" onClick={loadAudit}>
+          <RefreshCcw size={16} />
+          刷新
+        </Button>
+      </header>
+      <Card className="panel-card">
+        <Card.Content>
+          {loading ? (
+            <LoadingPanel text="正在加载审计日志" />
+          ) : items.length ? (
+            <div className="list-stack">
+              {items.map((item) => (
+                <div key={item.audit_id} className="audit-row">
+                  <div>
+                    <strong>{item.summary}</strong>
+                    <span>{item.operator} · {item.action} · {item.group_id || '全局'}</span>
+                    {(item.subject_code || item.subject_sender || item.subject_preview) && (
+                      <small className="audit-readable">
+                        {item.subject_code || '-'}
+                        {item.subject_sender ? ` · ${item.subject_sender}` : ''}
+                        {item.subject_preview ? ` · ${item.subject_preview}` : ''}
+                      </small>
+                    )}
+                  </div>
+                  <div className="audit-row-side">
+                    <small>{formatDateTime(item.created_at_ms)}</small>
+                    <Chip size="sm" variant="soft">
+                      {item.status}
+                    </Chip>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyPanel icon={<History size={28} />} text="当前还没有审计记录" />
+          )}
+        </Card.Content>
+      </Card>
+    </div>
+  )
+}
+
 function StatsView({ notify }: { notify: (kind: ToastKind, text: string) => void }) {
   const [stats, setStats] = useState<StatsResponse | null>(null)
   const [loading, setLoading] = useState(false)
-
-  useEffect(() => {
-    loadStats()
-  }, [])
 
   async function loadStats() {
     setLoading(true)
@@ -1504,84 +2158,46 @@ function StatsView({ notify }: { notify: (kind: ToastKind, text: string) => void
     }
   }
 
-  if (loading && !stats) return <EmptyPanel icon={<Spinner />} text="正在加载统计" />
-  if (!stats) return <EmptyPanel icon={<BarChart3 size={28} />} text="暂无统计数据" />
+  useEffect(() => {
+    void loadStats()
+  }, [])
 
-  const maxDaily = Math.max(1, ...stats.daily_trend.map((item) => item.submitted))
-  const maxHourly = Math.max(1, ...stats.hourly_distribution.map((item) => item.count))
+  if (loading && !stats) return <LoadingPanel text="正在加载统计" />
+  if (!stats) return <EmptyPanel icon={<BarChart3 size={28} />} text="暂无统计数据" />
 
   return (
     <div className="workspace">
       <header className="page-head">
         <div>
           <h1>运行统计</h1>
-          <p>当前状态快照</p>
+          <p>保留原有统计能力，作为概览之外的详细数据页</p>
         </div>
         <Button size="sm" variant="secondary" onClick={loadStats}>
           <RefreshCcw size={16} />
           刷新
         </Button>
       </header>
-
-      <section className="metrics" aria-label="运行指标">
+      <section className="metrics">
         <Metric label="待审核" value={stats.pending_count} tone="warn" icon={<Clock3 size={18} />} />
         <Metric label="今日投稿" value={stats.today_count} tone="good" icon={<FileText size={18} />} />
         <Metric label="总投稿" value={stats.total_count} tone="neutral" icon={<Inbox size={18} />} />
-        <Metric label="平均审核" value={formatDuration(stats.avg_review_time_ms)} tone="neutral" icon={<UserRound size={18} />} />
+        <Metric label="平均审核" value={formatDuration(stats.avg_review_time_ms)} tone="neutral" icon={<Users size={18} />} />
       </section>
-
-      <section className="stats-grid">
-        <Card className="panel-card">
-          <Card.Header>
-            <Card.Title>状态分布</Card.Title>
-          </Card.Header>
-          <Card.Content>
-            <div className="stage-list">
-              {Object.entries(stats.stage_breakdown).map(([stage, count]) => (
-                <div key={stage}>
-                  <span>{STAGE_LABELS[stage] ?? stage}</span>
-                  <strong>{count}</strong>
-                </div>
-              ))}
-            </div>
-          </Card.Content>
-        </Card>
-        <Card className="panel-card">
-          <Card.Header>
-            <Card.Title>近 14 天</Card.Title>
-          </Card.Header>
-          <Card.Content>
-            <div className="bar-list">
-              {stats.daily_trend.map((item) => (
-                <div key={item.date} className="bar-row">
-                  <span>{item.date.slice(5)}</span>
-                  <div>
-                    <i style={{ width: `${(item.submitted / maxDaily) * 100}%` }} />
-                  </div>
-                  <strong>
-                    {item.submitted} / 拒{item.rejected} 删{item.deleted}
-                  </strong>
-                </div>
-              ))}
-            </div>
-          </Card.Content>
-        </Card>
-        <Card className="panel-card wide">
-          <Card.Header>
-            <Card.Title>小时分布</Card.Title>
-          </Card.Header>
-          <Card.Content>
-            <div className="hour-grid">
-              {stats.hourly_distribution.map((item) => (
-                <div key={item.hour} title={`${item.hour}:00 ${item.count} 条`}>
-                  <span style={{ opacity: 0.18 + (item.count / maxHourly) * 0.82 }} />
-                  <small>{item.hour}</small>
-                </div>
-              ))}
-            </div>
-          </Card.Content>
-        </Card>
-      </section>
+      <Card className="panel-card">
+        <Card.Header>
+          <Card.Title>状态分布</Card.Title>
+        </Card.Header>
+        <Card.Content>
+          <div className="stage-list">
+            {Object.entries(stats.stage_breakdown).map(([stage, count]) => (
+              <div key={stage}>
+                <span>{STAGE_LABELS[stage] ?? stage}</span>
+                <strong>{count}</strong>
+              </div>
+            ))}
+          </div>
+        </Card.Content>
+      </Card>
     </div>
   )
 }
@@ -1621,23 +2237,23 @@ function HeroSelect({
   )
 }
 
-function DelayField({
-  value,
-  onChange,
-  className,
+function QuickEntryCard({
+  title,
+  text,
+  icon,
+  onClick,
 }: {
-  value: number
-  onChange: (value: number) => void
-  className?: string
+  title: string
+  text: string
+  icon: React.ReactNode
+  onClick: () => void
 }) {
   return (
-    <NumberField className={className} value={value} minValue={1000} step={60000} onChange={onChange} aria-label="延迟毫秒">
-      <NumberField.Group>
-        <NumberField.DecrementButton>-</NumberField.DecrementButton>
-        <NumberField.Input />
-        <NumberField.IncrementButton>+</NumberField.IncrementButton>
-      </NumberField.Group>
-    </NumberField>
+    <button type="button" className="quick-entry-card" onClick={onClick}>
+      <div className="quick-entry-icon">{icon}</div>
+      <strong>{title}</strong>
+      <span>{text}</span>
+    </button>
   )
 }
 
@@ -1681,6 +2297,100 @@ function StageChip({ stage }: { stage: string }) {
   )
 }
 
+function EmptyPanel({ icon, text }: { icon: React.ReactNode; text: string }) {
+  return (
+    <EmptyState className="empty-state">
+      <div className="empty-icon">{icon}</div>
+      <span>{text}</span>
+    </EmptyState>
+  )
+}
+
+function EmptyInline({ text }: { text: string }) {
+  return <div className="empty-inline">{text}</div>
+}
+
+function LoadingPanel({ text }: { text: string }) {
+  return (
+    <div className="loading-panel">
+      <Spinner size="sm" />
+      <span>{text}</span>
+    </div>
+  )
+}
+
+function buildPostParams(filters: ReviewFilters) {
+  const params = new URLSearchParams()
+  if (filters.stage && filters.stage !== '__active__') params.set('stage', filters.stage)
+  if (filters.stage === '__active__') params.set('active_only', 'true')
+  if (filters.keyword.trim()) params.set('keyword', filters.keyword.trim())
+  if (filters.groupId) params.set('group_id', filters.groupId)
+  if (filters.onlyError) params.set('only_error', 'true')
+  if (filters.onlyActionable) params.set('actionable_only', 'true')
+  params.set('sort_by', filters.sortBy)
+  params.set('sort_order', filters.sortOrder)
+  params.set('cursor', String(filters.page * filters.pageSize))
+  params.set('limit', String(filters.pageSize))
+  return params
+}
+
+function buildActionPayload(action: string, text: string, delayMs = 180000) {
+  const trimmed = text.trim()
+  const payload: Record<string, unknown> = { action }
+  if (action === 'defer') payload.delay_ms = delayMs
+  if ((action === 'reject' || action === 'delete' || action === 'blacklist') && trimmed) payload.comment = trimmed
+  if ((action === 'comment' || action === 'reply') && trimmed) payload.text = trimmed
+  if (action === 'quick_reply' && trimmed) payload.quick_reply_key = trimmed
+  if (action === 'merge' && trimmed) payload.target_review_code = Number(trimmed)
+  return payload
+}
+
+function formatDateTime(ms: number) {
+  return new Date(ms).toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function formatDuration(ms: number | null) {
+  if (!ms) return '-'
+  const minutes = Math.round(ms / 60000)
+  if (minutes < 60) return `${minutes} 分钟`
+  return `${Math.round(minutes / 60)} 小时`
+}
+
+function showToast(kind: ToastKind, text: string) {
+  if (kind === 'success') toast.success(text)
+  else if (kind === 'error') toast.danger(text)
+  else toast.info(text)
+}
+
+function FileImageIcon() {
+  return <FileText size={20} />
+}
+
+function DelayField({
+  value,
+  onChange,
+  className,
+}: {
+  value: number
+  onChange: (value: number) => void
+  className?: string
+}) {
+  return (
+    <NumberField className={className} value={value} minValue={1000} step={60000} onChange={onChange} aria-label="延迟毫秒">
+      <NumberField.Group>
+        <NumberField.DecrementButton>-</NumberField.DecrementButton>
+        <NumberField.Input />
+        <NumberField.IncrementButton>+</NumberField.IncrementButton>
+      </NumberField.Group>
+    </NumberField>
+  )
+}
+
 function quickActionVariant(action: string): ComponentProps<typeof Button>['variant'] {
   if (action === 'reject' || action === 'delete' || action === 'blacklist') return 'danger-soft'
   if (action === 'approve') return undefined
@@ -1704,25 +2414,6 @@ function quickActionIcon(action: string) {
   if (action === 'refresh' || action === 'rerender') return <RefreshCcw size={16} />
   if (action === 'skip') return <HelpCircle size={16} />
   return null
-}
-
-function EmptyPanel({ icon, text }: { icon: React.ReactNode; text: string }) {
-  return (
-    <EmptyState className="empty-state">
-      <div className="empty-icon">{icon}</div>
-      <span>{text}</span>
-    </EmptyState>
-  )
-}
-
-function showToast(kind: ToastKind, text: string) {
-  if (kind === 'success') {
-    toast.success(text)
-  } else if (kind === 'error') {
-    toast.danger(text)
-  } else {
-    toast.info(text)
-  }
 }
 
 function useMediaQuery(query: string) {
@@ -1793,59 +2484,6 @@ function useMasonryLayout(dependencies: React.DependencyList) {
   }, dependencies)
 
   return gridRef
-}
-
-function buildPostParams({
-  stage,
-  keyword,
-  groupId,
-  sortBy,
-  sortOrder,
-  page,
-  pageSize,
-  onlyError,
-  onlyActionable,
-}: PostQuerySnapshot) {
-  const params = new URLSearchParams()
-  if (stage && stage !== '__active__') params.set('stage', stage)
-  if (stage === '__active__') params.set('active_only', 'true')
-  if (keyword.trim()) params.set('keyword', keyword.trim())
-  if (groupId) params.set('group_id', groupId)
-  if (onlyError) params.set('only_error', 'true')
-  if (onlyActionable) params.set('actionable_only', 'true')
-  params.set('sort_by', sortBy)
-  params.set('sort_order', sortOrder)
-  params.set('cursor', String(page * pageSize))
-  params.set('limit', String(pageSize))
-  return params
-}
-
-function buildActionPayload(action: string, text: string, delayMs: number) {
-  const payload: Record<string, unknown> = { action }
-  const trimmed = text.trim()
-  if (action === 'defer') payload.delay_ms = delayMs
-  if ((action === 'reject' || action === 'delete') && trimmed) payload.comment = trimmed
-  if (action === 'comment' || action === 'reply') payload.text = trimmed
-  if (action === 'blacklist') payload.comment = trimmed
-  if (action === 'quick_reply') payload.quick_reply_key = trimmed
-  if (action === 'merge') payload.target_review_code = Number(trimmed)
-  return payload
-}
-
-function formatDateTime(ms: number) {
-  return new Date(ms).toLocaleString('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-}
-
-function formatDuration(ms: number | null) {
-  if (!ms) return '-'
-  const minutes = Math.round(ms / 60000)
-  if (minutes < 60) return `${minutes} 分钟`
-  return `${Math.round(minutes / 60)} 小时`
 }
 
 export default App
