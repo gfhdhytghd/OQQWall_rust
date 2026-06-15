@@ -33,6 +33,7 @@ export interface PostItem {
   external_code: number | null
   internal_code: number | null
   sender_id: string | null
+  sender_name?: string | null
   created_at_ms: number
   last_error: string | null
   preview_text?: string
@@ -152,6 +153,9 @@ export interface AuditListItem {
   target_id: string
   group_id: string | null
   summary: string
+  subject_code: string | null
+  subject_sender: string | null
+  subject_preview: string | null
   status: string
   created_at_ms: number
 }

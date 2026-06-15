@@ -794,6 +794,14 @@ textarea {
   justify-items: end;
 }
 
+.audit-readable {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .mobile-tabbar {
   display: none;
 }
