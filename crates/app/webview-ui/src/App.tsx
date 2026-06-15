@@ -1921,7 +1921,7 @@ function FailuresView({ notify }: { notify: (kind: ToastKind, text: string) => v
       </header>
 
       {loading && !data ? (
-        <EmptyPanel icon={<Spinner />} text="正在加载失败中心" />
+        <LoadingPanel text="正在加载失败中心" />
       ) : !data ? (
         <EmptyPanel icon={<FileClock size={28} />} text="暂无失败数据" />
       ) : (
@@ -2042,7 +2042,7 @@ function BlacklistView({ notify }: { notify: (kind: ToastKind, text: string) => 
       <Card className="panel-card">
         <Card.Content>
           {loading ? (
-            <EmptyPanel icon={<Spinner />} text="正在加载黑名单" />
+            <LoadingPanel text="正在加载黑名单" />
           ) : items.length ? (
             <div className="list-stack">
               {items.map((item) => (
@@ -2150,7 +2150,7 @@ function StatsView({ notify }: { notify: (kind: ToastKind, text: string) => void
     void loadStats()
   }, [])
 
-  if (loading && !stats) return <EmptyPanel icon={<Spinner />} text="正在加载统计" />
+  if (loading && !stats) return <LoadingPanel text="正在加载统计" />
   if (!stats) return <EmptyPanel icon={<BarChart3 size={28} />} text="暂无统计数据" />
 
   return (

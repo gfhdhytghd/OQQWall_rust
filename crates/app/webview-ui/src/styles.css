@@ -782,9 +782,10 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  padding: 14px 16px;
+  padding: 10px 14px;
   background: var(--surface-soft);
   border-radius: 16px;
+  font-size: 13px;
 }
 
 .audit-row-side {
