@@ -2076,6 +2076,35 @@ async fn webview_decide_review(
             "engine command channel closed",
         );
     }
+    let summary = format!(
+        "执行稿件操作：{} #{}",
+        req.action,
+        id_to_string(review_id)
+    );
+    let audit_group_id = {
+        let Ok(guard) = state.state.read() else {
+            None
+        };
+        guard
+            .reviews
+            .get(&review_id)
+            .and_then(|review| guard.posts.get(&review.post_id))
+            .map(|post| post.group_id.clone())
+    };
+    append_audit_entry(
+        &state,
+        WebviewAuditEntry {
+            audit_id: random_hex32(),
+            operator: session.identity.username,
+            action: req.action.clone(),
+            target_type: "review".to_string(),
+            target_id: id_to_string(review_id),
+            group_id: audit_group_id,
+            summary,
+            status: "applied".to_string(),
+            created_at_ms: now_ms(),
+        },
+    );
     (
         StatusCode::OK,
         Json(ReviewDecisionResponse {
@@ -2109,6 +2138,9 @@ async fn webview_decide_review_batch(
     };
     let mut accepted = 0usize;
     let mut failed = Vec::new();
+    let requested_action = req.action.clone();
+    let requested_count = req.review_ids.len();
+    let mut batch_group_ids = HashSet::new();
     for raw_review_id in req.review_ids {
         let Some(review_id) = parse_id128(&raw_review_id) else {
             failed.push(ReviewFailure {
@@ -2117,6 +2149,13 @@ async fn webview_decide_review_batch(
             });
             continue;
         };
+        if let Ok(guard) = state.state.read() {
+            if let Some(review) = guard.reviews.get(&review_id) {
+                if let Some(post) = guard.posts.get(&review.post_id) {
+                    batch_group_ids.insert(post.group_id.clone());
+                }
+            }
+        }
         if !can_access_review(&state, &session.identity, review_id) {
             failed.push(ReviewFailure {
                 review_id: id_to_string(review_id),
@@ -2142,6 +2181,28 @@ async fn webview_decide_review_batch(
         }
         accepted = accepted.saturating_add(1);
     }
+    append_audit_entry(
+        &state,
+        WebviewAuditEntry {
+            audit_id: random_hex32(),
+            operator: session.identity.username,
+            action: format!("batch:{}", requested_action),
+            target_type: "review_batch".to_string(),
+            target_id: format!("accepted:{} requested:{}", accepted, requested_count),
+            group_id: if batch_group_ids.len() == 1 {
+                batch_group_ids.iter().next().cloned()
+            } else {
+                None
+            },
+            summary: format!("批量执行 {}，成功 {} 条，失败 {} 条", requested_action, accepted, failed.len()),
+            status: if failed.is_empty() {
+                "applied".to_string()
+            } else {
+                "partial".to_string()
+            },
+            created_at_ms: now_ms(),
+        },
+    );
 
     (
         StatusCode::OK,
