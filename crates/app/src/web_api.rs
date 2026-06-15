@@ -63,6 +63,15 @@ const SEND_PRIVATE_TIMEOUT_MS: u64 = 5_000;
 const AVATAR_WAIT_AFTER_FETCH_MS: i64 = 1_500;
 const AVATAR_WAIT_POLL_MS: u64 = 100;
 
+fn reply_preview_sender_label(preview: &ReplyPreview) -> &str {
+    preview
+        .meta
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("未知发送者")
+}
+
 #[derive(Clone)]
 struct ApiState {
     cmd_tx: tokio::sync::mpsc::Sender<Command>,
@@ -1516,9 +1525,18 @@ async fn get_post(
                             size_bytes: *size_bytes,
                         }
                     }
-                    oqqwall_rust_core::draft::DraftBlock::Reply { preview } => PostBlock::Text {
-                        text: format!("[回复] {}", preview.body),
-                    },
+                    oqqwall_rust_core::draft::DraftBlock::Reply { preview, text } => {
+                        let reply_text = text
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty());
+                        let label = reply_preview_sender_label(preview);
+                        PostBlock::Text {
+                            text: reply_text
+                                .map(|text| format!("[{}] {}\n{}", label, preview.body, text))
+                                .unwrap_or_else(|| format!("[{}] {}", label, preview.body)),
+                        }
+                    }
                     oqqwall_rust_core::draft::DraftBlock::Poke => PostBlock::Text {
                         text: "[戳一戳]".to_string(),
                     },
@@ -2855,10 +2873,7 @@ fn normalize_segments(
                     .and_then(|map| map.get("id"))
                     .and_then(value_to_string)
                     .filter(|value| !value.trim().is_empty());
-                let body = reply_id
-                    .as_ref()
-                    .map(|id| format!("引用的消息 ID: {}", id))
-                    .unwrap_or_else(|| "引用的消息".to_string());
+                let body = "引用的消息".to_string();
                 text.push_str(&reply_marker(&ReplyPreview {
                     id: reply_id,
                     meta: None,

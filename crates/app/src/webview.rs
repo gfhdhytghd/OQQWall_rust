@@ -11,7 +11,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use oqqwall_rust_core::draft::MediaReference;
 use oqqwall_rust_core::state::{PostMeta, PostStage};
-use oqqwall_rust_core::{Command, Id128, ReviewAction, ReviewActionCommand, StateView};
+use oqqwall_rust_core::{
+    Command, Id128, ReplyPreview, ReviewAction, ReviewActionCommand, StateView,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -34,6 +36,15 @@ macro_rules! debug_log {
 }
 
 const SESSION_COOKIE_NAME: &str = "oqqwall_webview_session";
+
+fn reply_preview_sender_label(preview: &ReplyPreview) -> &str {
+    preview
+        .meta
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("未知发送者")
+}
 
 #[derive(Clone)]
 struct WebviewState {
@@ -1431,9 +1442,18 @@ async fn webview_get_post(
                             size_bytes: *size_bytes,
                         }
                     }
-                    oqqwall_rust_core::draft::DraftBlock::Reply { preview } => PostBlock::Text {
-                        text: format!("[回复] {}", preview.body),
-                    },
+                    oqqwall_rust_core::draft::DraftBlock::Reply { preview, text } => {
+                        let reply_text = text
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty());
+                        let label = reply_preview_sender_label(preview);
+                        PostBlock::Text {
+                            text: reply_text
+                                .map(|text| format!("[{}] {}\n{}", label, preview.body, text))
+                                .unwrap_or_else(|| format!("[{}] {}", label, preview.body)),
+                        }
+                    }
                     oqqwall_rust_core::draft::DraftBlock::Poke => PostBlock::Text {
                         text: "[戳一戳]".to_string(),
                     },
@@ -2575,8 +2595,12 @@ fn post_keyword_matches(
                 oqqwall_rust_core::draft::DraftBlock::Attachment { kind, .. } => {
                     media_kind_to_string(*kind).contains(keyword_lower)
                 }
-                oqqwall_rust_core::draft::DraftBlock::Reply { preview } => {
+                oqqwall_rust_core::draft::DraftBlock::Reply { preview, text } => {
                     preview.body.to_ascii_lowercase().contains(keyword_lower)
+                        || text
+                            .as_deref()
+                            .map(|text| text.to_ascii_lowercase().contains(keyword_lower))
+                            .unwrap_or(false)
                 }
                 oqqwall_rust_core::draft::DraftBlock::Poke => "戳一戳".contains(keyword_lower),
                 oqqwall_rust_core::draft::DraftBlock::JsonCard { raw } => {
@@ -2658,8 +2682,17 @@ fn post_preview_text(snapshot: &StateView, post_id: Id128) -> Option<String> {
             oqqwall_rust_core::draft::DraftBlock::Paragraph { text } => {
                 Some(text.chars().take(100).collect::<String>())
             }
-            oqqwall_rust_core::draft::DraftBlock::Reply { preview } => {
-                Some(format!("[回复] {}", preview.body.chars().take(80).collect::<String>()))
+            oqqwall_rust_core::draft::DraftBlock::Reply { preview, text } => {
+                let body = text
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(preview.body.as_str());
+                Some(format!(
+                    "[{}] {}",
+                    reply_preview_sender_label(preview),
+                    body.chars().take(80).collect::<String>()
+                ))
             }
             _ => None,
         })

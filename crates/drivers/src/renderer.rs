@@ -11,7 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::avatar_cache;
 use crate::blob_cache::{self, CacheKind, CacheRetention};
 use crate::napcat::{
-    NapCatConfig, extract_message_lite, napcat_account_for_group, napcat_ws_request,
+    NapCatConfig, extract_message_lite_resolving_replies, fetch_reply_preview,
+    napcat_account_for_group, napcat_ws_request,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -59,7 +60,11 @@ macro_rules! debug_log {
 
 #[cfg(not(debug_assertions))]
 macro_rules! debug_log {
-    ($($arg:tt)*) => {};
+    ($($arg:tt)*) => {{
+        if false {
+            oqqwall_rust_infra::debug_log::log(format_args!($($arg)*));
+        }
+    }};
 }
 
 const FORWARD_PREFIX: &str = "[合并转发:";
@@ -91,8 +96,6 @@ const REPLY_WRAP_WIDTH_COMPENSATION_PX: u32 = 8;
 const SHADOW_SM_ALPHA: f32 = 0.10;
 const SHADOW_SM_BLUR_PX: f32 = 2.5;
 const TEXT_RASTER_STROKE_PX: f32 = 0.01;
-const TOP_LEVEL_TEXT_BUBBLE_WIDTH_SHRINK_PX: u32 = 6;
-const FORWARD_TEXT_BUBBLE_WIDTH_SHRINK_PX: u32 = 1;
 const FORWARD_FILE_CARD_WIDTH_SHRINK_PX: u32 = 1;
 const FORWARD_SINGLE_LINE_TEXT_HEIGHT_SHRINK_PX: u32 = 2;
 const REQUIRED_RES_FILES: &[&str] = &[
@@ -196,6 +199,7 @@ enum BlockKind {
     Reply {
         meta_lines: Vec<String>,
         body_lines: Vec<String>,
+        text_lines: Vec<InlineLine>,
     },
     Poke {
         image: Option<ResolvedImage>,
@@ -420,15 +424,7 @@ fn reply_meta_text(preview: &ReplyPreview) -> String {
     {
         return meta.to_string();
     }
-    if let Some(id) = preview
-        .id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return format!("id:{}", id);
-    }
-    "回复".to_string()
+    "未知发送者".to_string()
 }
 
 fn parse_json_card_view(raw: &str) -> JsonCardView {
@@ -1111,6 +1107,49 @@ fn layout_forward_items(
     (out, bottom)
 }
 
+fn text_bubble_width(
+    max_line_w: u32,
+    bubble_pad_left: u32,
+    bubble_pad_right: u32,
+    content_width: u32,
+) -> u32 {
+    max_line_w
+        .saturating_add(bubble_pad_left)
+        .saturating_add(bubble_pad_right)
+        .min(content_width)
+        .max(1)
+}
+
+fn reply_body_gap(body_line_count: usize, file_meta_gap: u32) -> u32 {
+    if body_line_count == 0 {
+        0
+    } else {
+        file_meta_gap
+    }
+}
+
+fn reply_text_gap(text_line_count: usize, file_meta_gap: u32) -> u32 {
+    if text_line_count == 0 {
+        0
+    } else {
+        file_meta_gap.saturating_add(2)
+    }
+}
+
+fn reply_inner_height(
+    meta_line_count: usize,
+    body_line_count: usize,
+    reply_inner_pad_y: u32,
+    reply_meta_line_height: u32,
+    reply_body_line_height: u32,
+    file_meta_gap: u32,
+) -> u32 {
+    reply_inner_pad_y * 2
+        + meta_line_count as u32 * reply_meta_line_height
+        + reply_body_gap(body_line_count, file_meta_gap)
+        + body_line_count as u32 * reply_body_line_height
+}
+
 fn layout_forward_child_block(
     block: &DraftBlock,
     x: u32,
@@ -1154,10 +1193,8 @@ fn layout_forward_child_block(
                 emoji_cache,
             );
             let max_line_w = lines.iter().map(|line| line.width).max().unwrap_or(0);
-            let width = (max_line_w + bubble_pad_left + bubble_pad_right)
-                .saturating_sub(FORWARD_TEXT_BUBBLE_WIDTH_SHRINK_PX)
-                .min(content_width)
-                .max(1);
+            let width =
+                text_bubble_width(max_line_w, bubble_pad_left, bubble_pad_right, content_width);
             let height = (bubble_pad_top + bubble_pad_bottom + line_height * lines.len() as u32)
                 .saturating_sub(if lines.len() == 1 {
                     FORWARD_SINGLE_LINE_TEXT_HEIGHT_SHRINK_PX
@@ -1325,7 +1362,7 @@ fn layout_forward_child_block(
                 })
             }
         },
-        DraftBlock::Reply { preview } => {
+        DraftBlock::Reply { preview, text } => {
             let width = content_width.max(1);
             let wrap_width = width.min(320).max(1);
             let reply_accent_width = 3u32;
@@ -1367,17 +1404,37 @@ fn layout_forward_child_block(
                 measurer,
                 emoji_cache,
             );
-            let body_gap = if body_lines.is_empty() {
-                0
+            let reply_text = text.as_deref().map(str::trim).unwrap_or("");
+            let text_lines = if reply_text.is_empty() {
+                Vec::new()
             } else {
-                file_meta_gap
+                let reply_text_max_w = width
+                    .saturating_sub(bubble_pad_left + bubble_pad_right)
+                    .max(1);
+                wrap_inline_text(
+                    reply_text,
+                    reply_text_max_w,
+                    font_size,
+                    face_size,
+                    font_weight_body,
+                    measurer,
+                    emoji_cache,
+                )
             };
-            let inner_height = reply_inner_pad_y * 2
-                + meta_lines.len() as u32 * reply_meta_line_height
-                + body_gap
-                + body_lines.len() as u32 * reply_body_line_height;
-            let height =
-                bubble_pad_top + bubble_pad_bottom + inner_height + reply_outer_extra_height;
+            let inner_height = reply_inner_height(
+                meta_lines.len(),
+                body_lines.len(),
+                reply_inner_pad_y,
+                reply_meta_line_height,
+                reply_body_line_height,
+                file_meta_gap,
+            );
+            let height = bubble_pad_top
+                + bubble_pad_bottom
+                + inner_height
+                + reply_outer_extra_height
+                + reply_text_gap(text_lines.len(), file_meta_gap)
+                + text_lines.len() as u32 * line_height;
             Some(BlockLayout {
                 x,
                 y,
@@ -1386,6 +1443,7 @@ fn layout_forward_child_block(
                 kind: BlockKind::Reply {
                     meta_lines,
                     body_lines,
+                    text_lines,
                 },
             })
         }
@@ -1862,6 +1920,8 @@ async fn handle_render_request(
 
     let header = extract_header(state, post_id);
     let draft = resolve_forward_draft(&draft, &header, config).await;
+    let draft = resolve_reply_draft(&draft, &header).await;
+    let draft = hydrate_remote_media_references(&draft).await;
     let (image_sources, used_keys) =
         resolve_image_sources(state, &draft, &header, cmd_tx, image_cache).await;
     let render_result = render_png_async(&draft, &header, &image_sources, config).await;
@@ -1982,19 +2042,191 @@ async fn resolve_forward_draft(
     Draft { blocks }
 }
 
+async fn resolve_reply_draft(draft: &Draft, header: &HeaderInfo) -> Draft {
+    let Some(account_id) = napcat_account_for_group(&header.group_id) else {
+        return draft.clone();
+    };
+    let blocks = resolve_reply_blocks(&draft.blocks, &account_id).await;
+    Draft { blocks }
+}
+
+fn resolve_reply_blocks<'a>(
+    source_blocks: &'a [DraftBlock],
+    account_id: &'a str,
+) -> Pin<Box<dyn Future<Output = Vec<DraftBlock>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut blocks = Vec::with_capacity(source_blocks.len());
+        for block in source_blocks {
+            match block {
+                DraftBlock::Reply { preview, text } if reply_preview_needs_resolve(preview) => {
+                    if let Some(id) = preview
+                        .id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                    {
+                        if let Some(resolved) = fetch_reply_preview(account_id, id).await {
+                            blocks.push(DraftBlock::Reply {
+                                preview: resolved,
+                                text: text.clone(),
+                            });
+                            continue;
+                        }
+                    }
+                    blocks.push(block.clone());
+                }
+                DraftBlock::Forward { items } => {
+                    let mut resolved_items = Vec::with_capacity(items.len());
+                    for item in items {
+                        resolved_items.push(ForwardItem {
+                            sender_name: item.sender_name.clone(),
+                            blocks: resolve_reply_blocks(&item.blocks, account_id).await,
+                        });
+                    }
+                    blocks.push(DraftBlock::Forward {
+                        items: resolved_items,
+                    });
+                }
+                _ => blocks.push(block.clone()),
+            }
+        }
+        blocks
+    })
+}
+
+fn reply_preview_needs_resolve(preview: &ReplyPreview) -> bool {
+    preview
+        .id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|id| !id.is_empty())
+        && (preview
+            .meta
+            .as_deref()
+            .map(str::trim)
+            .filter(|meta| !meta.is_empty())
+            .is_none()
+            || preview.body.trim() == "引用的消息")
+}
+
+async fn hydrate_remote_media_references(draft: &Draft) -> Draft {
+    Draft {
+        blocks: hydrate_remote_media_blocks(&draft.blocks).await,
+    }
+}
+
+fn hydrate_remote_media_blocks<'a>(
+    source_blocks: &'a [DraftBlock],
+) -> Pin<Box<dyn Future<Output = Vec<DraftBlock>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut blocks = Vec::with_capacity(source_blocks.len());
+        for block in source_blocks {
+            blocks.push(hydrate_remote_media_block(block).await);
+        }
+        blocks
+    })
+}
+
+fn hydrate_remote_media_block<'a>(
+    block: &'a DraftBlock,
+) -> Pin<Box<dyn Future<Output = DraftBlock> + Send + 'a>> {
+    Box::pin(async move {
+        match block {
+            DraftBlock::Attachment {
+                kind,
+                name,
+                reference,
+                size_bytes,
+            } if is_renderable_image(*kind) => {
+                let mut reference = reference.clone();
+                let mut size_bytes = *size_bytes;
+                if let MediaReference::RemoteUrl { url } = reference.clone() {
+                    if let Some((hydrated_url, hydrated_size)) =
+                        hydrate_remote_image_reference(&url).await
+                    {
+                        reference = MediaReference::RemoteUrl { url: hydrated_url };
+                        size_bytes = size_bytes.or(Some(hydrated_size));
+                    }
+                }
+                DraftBlock::Attachment {
+                    kind: *kind,
+                    name: name.clone(),
+                    reference,
+                    size_bytes,
+                }
+            }
+            DraftBlock::Forward { items } => {
+                let mut hydrated_items = Vec::with_capacity(items.len());
+                for item in items {
+                    hydrated_items.push(ForwardItem {
+                        sender_name: item.sender_name.clone(),
+                        blocks: hydrate_remote_media_blocks(&item.blocks).await,
+                    });
+                }
+                DraftBlock::Forward {
+                    items: hydrated_items,
+                }
+            }
+            _ => block.clone(),
+        }
+    })
+}
+
+async fn hydrate_remote_image_reference(source: &str) -> Option<(String, u64)> {
+    if !is_remote_http(source) {
+        return None;
+    }
+    let image = fetch_remote_image(source).await?;
+    let bytes = image.bytes?;
+    let size = u64::try_from(bytes.len()).ok()?;
+    Some((
+        format!("base64://{}", STANDARD.encode(bytes.as_ref())),
+        size,
+    ))
+}
+
 fn resolve_forward_blocks<'a>(
     source_blocks: &'a [DraftBlock],
     context: &'a mut Option<ForwardContext>,
     depth: u32,
 ) -> Pin<Box<dyn Future<Output = Vec<DraftBlock>> + Send + 'a>> {
     Box::pin(async move {
+        if let Some(context) = context.as_mut() {
+            return resolve_forward_blocks_with_context(source_blocks, context, depth).await;
+        }
+
         let mut blocks = Vec::new();
         for block in source_blocks {
             match block {
-                DraftBlock::Paragraph { text }
-                    if context.is_some() && text.contains(FORWARD_PREFIX) =>
-                {
-                    let mut expanded = expand_forward_in_text(text, context, depth).await;
+                DraftBlock::Forward { items } => {
+                    if depth >= MAX_FORWARD_DEPTH {
+                        blocks.push(DraftBlock::Paragraph {
+                            text: "[合并转发:层级过深]".to_string(),
+                        });
+                    } else {
+                        let items = resolve_forward_items(items, context, depth + 1).await;
+                        blocks.push(DraftBlock::Forward { items });
+                    }
+                }
+                _ => blocks.push(block.clone()),
+            }
+        }
+        blocks
+    })
+}
+
+fn resolve_forward_blocks_with_context<'a>(
+    source_blocks: &'a [DraftBlock],
+    context: &'a mut ForwardContext,
+    depth: u32,
+) -> Pin<Box<dyn Future<Output = Vec<DraftBlock>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut blocks = Vec::new();
+        for block in source_blocks {
+            match block {
+                DraftBlock::Paragraph { text } if text.contains(FORWARD_PREFIX) => {
+                    let mut expanded =
+                        expand_forward_in_text_with_context(text, context, depth).await;
                     blocks.append(&mut expanded);
                 }
                 DraftBlock::Forward { items } => {
@@ -2003,7 +2235,8 @@ fn resolve_forward_blocks<'a>(
                             text: "[合并转发:层级过深]".to_string(),
                         });
                     } else {
-                        let items = resolve_forward_items(items, context, depth + 1).await;
+                        let items =
+                            resolve_forward_items_with_context(items, context, depth + 1).await;
                         blocks.push(DraftBlock::Forward { items });
                     }
                 }
@@ -2023,6 +2256,24 @@ fn resolve_forward_items<'a>(
         let mut items = Vec::with_capacity(source_items.len());
         for item in source_items {
             let blocks = resolve_forward_blocks(&item.blocks, context, depth).await;
+            items.push(ForwardItem {
+                sender_name: item.sender_name.clone(),
+                blocks,
+            });
+        }
+        items
+    })
+}
+
+fn resolve_forward_items_with_context<'a>(
+    source_items: &'a [ForwardItem],
+    context: &'a mut ForwardContext,
+    depth: u32,
+) -> Pin<Box<dyn Future<Output = Vec<ForwardItem>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut items = Vec::with_capacity(source_items.len());
+        for item in source_items {
+            let blocks = resolve_forward_blocks_with_context(&item.blocks, context, depth).await;
             items.push(ForwardItem {
                 sender_name: item.sender_name.clone(),
                 blocks,
@@ -2087,21 +2338,6 @@ fn push_text_block(blocks: &mut Vec<DraftBlock>, text: &str) {
     blocks.push(DraftBlock::Paragraph {
         text: trimmed.to_string(),
     });
-}
-
-fn expand_forward_in_text<'a>(
-    text: &'a str,
-    context: &'a mut Option<ForwardContext>,
-    depth: u32,
-) -> Pin<Box<dyn Future<Output = Vec<DraftBlock>> + Send + 'a>> {
-    Box::pin(async move {
-        let Some(context) = context.as_mut() else {
-            let mut blocks = Vec::new();
-            push_text_block(&mut blocks, text);
-            return blocks;
-        };
-        expand_forward_in_text_with_context(text, context, depth).await
-    })
 }
 
 fn expand_forward_in_text_with_context<'a>(
@@ -2202,23 +2438,201 @@ async fn forward_messages_to_items(
 ) -> Vec<ForwardItem> {
     let mut items = Vec::new();
     for message in messages {
-        let payload = message.get("message").or_else(|| message.get("content"));
-        let extracted = extract_message_lite(payload);
-        let mut blocks = expand_forward_in_text_with_context(&extracted.text, context, depth).await;
-        for attachment in extracted.attachments {
-            blocks.push(DraftBlock::Attachment {
-                kind: attachment.kind,
-                name: attachment.name,
-                reference: attachment.reference,
-                size_bytes: attachment.size_bytes,
-            });
-        }
-        items.push(ForwardItem {
-            sender_name: forward_sender_name(message),
-            blocks,
-        });
+        items.push(forward_message_to_item(message, context, depth).await);
     }
     items
+}
+
+async fn forward_message_to_item(
+    message: &Value,
+    context: &mut ForwardContext,
+    depth: u32,
+) -> ForwardItem {
+    ForwardItem {
+        sender_name: forward_sender_name(message),
+        blocks: forward_message_to_blocks(message, context, depth).await,
+    }
+}
+
+async fn forward_message_to_blocks(
+    message: &Value,
+    context: &mut ForwardContext,
+    depth: u32,
+) -> Vec<DraftBlock> {
+    let payload = message
+        .get("message")
+        .or_else(|| message.get("content"))
+        .or_else(|| message.get("raw_message"));
+    forward_payload_to_blocks(payload, context, depth).await
+}
+
+fn forward_payload_to_blocks<'a>(
+    payload: Option<&'a Value>,
+    context: &'a mut ForwardContext,
+    depth: u32,
+) -> Pin<Box<dyn Future<Output = Vec<DraftBlock>> + Send + 'a>> {
+    Box::pin(async move {
+        if let Some(Value::Array(segments)) = payload {
+            return forward_segments_to_blocks(segments, context, depth).await;
+        }
+        let extracted = extract_message_lite_resolving_replies(payload, &context.account_id).await;
+        extracted_message_to_blocks(extracted, context, depth).await
+    })
+}
+
+async fn forward_segments_to_blocks(
+    segments: &[Value],
+    context: &mut ForwardContext,
+    depth: u32,
+) -> Vec<DraftBlock> {
+    let mut blocks = Vec::new();
+    let mut buffered_segments = Vec::new();
+
+    for segment in segments {
+        let segment_type = segment.get("type").and_then(Value::as_str).unwrap_or("");
+        if segment_type != "forward" {
+            buffered_segments.push(segment.clone());
+            continue;
+        }
+
+        flush_forward_segment_buffer(&mut buffered_segments, context, depth, &mut blocks).await;
+        let mut resolved = forward_segment_to_blocks(segment.get("data"), context, depth).await;
+        blocks.append(&mut resolved);
+    }
+
+    flush_forward_segment_buffer(&mut buffered_segments, context, depth, &mut blocks).await;
+    blocks
+}
+
+async fn flush_forward_segment_buffer(
+    buffered_segments: &mut Vec<Value>,
+    context: &mut ForwardContext,
+    depth: u32,
+    blocks: &mut Vec<DraftBlock>,
+) {
+    if buffered_segments.is_empty() {
+        return;
+    }
+
+    let payload = Value::Array(std::mem::take(buffered_segments));
+    let extracted =
+        extract_message_lite_resolving_replies(Some(&payload), &context.account_id).await;
+    let mut resolved = extracted_message_to_blocks(extracted, context, depth).await;
+    blocks.append(&mut resolved);
+}
+
+async fn extracted_message_to_blocks(
+    extracted: crate::napcat::ExtractedMessage,
+    context: &mut ForwardContext,
+    depth: u32,
+) -> Vec<DraftBlock> {
+    let message = IngressMessage {
+        text: extracted.text,
+        attachments: extracted.attachments,
+    };
+    let draft = build_draft_from_messages(&[message]);
+    resolve_forward_blocks_with_context(&draft.blocks, context, depth).await
+}
+
+async fn forward_segment_to_blocks(
+    data: Option<&Value>,
+    context: &mut ForwardContext,
+    depth: u32,
+) -> Vec<DraftBlock> {
+    if depth >= MAX_FORWARD_DEPTH {
+        return vec![DraftBlock::Paragraph {
+            text: "[合并转发:层级过深]".to_string(),
+        }];
+    }
+
+    if let Some(content) = data.and_then(|data| data.get("content")) {
+        let items = inline_forward_content_to_items(content, context, depth + 1).await;
+        if !items.is_empty() {
+            return vec![DraftBlock::Forward { items }];
+        }
+    }
+
+    if let Some(id) = data
+        .and_then(|data| data.get("id"))
+        .and_then(json_scalar_to_string)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return forward_blocks_for_id(&id, context, depth).await;
+    }
+
+    vec![DraftBlock::Paragraph {
+        text: "[合并转发]".to_string(),
+    }]
+}
+
+fn inline_forward_content_to_items<'a>(
+    content: &'a Value,
+    context: &'a mut ForwardContext,
+    depth: u32,
+) -> Pin<Box<dyn Future<Output = Vec<ForwardItem>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth >= MAX_FORWARD_DEPTH {
+            return Vec::new();
+        }
+
+        if let Some(messages) = content
+            .get("messages")
+            .or_else(|| content.get("data").and_then(|data| data.get("messages")))
+            .and_then(Value::as_array)
+        {
+            return forward_messages_to_items(messages, context, depth).await;
+        }
+
+        match content {
+            Value::Array(items) if looks_like_message_segments(items) => {
+                let blocks = forward_segments_to_blocks(items, context, depth).await;
+                if blocks.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![ForwardItem {
+                        sender_name: None,
+                        blocks,
+                    }]
+                }
+            }
+            Value::Array(messages) => forward_messages_to_items(messages, context, depth).await,
+            Value::Object(_) => {
+                let item = forward_message_to_item(content, context, depth).await;
+                if item.blocks.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![item]
+                }
+            }
+            _ => {
+                let blocks = forward_payload_to_blocks(Some(content), context, depth).await;
+                if blocks.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![ForwardItem {
+                        sender_name: None,
+                        blocks,
+                    }]
+                }
+            }
+        }
+    })
+}
+
+fn looks_like_message_segments(items: &[Value]) -> bool {
+    items
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str).is_some())
+}
+
+fn json_scalar_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn forward_sender_name(message: &Value) -> Option<String> {
@@ -2409,10 +2823,8 @@ fn render_png_pages(
                 for line in &lines {
                     max_line_w = max_line_w.max(line.width);
                 }
-                let bubble_w = (max_line_w + bubble_pad_left + bubble_pad_right)
-                    .saturating_sub(TOP_LEVEL_TEXT_BUBBLE_WIDTH_SHRINK_PX)
-                    .min(content_width)
-                    .max(1);
+                let bubble_w =
+                    text_bubble_width(max_line_w, bubble_pad_left, bubble_pad_right, content_width);
                 let height = bubble_pad_top + bubble_pad_bottom + line_height * lines.len() as u32;
                 BlockLayout {
                     x: content_padding,
@@ -2566,7 +2978,7 @@ fn render_png_pages(
                     }
                 }
             }
-            DraftBlock::Reply { preview } => {
+            DraftBlock::Reply { preview, text } => {
                 let width = content_width.max(1);
                 let wrap_width = width.min(320).max(1);
                 let reply_accent_width = 3u32;
@@ -2612,17 +3024,37 @@ fn render_png_pages(
                     &mut text_measurer,
                     &emoji_cache,
                 );
-                let body_gap = if body_lines.is_empty() {
-                    0
+                let reply_text = text.as_deref().map(str::trim).unwrap_or("");
+                let text_lines = if reply_text.is_empty() {
+                    Vec::new()
                 } else {
-                    file_meta_gap
+                    let reply_text_max_w = width
+                        .saturating_sub(bubble_pad_left + bubble_pad_right)
+                        .max(1);
+                    wrap_inline_text(
+                        reply_text,
+                        reply_text_max_w,
+                        font_size,
+                        face_size,
+                        font_weight_body,
+                        &mut text_measurer,
+                        &emoji_cache,
+                    )
                 };
-                let inner_height = reply_inner_pad_y * 2
-                    + meta_lines.len() as u32 * reply_meta_line_height
-                    + body_gap
-                    + body_lines.len() as u32 * reply_body_line_height;
-                let height =
-                    bubble_pad_top + bubble_pad_bottom + inner_height + reply_outer_extra_height;
+                let inner_height = reply_inner_height(
+                    meta_lines.len(),
+                    body_lines.len(),
+                    reply_inner_pad_y,
+                    reply_meta_line_height,
+                    reply_body_line_height,
+                    file_meta_gap,
+                );
+                let height = bubble_pad_top
+                    + bubble_pad_bottom
+                    + inner_height
+                    + reply_outer_extra_height
+                    + reply_text_gap(text_lines.len(), file_meta_gap)
+                    + text_lines.len() as u32 * line_height;
                 BlockLayout {
                     x: content_padding,
                     y: cursor_y,
@@ -2631,6 +3063,7 @@ fn render_png_pages(
                     kind: BlockKind::Reply {
                         meta_lines,
                         body_lines,
+                        text_lines,
                     },
                 }
             }
@@ -2782,13 +3215,18 @@ fn render_png_pages(
                     _name_lines.len()
                 );
             }
-            BlockKind::Reply { body_lines, .. } => {
+            BlockKind::Reply {
+                body_lines,
+                text_lines,
+                ..
+            } => {
                 debug_log!(
-                    "layout block: idx={} kind=reply width={} height={} body_lines={}",
+                    "layout block: idx={} kind=reply width={} height={} body_lines={} text_lines={}",
                     block_idx,
                     layout.width,
                     layout.height,
-                    body_lines.len()
+                    body_lines.len(),
+                    text_lines.len()
                 );
             }
             BlockKind::Poke { image } => {
@@ -3346,6 +3784,7 @@ fn render_png_pages(
                 BlockKind::Reply {
                     meta_lines,
                     body_lines,
+                    text_lines,
                 } => {
                     let rect = Rect::from_xywh(
                         block.x as f32,
@@ -3376,9 +3815,14 @@ fn render_png_pages(
                     let inner_width = block
                         .width
                         .saturating_sub(bubble_pad_left + bubble_pad_right);
-                    let inner_height = block
-                        .height
-                        .saturating_sub(bubble_pad_top + bubble_pad_bottom);
+                    let inner_height = reply_inner_height(
+                        meta_lines.len(),
+                        body_lines.len(),
+                        reply_inner_pad_y,
+                        reply_meta_line_height,
+                        reply_body_line_height,
+                        file_meta_gap,
+                    );
                     let inner_rect = Rect::from_xywh(
                         inner_x as f32,
                         inner_y as f32,
@@ -3437,6 +3881,33 @@ fn render_png_pages(
                             color_from_hex(0x333333),
                         );
                         baseline = baseline.saturating_add(reply_body_line_height);
+                    }
+                    let line_x = block.x + bubble_pad_left;
+                    let line_y = block
+                        .y
+                        .saturating_add(bubble_pad_top)
+                        .saturating_add(inner_height)
+                        .saturating_add(6)
+                        .saturating_add(reply_text_gap(text_lines.len(), file_meta_gap))
+                        .saturating_add(font_size);
+                    for (idx, line) in text_lines.iter().enumerate() {
+                        let baseline_y = line_y + line_height.saturating_mul(idx as u32);
+                        draw_inline_runs(
+                            canvas,
+                            &font_collection,
+                            &mut emoji_cache,
+                            &mut text_measurer,
+                            &mut face_cache,
+                            &mut face_image_cache,
+                            line,
+                            line_x,
+                            baseline_y,
+                            font_size,
+                            line_height,
+                            face_size,
+                            font_weight_body,
+                            color_text,
+                        );
                     }
                 }
                 BlockKind::Poke { image } => {
@@ -3880,6 +4351,7 @@ fn render_png_pages(
                                 BlockKind::Reply {
                                     meta_lines,
                                     body_lines,
+                                    text_lines,
                                 } => {
                                     let rect = Rect::from_xywh(
                                         child.x as f32,
@@ -3919,9 +4391,14 @@ fn render_png_pages(
                                     let inner_width = child
                                         .width
                                         .saturating_sub(bubble_pad_left + bubble_pad_right);
-                                    let inner_height = child
-                                        .height
-                                        .saturating_sub(bubble_pad_top + bubble_pad_bottom);
+                                    let inner_height = reply_inner_height(
+                                        meta_lines.len(),
+                                        body_lines.len(),
+                                        reply_inner_pad_y,
+                                        reply_meta_line_height,
+                                        reply_body_line_height,
+                                        file_meta_gap,
+                                    );
                                     let inner_rect = Rect::from_xywh(
                                         inner_x as f32,
                                         inner_y as f32,
@@ -3982,6 +4459,37 @@ fn render_png_pages(
                                         );
                                         baseline = baseline.saturating_add(reply_body_line_height);
                                     }
+                                    let line_x = child.x + bubble_pad_left;
+                                    let line_y = child
+                                        .y
+                                        .saturating_add(bubble_pad_top)
+                                        .saturating_add(inner_height)
+                                        .saturating_add(6)
+                                        .saturating_add(reply_text_gap(
+                                            text_lines.len(),
+                                            file_meta_gap,
+                                        ))
+                                        .saturating_add(font_size);
+                                    for (idx, line) in text_lines.iter().enumerate() {
+                                        let baseline_y =
+                                            line_y + line_height.saturating_mul(idx as u32);
+                                        draw_inline_runs(
+                                            canvas,
+                                            &font_collection,
+                                            &mut emoji_cache,
+                                            &mut text_measurer,
+                                            &mut face_cache,
+                                            &mut face_image_cache,
+                                            line,
+                                            line_x,
+                                            baseline_y,
+                                            font_size,
+                                            line_height,
+                                            face_size,
+                                            font_weight_body,
+                                            color_text,
+                                        );
+                                    }
                                 }
                                 BlockKind::Poke { image } => {
                                     let rect = Rect::from_xywh(
@@ -4027,7 +4535,6 @@ fn render_png_pages(
                                         bubble_pad_left,
                                         bubble_pad_right,
                                         bubble_pad_top,
-                                        bubble_pad_bottom,
                                         font_size,
                                         line_height,
                                         face_size,
@@ -4199,6 +4706,92 @@ impl BlockFrame {
             self.width as f32,
             self.height as f32,
         )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_inline_runs(
+    canvas: &Canvas,
+    font_collection: &FontCollection,
+    emoji_cache: &mut EmojiRenderCache,
+    text_measurer: &mut TextMeasurer,
+    face_cache: &mut HashMap<String, ResolvedImage>,
+    face_image_cache: &mut HashMap<String, Option<Image>>,
+    line: &InlineLine,
+    line_x: u32,
+    baseline_y: u32,
+    font_size: u32,
+    line_height: u32,
+    face_size: u32,
+    font_weight_body: u32,
+    color_text: Color4f,
+) {
+    let mut cursor_x = line_x;
+    for run in &line.runs {
+        match run {
+            InlineRun::Text(text) => {
+                if !text.is_empty() {
+                    draw_text_line(
+                        canvas,
+                        font_collection,
+                        emoji_cache,
+                        text,
+                        cursor_x as f32,
+                        baseline_y as f32,
+                        font_size,
+                        font_weight_body,
+                        color_text,
+                    );
+                    cursor_x = cursor_x.saturating_add(measure_inline_text_width(
+                        text,
+                        font_size,
+                        font_weight_body,
+                        text_measurer,
+                        emoji_cache,
+                    ));
+                }
+            }
+            InlineRun::Face { id } => {
+                if let Some(face) = resolve_face_image(id, face_cache) {
+                    let line_top = baseline_y.saturating_sub(font_size);
+                    let face_y = line_top.saturating_add(line_height.saturating_sub(face_size) / 2);
+                    let face_image = face_image_cache
+                        .entry(id.clone())
+                        .or_insert_with(|| decode_image(&face));
+                    if let Some(image) = face_image.as_ref() {
+                        draw_image_cover_rounded(
+                            canvas,
+                            image,
+                            Rect::from_xywh(
+                                cursor_x as f32,
+                                face_y as f32,
+                                face_size as f32,
+                                face_size as f32,
+                            ),
+                            3.0,
+                        );
+                    }
+                    cursor_x = cursor_x.saturating_add(face_size);
+                }
+            }
+            InlineRun::Emoji { glyph_id } => {
+                let line_top = baseline_y.saturating_sub(font_size);
+                let emoji_y = line_top.saturating_add(line_height.saturating_sub(face_size) / 2);
+                if let Some(image) = emoji_cache.resolve_image_by_gid(*glyph_id) {
+                    draw_image_stretch(
+                        canvas,
+                        &image,
+                        Rect::from_xywh(
+                            cursor_x as f32,
+                            emoji_y as f32,
+                            face_size as f32,
+                            face_size as f32,
+                        ),
+                    );
+                }
+                cursor_x = cursor_x.saturating_add(face_size);
+            }
+        }
     }
 }
 
@@ -4684,7 +5277,6 @@ struct ForwardDrawContext<'a> {
     bubble_pad_left: u32,
     bubble_pad_right: u32,
     bubble_pad_top: u32,
-    bubble_pad_bottom: u32,
     font_size: u32,
     line_height: u32,
     face_size: u32,
@@ -4830,7 +5422,8 @@ impl ForwardDrawContext<'_> {
             BlockKind::Reply {
                 meta_lines,
                 body_lines,
-            } => self.draw_reply(frame, &meta_lines, &body_lines),
+                text_lines,
+            } => self.draw_reply(frame, &meta_lines, &body_lines, &text_lines),
             BlockKind::Poke { image } => self.draw_poke(frame, image.as_ref()),
             BlockKind::Forward { items } => self.draw_forward(frame, &items),
         }
@@ -5069,7 +5662,13 @@ impl ForwardDrawContext<'_> {
         );
     }
 
-    fn draw_reply(&mut self, frame: BlockFrame, meta_lines: &[String], body_lines: &[String]) {
+    fn draw_reply(
+        &mut self,
+        frame: BlockFrame,
+        meta_lines: &[String],
+        body_lines: &[String],
+        text_lines: &[InlineLine],
+    ) {
         let rr = RRect::new_rect_xy(frame.rect(), self.radius_lg as f32, self.radius_lg as f32);
         draw_shadowed_rrect(self.canvas, rr, SHADOW_SM_BLUR_PX, SHADOW_SM_ALPHA);
         let mut bubble_bg = Paint::default();
@@ -5092,9 +5691,14 @@ impl ForwardDrawContext<'_> {
         let inner_width = frame
             .width
             .saturating_sub(self.bubble_pad_left + self.bubble_pad_right);
-        let inner_height = frame
-            .height
-            .saturating_sub(self.bubble_pad_top + self.bubble_pad_bottom);
+        let inner_height = reply_inner_height(
+            meta_lines.len(),
+            body_lines.len(),
+            reply_inner_pad_y,
+            reply_meta_line_height,
+            reply_body_line_height,
+            self.file_meta_gap,
+        );
         let inner_rect = Rect::from_xywh(
             inner_x as f32,
             inner_y as f32,
@@ -5154,6 +5758,18 @@ impl ForwardDrawContext<'_> {
                 color_from_hex(0x333333),
             );
             baseline = baseline.saturating_add(reply_body_line_height);
+        }
+        let line_x = frame.x + self.bubble_pad_left;
+        let line_y = frame
+            .y
+            .saturating_add(self.bubble_pad_top)
+            .saturating_add(inner_height)
+            .saturating_add(6)
+            .saturating_add(reply_text_gap(text_lines.len(), self.file_meta_gap))
+            .saturating_add(self.font_size);
+        for (idx, line) in text_lines.iter().enumerate() {
+            let baseline_y = line_y + self.line_height.saturating_mul(idx as u32);
+            self.draw_inline_line(line, line_x, baseline_y);
         }
     }
 
@@ -6263,9 +6879,12 @@ fn resolve_media_reference_for_image(
             image_cache.get_or_load_blob(state, *blob_id)
         }
         MediaReference::RemoteUrl { url } => {
-            debug_log!("media image: remote url={}", url);
+            debug_log!("media image: remote url={}", media_source_for_log(url));
             if is_remote_http(url) {
-                debug_log!("image load blocked remote url: {}", url);
+                debug_log!(
+                    "image load blocked remote url: {}",
+                    media_source_for_log(url)
+                );
                 return None;
             }
             let key = ImageCacheKey::Source(url.clone());
@@ -6289,13 +6908,24 @@ fn resolve_media_reference_for_video_preview(
         }
         MediaReference::RemoteUrl { url } => {
             if is_remote_http(url) {
-                debug_log!("video preview load blocked remote url: {}", url);
+                debug_log!(
+                    "video preview load blocked remote url: {}",
+                    media_source_for_log(url)
+                );
                 return None;
             }
             let key = ImageCacheKey::Source(format!("video-preview:{}", url));
             used_keys.insert(key);
             image_cache.get_or_load_video_preview_source(url)
         }
+    }
+}
+
+fn media_source_for_log(source: &str) -> &str {
+    if source.starts_with("base64://") || source.starts_with("data:") {
+        "<inline-media>"
+    } else {
+        source
     }
 }
 
@@ -7744,6 +8374,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn text_bubble_width_preserves_horizontal_padding_when_not_capped() {
+        let line_width = 200;
+        let pad_left = 8;
+        let pad_right = 8;
+
+        let width = text_bubble_width(line_width, pad_left, pad_right, 354);
+
+        assert_eq!(width, line_width + pad_left + pad_right);
+    }
+
+    #[test]
+    fn text_bubble_width_caps_at_content_width() {
+        assert_eq!(text_bubble_width(400, 8, 8, 354), 354);
+    }
+
+    #[test]
+    fn reply_meta_text_uses_sender_name_and_does_not_expose_reply_id() {
+        let preview = ReplyPreview {
+            id: Some("42".to_string()),
+            meta: Some("Alice".to_string()),
+            body: "quoted".to_string(),
+            missing: false,
+        };
+
+        assert_eq!(reply_meta_text(&preview), "Alice");
+    }
+
+    #[test]
+    fn reply_meta_text_falls_back_without_reply_id() {
+        let preview = ReplyPreview {
+            id: Some("42".to_string()),
+            meta: None,
+            body: "quoted".to_string(),
+            missing: false,
+        };
+
+        assert_eq!(reply_meta_text(&preview), "未知发送者");
+    }
+
+    #[test]
+    fn reply_preview_resolve_needed_only_for_fallback_preview() {
+        let fallback = ReplyPreview {
+            id: Some("42".to_string()),
+            meta: None,
+            body: "引用的消息".to_string(),
+            missing: false,
+        };
+        let resolved = ReplyPreview {
+            id: Some("42".to_string()),
+            meta: Some("Alice".to_string()),
+            body: "quoted".to_string(),
+            missing: false,
+        };
+
+        assert!(reply_preview_needs_resolve(&fallback));
+        assert!(!reply_preview_needs_resolve(&resolved));
+    }
+
+    #[test]
     fn render_png_pages_splits_long_text() {
         let draft = Draft {
             blocks: (0..80)
@@ -7943,5 +8632,163 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(nested_text, vec!["deep content"]);
+    }
+
+    #[tokio::test]
+    async fn inline_forward_segment_content_expands_without_fetching_id() {
+        let payload = json!([
+            {
+                "type": "forward",
+                "data": {
+                    "id": "unavailable-forward-id",
+                    "content": {
+                        "sender": { "nickname": "Inner Sender" },
+                        "message": [
+                            { "type": "text", "data": { "text": "deep content" } }
+                        ]
+                    }
+                }
+            }
+        ]);
+        let mut context = ForwardContext {
+            account_id: "test-account".to_string(),
+            cache: HashMap::new(),
+            seen: HashSet::new(),
+        };
+
+        let blocks = forward_payload_to_blocks(Some(&payload), &mut context, 0).await;
+
+        assert!(
+            context.seen.is_empty(),
+            "inline content should not fetch by id"
+        );
+        let DraftBlock::Forward { items } = &blocks[0] else {
+            panic!("inline content should become a forward block");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].sender_name.as_deref(), Some("Inner Sender"));
+        assert_eq!(
+            items[0]
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    DraftBlock::Paragraph { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["deep content"]
+        );
+    }
+
+    #[test]
+    fn render_forward_inline_base64_image_draws_image_pixels() {
+        let image = image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 0, 255]));
+        let mut cursor = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("encode test png");
+        let image_url = format!("base64://{}", STANDARD.encode(cursor.into_inner()));
+        let draft = Draft {
+            blocks: vec![DraftBlock::Forward {
+                items: vec![ForwardItem {
+                    sender_name: Some("Image Sender".to_string()),
+                    blocks: vec![DraftBlock::Attachment {
+                        kind: MediaKind::Image,
+                        name: Some("red.png".to_string()),
+                        reference: MediaReference::RemoteUrl { url: image_url },
+                        size_bytes: None,
+                    }],
+                }],
+            }],
+        };
+        let image_sources = RenderImageSources {
+            avatar: None,
+            block_images: vec![None],
+            block_tag_icons: vec![None],
+            block_brand_icons: vec![None],
+            block_labels: vec![None],
+        };
+
+        let pages = render_png_pages(
+            &draft,
+            &HeaderInfo::from(RenderPreviewHeader::default()),
+            &image_sources,
+            &RendererRuntimeConfig::default(),
+        )
+        .unwrap();
+        let rendered = image::load_from_memory(&pages[0])
+            .expect("rendered png should decode")
+            .to_rgba8();
+        let red_pixels = rendered
+            .pixels()
+            .filter(|pixel| pixel[0] > 220 && pixel[1] < 40 && pixel[2] < 40 && pixel[3] > 200)
+            .count();
+
+        assert!(red_pixels > 100, "forward image should draw red pixels");
+    }
+
+    #[tokio::test]
+    async fn hydrate_remote_media_references_recurses_into_forward_items() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255]));
+        let mut cursor = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("encode test png");
+        let bytes = cursor.into_inner();
+        let expected_size = bytes.len() as u64;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let url = format!("http://{}/image.png", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response headers");
+            socket.write_all(&bytes).await.expect("write response body");
+        });
+        let draft = Draft {
+            blocks: vec![DraftBlock::Forward {
+                items: vec![ForwardItem {
+                    sender_name: Some("Image Sender".to_string()),
+                    blocks: vec![DraftBlock::Attachment {
+                        kind: MediaKind::Image,
+                        name: Some("remote.png".to_string()),
+                        reference: MediaReference::RemoteUrl { url },
+                        size_bytes: None,
+                    }],
+                }],
+            }],
+        };
+
+        let hydrated = hydrate_remote_media_references(&draft).await;
+        server.await.expect("server task");
+
+        let DraftBlock::Forward { items } = &hydrated.blocks[0] else {
+            panic!("top-level forward should stay forward");
+        };
+        let DraftBlock::Attachment {
+            reference,
+            size_bytes,
+            ..
+        } = &items[0].blocks[0]
+        else {
+            panic!("nested block should stay an attachment");
+        };
+        let MediaReference::RemoteUrl { url } = reference else {
+            panic!("hydrated image should remain a URL reference");
+        };
+
+        assert!(url.starts_with("base64://"));
+        assert_eq!(*size_bytes, Some(expected_size));
     }
 }

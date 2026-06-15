@@ -1,6 +1,6 @@
 use oqqwall_rust_core::{
-    DraftBlock, IngressAttachment, IngressMessage, MediaKind, MediaReference,
-    build_draft_from_messages, poke_marker,
+    DraftBlock, IngressAttachment, IngressMessage, MediaKind, MediaReference, ReplyPreview,
+    build_draft_from_messages, poke_marker, reply_marker,
 };
 
 #[test]
@@ -59,6 +59,30 @@ fn build_draft_keeps_unknown_double_bracket_markers_literal() {
         draft.blocks,
         vec![DraftBlock::Paragraph {
             text: "hello [[face:5]] world".to_string()
+        }]
+    );
+}
+
+#[test]
+fn build_draft_keeps_reply_preview_and_reply_text_in_one_block() {
+    let preview = ReplyPreview {
+        id: Some("42".to_string()),
+        meta: None,
+        body: "quoted text".to_string(),
+        missing: false,
+    };
+    let message = IngressMessage {
+        text: format!("{} reply body", reply_marker(&preview)),
+        attachments: Vec::new(),
+    };
+
+    let draft = build_draft_from_messages(&[message]);
+
+    assert_eq!(
+        draft.blocks,
+        vec![DraftBlock::Reply {
+            preview,
+            text: Some("reply body".to_string())
         }]
     );
 }

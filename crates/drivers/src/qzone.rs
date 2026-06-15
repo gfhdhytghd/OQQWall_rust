@@ -48,7 +48,11 @@ macro_rules! debug_log {
 
 #[cfg(not(debug_assertions))]
 macro_rules! debug_log {
-    ($($arg:tt)*) => {};
+    ($($arg:tt)*) => {{
+        if false {
+            oqqwall_rust_infra::debug_log::log(format_args!($($arg)*));
+        }
+    }};
 }
 
 const EMOTION_PUBLISH_URL: &str =

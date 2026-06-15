@@ -1513,7 +1513,11 @@ fn draft_preview_text(draft: &Draft) -> String {
     for block in &draft.blocks {
         let text = match block {
             DraftBlock::Paragraph { text } => text.as_str(),
-            DraftBlock::Reply { preview } => preview.body.as_str(),
+            DraftBlock::Reply { preview, text } => text
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(preview.body.as_str()),
             DraftBlock::Poke => "[戳一戳]",
             DraftBlock::JsonCard { .. } => "[卡片]",
             DraftBlock::Forward { .. } => "[合并转发聊天记录]",

@@ -216,6 +216,7 @@ struct NapCatState {
     review_by_code: HashMap<ReviewCode, ReviewId>,
     review_publish_attempts: HashMap<ReviewId, u32>,
     ingress_summary: HashMap<IngressId, IngressSummary>,
+    ingress_by_platform_msg_id: HashMap<String, IngressId>,
     pending_summary: HashMap<IngressId, String>,
     post_ingress: HashMap<PostId, Vec<IngressId>>,
     post_group: HashMap<PostId, String>,
@@ -305,6 +306,11 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
                 attachments,
             },
         );
+        if !meta.platform_msg_id.trim().is_empty() {
+            state
+                .ingress_by_platform_msg_id
+                .insert(meta.platform_msg_id.clone(), *ingress_id);
+        }
     }
     for (post_id, ingress_ids) in &view.post_ingress {
         state.post_ingress.insert(*post_id, ingress_ids.clone());
@@ -1111,6 +1117,7 @@ async fn build_action_from_event(
             ingress_id,
             user_id,
             sender_name,
+            platform_msg_id,
             message,
             ..
         })
@@ -1118,6 +1125,7 @@ async fn build_action_from_event(
             ingress_id,
             user_id,
             sender_name,
+            platform_msg_id,
             message,
             ..
         }) => {
@@ -1136,6 +1144,11 @@ async fn build_action_from_event(
                     attachments,
                 },
             );
+            if !platform_msg_id.trim().is_empty() {
+                guard
+                    .ingress_by_platform_msg_id
+                    .insert(platform_msg_id, ingress_id);
+            }
             None
         }
         Event::Ingress(IngressEvent::MessageIgnored { ingress_id, .. }) => {
@@ -1147,6 +1160,9 @@ async fn build_action_from_event(
             let mut guard = state.lock().await;
             guard.pending_summary.remove(&ingress_id);
             guard.ingress_summary.remove(&ingress_id);
+            guard
+                .ingress_by_platform_msg_id
+                .retain(|_, indexed_ingress_id| *indexed_ingress_id != ingress_id);
             for ingress_ids in guard.post_ingress.values_mut() {
                 ingress_ids.retain(|id| *id != ingress_id);
             }
@@ -2718,6 +2734,14 @@ async fn parse_inbound_event(
                     let sender_name = extract_sender_name(&session.messages[0].message)
                         .or_else(|| Some(user_id.clone()));
                     let chat_id = format!("{}_submission_{}", user_id, session.started_at_ms);
+                    let mut local_reply_previews =
+                        reply_previews_from_buffered_messages(&session.messages);
+                    for buffered in &session.messages {
+                        local_reply_previews.extend(reply_previews_from_state(
+                            buffered.message.get("message"),
+                            &guard,
+                        ));
+                    }
                     let mut combined_text = String::new();
                     let mut combined_attachments = Vec::new();
                     let mut combined_summary = String::new();
@@ -2726,7 +2750,10 @@ async fn parse_inbound_event(
                             text,
                             summary_text,
                             attachments,
-                        } = extract_message_lite(buffered.message.get("message"));
+                        } = extract_message_lite_with_reply_previews(
+                            buffered.message.get("message"),
+                            &local_reply_previews,
+                        );
                         if !text.trim().is_empty() {
                             if !combined_text.is_empty() {
                                 combined_text.push_str("\n\n");
@@ -2826,11 +2853,15 @@ async fn parse_inbound_event(
                 return None;
             }
         }
+        let local_reply_previews = {
+            let guard = state.lock().await;
+            reply_previews_from_state(value.get("message"), &guard)
+        };
         let ExtractedMessage {
             text,
             summary_text,
             attachments,
-        } = extract_message_lite(value.get("message"));
+        } = extract_message_lite_with_reply_previews(value.get("message"), &local_reply_previews);
         if raw_message.map(|raw| raw.is_empty()).unwrap_or(true)
             && is_auto_reply_message(&summary_text)
         {
@@ -3420,7 +3451,169 @@ async fn extract_message(
     )
 }
 
+pub(crate) async fn extract_message_lite_resolving_replies(
+    value: Option<&Value>,
+    account_id: &str,
+) -> ExtractedMessage {
+    let previews = resolve_reply_previews(value, account_id).await;
+    extract_message_lite_with_reply_previews(value, &previews)
+}
+
 pub(crate) fn extract_message_lite(value: Option<&Value>) -> ExtractedMessage {
+    extract_message_lite_with_reply_previews(value, &HashMap::new())
+}
+
+async fn resolve_reply_previews(
+    value: Option<&Value>,
+    account_id: &str,
+) -> HashMap<String, ReplyPreview> {
+    let mut previews = HashMap::new();
+    for id in collect_reply_ids(value) {
+        if previews.contains_key(&id) {
+            continue;
+        }
+        let preview = fetch_reply_preview(account_id, &id)
+            .await
+            .unwrap_or_else(|| fallback_reply_preview(Some(id.clone())));
+        previews.insert(id, preview);
+    }
+    previews
+}
+
+fn collect_reply_ids(value: Option<&Value>) -> Vec<String> {
+    let mut ids = Vec::new();
+    let Some(Value::Array(items)) = value else {
+        return ids;
+    };
+    for item in items {
+        if item.get("type").and_then(|v| v.as_str()) != Some("reply") {
+            continue;
+        }
+        if let Some(id) = item
+            .get("data")
+            .and_then(|data| data.get("id"))
+            .and_then(value_to_string)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+fn reply_previews_from_state(
+    value: Option<&Value>,
+    state: &NapCatState,
+) -> HashMap<String, ReplyPreview> {
+    let mut previews = HashMap::new();
+    for id in collect_reply_ids(value) {
+        if let Some(ingress_id) = state.ingress_by_platform_msg_id.get(&id) {
+            if let Some(summary) = state.ingress_summary.get(ingress_id) {
+                previews.insert(id.clone(), reply_preview_from_ingress_summary(id, summary));
+            }
+        }
+    }
+    previews
+}
+
+fn reply_previews_from_buffered_messages(
+    messages: &[BufferedMessage],
+) -> HashMap<String, ReplyPreview> {
+    let mut previews = HashMap::new();
+    for buffered in messages {
+        let Some(id) = value_opt_to_string(buffered.message.get("message_id"))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        previews.insert(
+            id.clone(),
+            reply_preview_from_message_value(Some(id), &buffered.message),
+        );
+    }
+    previews
+}
+
+fn reply_preview_from_ingress_summary(id: String, summary: &IngressSummary) -> ReplyPreview {
+    let mut preview = fallback_reply_preview(Some(id));
+    preview.meta = summary.sender_name.clone();
+    let body = summary.text.trim();
+    if !body.is_empty() {
+        preview.body = body.to_string();
+    } else if let Some(attachment) = summary.attachments.first() {
+        preview.body = attachment_placeholder(attachment.kind).to_string();
+    }
+    preview
+}
+
+pub(crate) async fn fetch_reply_preview(account_id: &str, reply_id: &str) -> Option<ReplyPreview> {
+    let body = napcat_ws_request(
+        account_id,
+        "get_msg",
+        json!({ "message_id": json_id(reply_id) }),
+        Duration::from_secs(4),
+    )
+    .await
+    .map_err(|err| {
+        debug_log!("napcat reply get_msg failed: id={} err={}", reply_id, err);
+        err
+    })
+    .ok()?;
+    Some(reply_preview_from_get_msg_response(
+        Some(reply_id.to_string()),
+        &body,
+    ))
+}
+
+fn fallback_reply_preview(id: Option<String>) -> ReplyPreview {
+    ReplyPreview {
+        id,
+        meta: None,
+        body: "引用的消息".to_string(),
+        missing: false,
+    }
+}
+
+fn reply_preview_from_get_msg_response(id: Option<String>, response: &Value) -> ReplyPreview {
+    let message = response.get("data").unwrap_or(response);
+    reply_preview_from_message_value(id, message)
+}
+
+fn reply_preview_from_message_value(id: Option<String>, message: &Value) -> ReplyPreview {
+    let mut preview = fallback_reply_preview(id);
+    preview.meta = extract_sender_name(message);
+    if let Some(body) = reply_preview_body_from_message(message) {
+        preview.body = body;
+    }
+    preview
+}
+
+fn reply_preview_body_from_message(message: &Value) -> Option<String> {
+    let payload = message
+        .get("message")
+        .or_else(|| message.get("content"))
+        .or_else(|| message.get("raw_message"));
+    let extracted = extract_message_lite(payload);
+    let body = extracted.text.trim();
+    if !body.is_empty() {
+        return Some(body.to_string());
+    }
+    if let Some(attachment) = extracted.attachments.first() {
+        return Some(attachment_placeholder(attachment.kind).to_string());
+    }
+    let summary = extracted.summary_text.trim();
+    if !summary.is_empty() {
+        return Some(summary.to_string());
+    }
+    None
+}
+
+fn extract_message_lite_with_reply_previews(
+    value: Option<&Value>,
+    reply_previews: &HashMap<String, ReplyPreview>,
+) -> ExtractedMessage {
     let mut text = String::new();
     let mut summary_text = String::new();
     let mut attachments = Vec::new();
@@ -3446,16 +3639,13 @@ pub(crate) fn extract_message_lite(value: Option<&Value>) -> ExtractedMessage {
                     }
                     "reply" => {
                         let id = data.and_then(|d| d.get("id")).and_then(value_to_string);
-                        let body = id
+                        let preview = id
                             .as_ref()
-                            .map(|id| format!("引用的消息 ID: {}", id))
-                            .unwrap_or_else(|| "引用的消息".to_string());
-                        text.push_str(&reply_marker(&ReplyPreview {
-                            id: id.clone(),
-                            meta: None,
-                            body,
-                            missing: false,
-                        }));
+                            .map(|id| id.trim())
+                            .filter(|id| !id.is_empty())
+                            .and_then(|id| reply_previews.get(id).cloned())
+                            .unwrap_or_else(|| fallback_reply_preview(id.clone()));
+                        text.push_str(&reply_marker(&preview));
                         if let Some(id) = id {
                             summary_text.push_str(&format!("[回复:{}]", id));
                         } else {
@@ -5480,6 +5670,106 @@ mod tests {
                 serde_json::json!({"type": "text", "data": {"text": "!"}}),
             ]
         );
+    }
+
+    #[test]
+    fn reply_preview_from_get_msg_response_uses_sender_card_first() {
+        let response = serde_json::json!({
+            "status": "ok",
+            "retcode": 0,
+            "data": {
+                "sender": {
+                    "nickname": "Nick",
+                    "card": "Group Card"
+                },
+                "message": "quoted"
+            }
+        });
+
+        let preview = reply_preview_from_get_msg_response(Some("42".to_string()), &response);
+
+        assert_eq!(preview.id.as_deref(), Some("42"));
+        assert_eq!(preview.meta.as_deref(), Some("Group Card"));
+        assert_eq!(preview.body, "quoted");
+    }
+
+    #[test]
+    fn reply_preview_from_get_msg_response_uses_attachment_placeholder_body() {
+        let response = serde_json::json!({
+            "data": {
+                "sender": {
+                    "nickname": "Nick"
+                },
+                "message": [
+                    {"type": "image", "data": {"file": "https://example.test/a.png", "sub_type": 0}}
+                ]
+            }
+        });
+
+        let preview = reply_preview_from_get_msg_response(Some("42".to_string()), &response);
+
+        assert_eq!(preview.meta.as_deref(), Some("Nick"));
+        assert_eq!(preview.body, "[图片]");
+    }
+
+    #[test]
+    fn collect_reply_ids_trims_and_skips_empty_ids() {
+        let message = serde_json::json!([
+            {"type": "reply", "data": {"id": " 42 "}},
+            {"type": "reply", "data": {"id": " "}},
+            {"type": "text", "data": {"text": "body"}}
+        ]);
+
+        assert_eq!(collect_reply_ids(Some(&message)), vec!["42".to_string()]);
+    }
+
+    #[test]
+    fn reply_previews_from_state_resolves_platform_message_id() {
+        let ingress_id = IngressId::from_u128(7);
+        let mut state = NapCatState::default();
+        state
+            .ingress_by_platform_msg_id
+            .insert("42".to_string(), ingress_id);
+        state.ingress_summary.insert(
+            ingress_id,
+            IngressSummary {
+                user_id: "100".to_string(),
+                sender_name: Some("Alice".to_string()),
+                text: "quoted text".to_string(),
+                attachments: Vec::new(),
+            },
+        );
+        let message = serde_json::json!([
+            {"type": "reply", "data": {"id": "42"}},
+            {"type": "text", "data": {"text": "body"}}
+        ]);
+
+        let previews = reply_previews_from_state(Some(&message), &state);
+
+        let preview = previews.get("42").expect("reply preview");
+        assert_eq!(preview.meta.as_deref(), Some("Alice"));
+        assert_eq!(preview.body, "quoted text");
+    }
+
+    #[test]
+    fn reply_previews_from_buffered_messages_resolves_session_message() {
+        let messages = vec![BufferedMessage {
+            message: serde_json::json!({
+                "message_id": 42,
+                "sender": {
+                    "nickname": "Alice"
+                },
+                "message": [
+                    {"type": "text", "data": {"text": "quoted text"}}
+                ]
+            }),
+        }];
+
+        let previews = reply_previews_from_buffered_messages(&messages);
+
+        let preview = previews.get("42").expect("reply preview");
+        assert_eq!(preview.meta.as_deref(), Some("Alice"));
+        assert_eq!(preview.body, "quoted text");
     }
 
     #[test]
