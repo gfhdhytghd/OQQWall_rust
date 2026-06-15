@@ -1,0 +1,212 @@
+{
+  "id": "2026-06-15-122609",
+  "generated_at": "2026-06-15T04:26:09.885957Z",
+  "language": "zh",
+  "pages": [
+    {
+      "slug": "1-gai-lan",
+      "title": "概览",
+      "file": "1-gai-lan.md",
+      "section": "Get Started",
+      "level": "..."
+    },
+    {
+      "slug": "2-kuai-su-kai-shi",
+      "title": "快速开始",
+      "file": "2-kuai-su-kai-shi.md",
+      "section": "Get Started",
+      "level": "..."
+    },
+    {
+      "slug": "3-kai-fa-huan-jing-da-jian",
+      "title": "开发环境搭建",
+      "file": "3-kai-fa-huan-jing-da-jian.md",
+      "section": "Get Started",
+      "group": "环境与配置",
+      "level": "..."
+    },
+    {
+      "slug": "4-pei-zhi-wen-jian-shuo-ming",
+      "title": "配置文件说明",
+      "file": "4-pei-zhi-wen-jian-shuo-ming.md",
+      "section": "Get Started",
+      "group": "环境与配置",
+      "level": "..."
+    },
+    {
+      "slug": "5-shou-ci-yun-xing-yu-chu-shi-hua",
+      "title": "首次运行与初始化",
+      "file": "5-shou-ci-yun-xing-yu-chu-shi-hua.md",
+      "section": "Get Started",
+      "group": "环境与配置",
+      "level": "..."
+    },
+    {
+      "slug": "6-shen-he-zhi-ling-xi-tong",
+      "title": "审核指令系统",
+      "file": "6-shen-he-zhi-ling-xi-tong.md",
+      "section": "Get Started",
+      "group": "基础操作",
+      "level": "..."
+    },
+    {
+      "slug": "7-tou-gao-chu-li-liu-cheng",
+      "title": "投稿处理流程",
+      "file": "7-tou-gao-chu-li-liu-cheng.md",
+      "section": "Get Started",
+      "group": "基础操作",
+      "level": "..."
+    },
+    {
+      "slug": "8-xiang-mu-jia-gou-xiang-jie",
+      "title": "项目架构详解",
+      "file": "8-xiang-mu-jia-gou-xiang-jie.md",
+      "section": "Deep Dive",
+      "level": "..."
+    },
+    {
+      "slug": "9-shi-jian-su-yuan-jia-gou",
+      "title": "事件溯源架构",
+      "file": "9-shi-jian-su-yuan-jia-gou.md",
+      "section": "Deep Dive",
+      "group": "核心业务逻辑",
+      "level": "..."
+    },
+    {
+      "slug": "10-zhuang-tai-guan-li-yu-huan-yuan",
+      "title": "状态管理与还原",
+      "file": "10-zhuang-tai-guan-li-yu-huan-yuan.md",
+      "section": "Deep Dive",
+      "group": "核心业务逻辑",
+      "level": "..."
+    },
+    {
+      "slug": "11-zhi-ling-jue-ce-yin-qing",
+      "title": "指令决策引擎",
+      "file": "11-zhi-ling-jue-ce-yin-qing.md",
+      "section": "Deep Dive",
+      "group": "核心业务逻辑",
+      "level": "..."
+    },
+    {
+      "slug": "12-skia-xuan-ran-yin-qing",
+      "title": "Skia 渲染引擎",
+      "file": "12-skia-xuan-ran-yin-qing.md",
+      "section": "Deep Dive",
+      "group": "渲染与展示",
+      "level": "..."
+    },
+    {
+      "slug": "13-svg-zhong-jian-biao-shi",
+      "title": "SVG 中间表示",
+      "file": "13-svg-zhong-jian-biao-shi.md",
+      "section": "Deep Dive",
+      "group": "渲染与展示",
+      "level": "..."
+    },
+    {
+      "slug": "14-xiao-xi-lei-xing-pai-ban",
+      "title": "消息类型排版",
+      "file": "14-xiao-xi-lei-xing-pai-ban.md",
+      "section": "Deep Dive",
+      "group": "渲染与展示",
+      "level": "..."
+    },
+    {
+      "slug": "15-napcat-onebot-ji-cheng",
+      "title": "NapCat OneBot 集成",
+      "file": "15-napcat-onebot-ji-cheng.md",
+      "section": "Deep Dive",
+      "group": "集成与驱动",
+      "level": "..."
+    },
+    {
+      "slug": "16-qqkong-jian-fa-song-ji-zhi",
+      "title": "QQ空间发送机制",
+      "file": "16-qqkong-jian-fa-song-ji-zhi.md",
+      "section": "Deep Dive",
+      "group": "集成与驱动",
+      "level": "..."
+    },
+    {
+      "slug": "17-mei-ti-wen-jian-chu-li",
+      "title": "媒体文件处理",
+      "file": "17-mei-ti-wen-jian-chu-li.md",
+      "section": "Deep Dive",
+      "group": "集成与驱动",
+      "level": "..."
+    },
+    {
+      "slug": "18-webview-shen-he-jie-mian",
+      "title": "WebView 审核界面",
+      "file": "18-webview-shen-he-jie-mian.md",
+      "section": "Deep Dive",
+      "group": "前端与接口",
+      "level": "..."
+    },
+    {
+      "slug": "19-http-api-v1",
+      "title": "HTTP API v1",
+      "file": "19-http-api-v1.md",
+      "section": "Deep Dive",
+      "group": "前端与接口",
+      "level": "..."
+    },
+    {
+      "slug": "20-sheng-chan-huan-jing-bu-shu",
+      "title": "生产环境部署",
+      "file": "20-sheng-chan-huan-jing-bu-shu.md",
+      "section": "Deep Dive",
+      "group": "运维与部署",
+      "level": "..."
+    },
+    {
+      "slug": "21-jian-kong-yu-yao-ce",
+      "title": "监控与遥测",
+      "file": "21-jian-kong-yu-yao-ce.md",
+      "section": "Deep Dive",
+      "group": "运维与部署",
+      "level": "..."
+    },
+    {
+      "slug": "22-gu-zhang-pai-cha-shou-ce",
+      "title": "故障排查手册",
+      "file": "22-gu-zhang-pai-cha-shou-ce.md",
+      "section": "Deep Dive",
+      "group": "运维与部署",
+      "level": "..."
+    },
+    {
+      "slug": "23-xing-neng-you-hua-ce-lue",
+      "title": "性能优化策略",
+      "file": "23-xing-neng-you-hua-ce-lue.md",
+      "section": "Deep Dive",
+      "group": "高级主题",
+      "level": "..."
+    },
+    {
+      "slug": "24-bing-fa-chu-li-ji-zhi",
+      "title": "并发处理机制",
+      "file": "24-bing-fa-chu-li-ji-zhi.md",
+      "section": "Deep Dive",
+      "group": "高级主题",
+      "level": "..."
+    },
+    {
+      "slug": "25-ce-shi-yu-zhi-liang-bao-zheng",
+      "title": "测试与质量保证",
+      "file": "25-ce-shi-yu-zhi-liang-bao-zheng.md",
+      "section": "Deep Dive",
+      "group": "高级主题",
+      "level": "..."
+    },
+    {
+      "slug": "26-wei-lai-ji-qun-kuo-zhan",
+      "title": "未来集群扩展",
+      "file": "26-wei-lai-ji-qun-kuo-zhan.md",
+      "section": "Deep Dive",
+      "group": "高级主题",
+      "level": "..."
+    }
+  ]
+}
