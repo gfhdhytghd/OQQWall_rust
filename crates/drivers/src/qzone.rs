@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Cursor;
@@ -20,12 +20,11 @@ use image::{
 };
 use oqqwall_rust_core::draft::{Draft, DraftBlock, IngressMessage, MediaKind, MediaReference};
 use oqqwall_rust_core::event::{
-    BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, QzonePublicationItem, RenderEvent,
-    ReviewEvent, ScheduleEvent, SendEvent, SendPriority,
+    BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, RenderEvent, ReviewEvent,
+    ScheduleEvent, SendEvent, SendPriority,
 };
 use oqqwall_rust_core::ids::{
-    AccountId, BlobId, ExternalCode, IngressId, PostId, RemotePostId, ReviewCode, ReviewId,
-    TimestampMs,
+    BlobId, ExternalCode, IngressId, PostId, ReviewCode, ReviewId, TimestampMs,
 };
 use oqqwall_rust_core::{Command, StateView, build_draft_from_messages, derive_blob_id};
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
@@ -48,17 +47,11 @@ macro_rules! debug_log {
 
 #[cfg(not(debug_assertions))]
 macro_rules! debug_log {
-    ($($arg:tt)*) => {{
-        if false {
-            oqqwall_rust_infra::debug_log::log(format_args!($($arg)*));
-        }
-    }};
+    ($($arg:tt)*) => {};
 }
 
 const EMOTION_PUBLISH_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6";
-const EMOTION_UPDATE_URL: &str =
-    "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_update";
 const UPLOAD_IMAGE_URL: &str = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image";
 const CHROME_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.1.3702.40 Safari/537.36 QBWebViewUA/2 QBWebViewType/1 WKType/1";
 const MAX_UPLOAD_IMAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -67,6 +60,7 @@ const PRESERVE_MAX_LONG_EDGE_1080P: u32 = 1920;
 const PRESERVE_MAX_SHORT_EDGE_1080P: u32 = 1080;
 const JPEG_MIN_DIMENSION: u32 = 512;
 const JPEG_QUALITY_STEPS: [u8; 6] = [90, 82, 74, 66, 58, 50];
+const STACKING_HOLD_MS: i64 = 365 * 24 * 60 * 60 * 1000;
 #[cfg(debug_assertions)]
 const EMUQZONE_PORT: u16 = 18080;
 #[cfg(debug_assertions)]
@@ -143,6 +137,7 @@ struct IngressAuthor {
 #[derive(Debug, Clone)]
 struct SendPlanMeta {
     group_id: String,
+    not_before_ms: i64,
     priority: SendPriority,
     seq: u64,
 }
@@ -256,6 +251,7 @@ fn build_state_from_view(view: &StateView) -> QzoneState {
             *post_id,
             SendPlanMeta {
                 group_id: plan.group_id.clone(),
+                not_before_ms: plan.not_before_ms,
                 priority: plan.priority,
                 seq: plan.seq,
             },
@@ -263,22 +259,11 @@ fn build_state_from_view(view: &StateView) -> QzoneState {
     }
 
     for (post_id, render) in &view.render {
-        let mut pngs = render.png_blobs.clone();
-        if pngs.is_empty() {
-            if let Some(png) = render.png_blob {
-                pngs.push(png);
-            }
-        } else if let Some(png) = render.png_blob {
-            if !pngs.contains(&png) {
-                pngs.insert(0, png);
-            }
-        }
-        if !pngs.is_empty() {
+        if render.png_blob.is_some() {
             state.render_blobs.insert(
                 *post_id,
                 RenderBlobs {
-                    png: pngs.first().copied(),
-                    pngs,
+                    png: render.png_blob,
                 },
             );
         }
@@ -299,10 +284,9 @@ struct CookieCache {
     fetched_at_ms: TimestampMs,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy)]
 struct RenderBlobs {
     png: Option<BlobId>,
-    pngs: Vec<BlobId>,
 }
 
 #[cfg(debug_assertions)]
@@ -461,6 +445,7 @@ pub fn spawn_qzone_sender(
                 Event::Schedule(ScheduleEvent::SendPlanCreated {
                     post_id,
                     group_id,
+                    not_before_ms,
                     priority,
                     seq,
                     ..
@@ -468,6 +453,7 @@ pub fn spawn_qzone_sender(
                 | Event::Schedule(ScheduleEvent::SendPlanRescheduled {
                     post_id,
                     group_id,
+                    not_before_ms,
                     priority,
                     seq,
                     ..
@@ -477,6 +463,7 @@ pub fn spawn_qzone_sender(
                         post_id,
                         SendPlanMeta {
                             group_id,
+                            not_before_ms,
                             priority,
                             seq,
                         },
@@ -499,35 +486,16 @@ pub fn spawn_qzone_sender(
                     let mut guard = state.lock().await;
                     let entry = guard.render_blobs.entry(post_id).or_default();
                     entry.png = None;
-                    entry.pngs.clear();
                 }
                 Event::Render(RenderEvent::PngReady { post_id, blob_id }) => {
                     let mut guard = state.lock().await;
                     let entry = guard.render_blobs.entry(post_id).or_default();
-                    if entry.png.is_none() {
-                        entry.png = Some(blob_id);
-                    }
-                    if !entry.pngs.contains(&blob_id) {
-                        entry.pngs.push(blob_id);
-                    }
-                }
-                Event::Render(RenderEvent::PngBatchReady { post_id, blob_ids }) => {
-                    let mut guard = state.lock().await;
-                    let entry = guard.render_blobs.entry(post_id).or_default();
-                    if entry.png.is_none() {
-                        entry.png = blob_ids.first().copied();
-                    }
-                    for blob_id in blob_ids {
-                        if !entry.pngs.contains(&blob_id) {
-                            entry.pngs.push(blob_id);
-                        }
-                    }
+                    entry.png = Some(blob_id);
                 }
                 Event::Render(RenderEvent::RenderFailed { post_id, .. }) => {
                     let mut guard = state.lock().await;
                     let entry = guard.render_blobs.entry(post_id).or_default();
                     entry.png = None;
-                    entry.pngs.clear();
                 }
                 Event::Send(SendEvent::SendSucceeded { post_id, .. })
                 | Event::Send(SendEvent::SendGaveUp { post_id, .. }) => {
@@ -568,7 +536,6 @@ pub fn spawn_qzone_sender(
                         .get(&group_id)
                         .copied()
                         .unwrap_or(runtime.default_individual_images);
-                    let merging_enabled = max_queue > 1;
 
                     let batch_result = {
                         let mut guard = state.lock().await;
@@ -576,12 +543,16 @@ pub fn spawn_qzone_sender(
                         let leader_priority = leader_meta
                             .map(|meta| meta.priority)
                             .unwrap_or(SendPriority::Normal);
-                        let batch_posts =
-                            if merging_enabled && leader_priority == SendPriority::Normal {
-                                collect_batch_post_ids(&guard, &group_id, post_id, leader_priority)
-                            } else {
-                                vec![post_id]
-                            };
+                        let (batch_posts, requeue_posts) = collect_batch_post_ids(
+                            &guard,
+                            &group_id,
+                            post_id,
+                            leader_priority,
+                            started_at_ms,
+                            max_queue,
+                            max_images_per_post,
+                            include_original_images,
+                        );
                         let publish_text = build_publish_text_for_batch(
                             &batch_posts,
                             &guard.external_codes,
@@ -592,25 +563,18 @@ pub fn spawn_qzone_sender(
                             runtime.at_unprived_sender,
                         );
                         match collect_post_assets(&guard, &batch_posts, include_original_images) {
-                            Ok(assets) => {
-                                let publication_items = build_qzone_publication_items(
-                                    &assets,
-                                    &guard.external_codes,
-                                    &guard.review_codes,
-                                );
-                                Ok((
-                                    batch_posts,
-                                    assets,
-                                    guard.blob_paths.clone(),
-                                    publish_text,
-                                    publication_items,
-                                ))
-                            }
+                            Ok(assets) => Ok((
+                                batch_posts,
+                                requeue_posts,
+                                assets,
+                                guard.blob_paths.clone(),
+                                publish_text,
+                            )),
                             Err(err) => Err(err),
                         }
                     };
 
-                    let (batch_posts, assets, blob_paths, publish_text, publication_items) =
+                    let (batch_posts, requeue_posts, assets, blob_paths, publish_text) =
                         match batch_result {
                             Ok(data) => data,
                             Err(err) => {
@@ -632,6 +596,19 @@ pub fn spawn_qzone_sender(
                                 continue;
                             }
                         };
+                    let hold_until_ms = started_at_ms.saturating_add(STACKING_HOLD_MS);
+                    for requeue in requeue_posts {
+                        let event = ScheduleEvent::SendPlanRescheduled {
+                            post_id: requeue.post_id,
+                            group_id: group_id.clone(),
+                            not_before_ms: hold_until_ms,
+                            priority: requeue.priority,
+                            seq: requeue.seq,
+                        };
+                        let _ = cmd_tx
+                            .send(Command::DriverEvent(Event::Schedule(event)))
+                            .await;
+                    }
                     let attempt = {
                         let mut guard = state.lock().await;
                         let entry = guard.attempts.entry(post_id).or_insert(0);
@@ -654,39 +631,25 @@ pub fn spawn_qzone_sender(
                             &assets,
                             &blob_paths,
                             &publish_text,
-                            &publication_items,
                             #[cfg(debug_assertions)]
                             emu_state.as_ref(),
                         )
                         .await
                         {
-                            Ok(published_posts) => {
+                            Ok(remote_id) => {
                                 final_account_id = target_account.clone();
-                                let remote_id =
-                                    published_posts.first().map(|post| post.remote_id.clone());
                                 if first_tid.is_none() {
                                     first_tid = remote_id.clone();
                                 }
                                 let account_event = SendEvent::SendAccountSucceeded {
                                     post_id,
-                                    account_id: target_account.clone(),
+                                    account_id: target_account,
                                     finished_at_ms: started_at_ms,
                                     remote_id,
                                 };
                                 let _ = cmd_tx
                                     .send(Command::DriverEvent(Event::Send(account_event)))
                                     .await;
-                                for published_post in published_posts {
-                                    let event = SendEvent::QzonePostPublished {
-                                        group_id: group_id.clone(),
-                                        account_id: target_account.clone(),
-                                        remote_id: published_post.remote_id,
-                                        text: publish_text.clone(),
-                                        items: published_post.items,
-                                    };
-                                    let _ =
-                                        cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                                }
                             }
                             Err(err) => {
                                 let failed_account_id = target_account.clone();
@@ -745,49 +708,6 @@ pub fn spawn_qzone_sender(
                         let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
                     }
                 }
-                Event::Send(SendEvent::QzonePostWithdrawRequested {
-                    post_id,
-                    group_id,
-                    account_id,
-                    remote_id,
-                    text,
-                    items,
-                    withdrawn_post_ids,
-                    requested_at_ms,
-                }) => {
-                    let result = withdraw_qzone_post_images(
-                        &state,
-                        &runtime,
-                        &group_id,
-                        &account_id,
-                        &remote_id,
-                        &text,
-                        &items,
-                        &withdrawn_post_ids,
-                    )
-                    .await;
-                    let event = match result {
-                        Ok(updated_text) => SendEvent::QzonePostWithdrawSucceeded {
-                            post_id,
-                            account_id,
-                            remote_id,
-                            text: updated_text,
-                            withdrawn_post_ids,
-                            withdrawn_at_ms: requested_at_ms,
-                        },
-                        Err(err) => SendEvent::QzonePostWithdrawFailed {
-                            post_id,
-                            account_id,
-                            remote_id,
-                            withdrawn_post_ids,
-                            error: format!("[{:?}] {}", err.kind, err.message),
-                        },
-                    };
-                    let _ = cmd_tx.send(Command::DriverEvent(Event::Send(event))).await;
-                }
-                Event::Send(SendEvent::QzonePostPublished { .. })
-                | Event::Send(SendEvent::QzonePostWithdrawSucceeded { .. })
-                | Event::Send(SendEvent::QzonePostWithdrawFailed { .. }) => {}
                 _ => {}
             }
         }
@@ -814,25 +734,6 @@ fn select_send_accounts(accounts: Option<&Vec<String>>, fallback_account: &str) 
     out
 }
 
-struct PublishedQzonePost {
-    remote_id: RemotePostId,
-    items: Vec<QzonePublicationItem>,
-}
-
-fn usable_remote_id(remote_id: &str) -> Option<RemotePostId> {
-    let remote_id = remote_id.trim();
-    if remote_id.is_empty() || remote_id == "unknown" {
-        None
-    } else {
-        Some(remote_id.to_string())
-    }
-}
-
-fn require_remote_id(remote_id: &str) -> Result<RemotePostId, QzoneError> {
-    usable_remote_id(remote_id)
-        .ok_or_else(|| QzoneError::unknown("qzone publish response missing tid"))
-}
-
 async fn publish_batch_for_account(
     state: &Arc<Mutex<QzoneState>>,
     runtime: &QzoneRuntimeConfig,
@@ -843,9 +744,8 @@ async fn publish_batch_for_account(
     assets: &[PostAssets],
     blob_paths: &HashMap<BlobId, String>,
     publish_text: &str,
-    publication_items: &[QzonePublicationItem],
     #[cfg(debug_assertions)] emu_state: Option<&Arc<std::sync::Mutex<EmuQzoneState>>>,
-) -> Result<Vec<PublishedQzonePost>, QzoneError> {
+) -> Result<Option<String>, QzoneError> {
     #[cfg(debug_assertions)]
     if runtime.use_virt_qzone {
         let Some(emu_state) = emu_state else {
@@ -870,7 +770,7 @@ async fn publish_batch_for_account(
         for chunk in images.chunks(chunk_size) {
             append_emuqzone_post(emu_state, publish_text.to_string(), chunk.to_vec());
         }
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
     let napcat = runtime
@@ -920,21 +820,13 @@ async fn publish_batch_for_account(
     } else {
         images.len().max(1)
     };
-    let item_chunks = split_publication_items_by_image_chunks(publication_items, chunk_size);
-    if item_chunks.len() != images.chunks(chunk_size).len() {
-        return Err(QzoneError::unknown(format!(
-            "publication item chunks mismatch: items={} image_chunks={}",
-            item_chunks.len(),
-            images.chunks(chunk_size).len()
-        )));
-    }
-
-    let mut published = Vec::new();
-    for (chunk, items) in images.chunks(chunk_size).zip(item_chunks) {
+    let mut first_tid: Option<String> = None;
+    for chunk in images.chunks(chunk_size) {
         match client.publish_emotion(publish_text, chunk).await {
             Ok(tid) => {
-                let remote_id = require_remote_id(&tid)?;
-                published.push(PublishedQzonePost { remote_id, items });
+                if first_tid.is_none() {
+                    first_tid = Some(tid);
+                }
             }
             Err(err) => {
                 refresh_cookie_cache(state, account_id).await;
@@ -942,184 +834,7 @@ async fn publish_batch_for_account(
             }
         }
     }
-    Ok(published)
-}
-
-fn split_publication_items_by_image_chunks(
-    items: &[QzonePublicationItem],
-    chunk_size: usize,
-) -> Vec<Vec<QzonePublicationItem>> {
-    let chunk_size = chunk_size.max(1);
-    let mut chunks: Vec<Vec<QzonePublicationItem>> = Vec::new();
-    let mut current = Vec::new();
-    let mut current_images = 0usize;
-
-    for item in items {
-        let mut item_offset = 0usize;
-        let mut remaining = item.image_count;
-        while remaining > 0 {
-            if current_images == chunk_size {
-                chunks.push(current);
-                current = Vec::new();
-                current_images = 0;
-            }
-            let available = chunk_size.saturating_sub(current_images).max(1);
-            let take = remaining.min(available);
-            let mut chunk_item = item.clone();
-            chunk_item.image_offset = item.image_offset.saturating_add(item_offset);
-            chunk_item.image_count = take;
-            current.push(chunk_item);
-            current_images = current_images.saturating_add(take);
-            item_offset = item_offset.saturating_add(take);
-            remaining -= take;
-        }
-    }
-
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
-}
-
-async fn withdraw_qzone_post_images(
-    state: &Arc<Mutex<QzoneState>>,
-    runtime: &QzoneRuntimeConfig,
-    group_id: &str,
-    account_id: &AccountId,
-    remote_id: &RemotePostId,
-    current_text: &str,
-    items: &[QzonePublicationItem],
-    withdrawn_post_ids: &[PostId],
-) -> Result<String, QzoneError> {
-    let withdrawn = withdrawn_post_ids.iter().copied().collect::<BTreeSet<_>>();
-    let updated_text = build_withdrawn_qzone_text(current_text, items, &withdrawn);
-
-    let images =
-        collect_publication_item_images(state, runtime, group_id, items, &withdrawn).await?;
-
-    let cookies = match get_cookies(state, account_id).await {
-        Ok(cookies) => cookies,
-        Err(err) => {
-            refresh_cookie_cache(state, account_id).await;
-            return Err(err);
-        }
-    };
-    let client = match QzoneClient::from_cookie_map(cookies) {
-        Ok(client) => client,
-        Err(err) => {
-            refresh_cookie_cache(state, account_id).await;
-            return Err(err);
-        }
-    };
-    if let Err(err) = client
-        .update_emotion(remote_id, &updated_text, &images)
-        .await
-    {
-        refresh_cookie_cache(state, account_id).await;
-        return Err(err);
-    }
-    Ok(updated_text)
-}
-
-async fn collect_publication_item_images(
-    state: &Arc<Mutex<QzoneState>>,
-    runtime: &QzoneRuntimeConfig,
-    group_id: &str,
-    items: &[QzonePublicationItem],
-    withdrawn: &BTreeSet<PostId>,
-) -> Result<Vec<Vec<u8>>, QzoneError> {
-    let mut remaining_post_ids = Vec::new();
-    for item in items {
-        if withdrawn.contains(&item.post_id) || remaining_post_ids.contains(&item.post_id) {
-            continue;
-        }
-        remaining_post_ids.push(item.post_id);
-    }
-    if remaining_post_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let include_original_images = runtime
-        .individual_images_by_group
-        .get(group_id)
-        .copied()
-        .unwrap_or(runtime.default_individual_images);
-    let (assets, blob_paths) = {
-        let guard = state.lock().await;
-        let assets = collect_post_assets(&guard, &remaining_post_ids, include_original_images)?;
-        (assets, guard.blob_paths.clone())
-    };
-
-    let mut images_by_post = HashMap::new();
-    for asset in assets {
-        let images = collect_images(
-            &asset.draft,
-            &blob_paths,
-            &asset.preview_blobs,
-            asset.include_original_images,
-        )
-        .await?;
-        images_by_post.insert(asset.post_id, images);
-    }
-
-    let mut out = Vec::new();
-    for item in items {
-        if withdrawn.contains(&item.post_id) {
-            continue;
-        }
-        let Some(images) = images_by_post.get(&item.post_id) else {
-            return Err(QzoneError::unknown(format!(
-                "missing publication item images post_id={}",
-                item.post_id.0
-            )));
-        };
-        let end = item.image_offset.saturating_add(item.image_count);
-        if end > images.len() {
-            return Err(QzoneError::unknown(format!(
-                "publication image range out of bounds post_id={} offset={} count={} available={}",
-                item.post_id.0,
-                item.image_offset,
-                item.image_count,
-                images.len()
-            )));
-        }
-        out.extend(images[item.image_offset..end].iter().cloned());
-    }
-    Ok(out)
-}
-
-fn build_withdrawn_qzone_text(
-    current_text: &str,
-    items: &[QzonePublicationItem],
-    withdrawn: &BTreeSet<PostId>,
-) -> String {
-    let mut codes = items
-        .iter()
-        .filter_map(|item| {
-            withdrawn
-                .contains(&item.post_id)
-                .then_some(item.external_code)
-        })
-        .collect::<Vec<_>>();
-    codes.sort_unstable();
-    codes.dedup();
-
-    let mut text = current_text.trim_end().to_string();
-    for code in codes {
-        let marker = format!("#{} [已删除]", code);
-        if text.contains(&marker) {
-            continue;
-        }
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&marker);
-    }
-    if text.trim().is_empty() {
-        "#0 [已删除]".to_string()
-    } else {
-        text
-    }
+    Ok(first_tid)
 }
 
 #[derive(Clone)]
@@ -1288,113 +1003,6 @@ impl QzoneClient {
             .unwrap_or("unknown")
             .to_string();
         Ok(tid)
-    }
-
-    async fn update_emotion(
-        &self,
-        tid: &str,
-        content: &str,
-        images: &[Vec<u8>],
-    ) -> Result<(), QzoneError> {
-        if content.trim().is_empty() {
-            return Err(QzoneError::unknown("qzone update content cannot be empty"));
-        }
-        let cookie_header = build_cookie_header(&self.cookies);
-        let mut form: HashMap<&str, String> = HashMap::new();
-        form.insert("syn_tweet_verson", "1".to_string());
-        form.insert("tid", tid.to_string());
-        form.insert("paramstr", "1".to_string());
-        form.insert("pic_template", "".to_string());
-        form.insert("richtype", "".to_string());
-        form.insert("richval", "".to_string());
-        form.insert("special_url", "".to_string());
-        form.insert("subrichtype", "".to_string());
-        form.insert("con", content.to_string());
-        form.insert("feedversion", "1".to_string());
-        form.insert("ver", "1".to_string());
-        form.insert("ugc_right", "1".to_string());
-        form.insert("to_sign", "0".to_string());
-        form.insert("hostuin", self.uin.to_string());
-        form.insert("code_version", "1".to_string());
-        form.insert("format", "fs".to_string());
-        form.insert(
-            "qzreferrer",
-            format!("https://user.qzone.qq.com/{}", self.uin),
-        );
-
-        if !images.is_empty() {
-            let mut pic_bos = Vec::new();
-            let mut richvals = Vec::new();
-            form.insert("subrichtype", "1".to_string());
-            for image in images {
-                let upload = self.upload_image(image).await?;
-                let (picbo, richval) = get_picbo_and_richval(&upload)?;
-                pic_bos.push(picbo);
-                richvals.push(richval);
-            }
-            form.insert("pic_bo", pic_bos.join("\t"));
-            form.insert("richtype", "1".to_string());
-            form.insert("richval", richvals.join("\t"));
-        }
-
-        debug_log!(
-            "qzone update_emotion: tid={} content_len={} images={}",
-            tid,
-            content.len(),
-            images.len()
-        );
-        let res = self
-            .client
-            .post(EMOTION_UPDATE_URL)
-            .query(&[("g_tk", &self.gtk)])
-            .header("user-agent", CHROME_USER_AGENT)
-            .header("accept", "*/*")
-            .header(
-                "content-type",
-                "application/x-www-form-urlencoded;charset=UTF-8",
-            )
-            .header("referer", format!("https://user.qzone.qq.com/{}", self.uin))
-            .header("origin", "https://user.qzone.qq.com")
-            .header("cookie", cookie_header)
-            .form(&form)
-            .send()
-            .await
-            .map_err(|err| classify_reqwest_error("update emotion request", err))?;
-
-        let status = res.status();
-        let headers = res.headers().clone();
-        let body = match res.text().await {
-            Ok(text) => text,
-            Err(err) => {
-                if !status.is_success() {
-                    let fallback = format!("<read body failed: {}>", err);
-                    debug_log_http_failure("qzone update emotion", status, &headers, &fallback);
-                    return Err(classify_http_status_with_body(
-                        "update emotion http status",
-                        status.as_u16(),
-                        &fallback,
-                    ));
-                }
-                return Err(classify_reqwest_error("update emotion read body", err));
-            }
-        };
-        if !status.is_success() {
-            debug_log_http_failure("qzone update emotion", status, &headers, &body);
-            return Err(classify_http_status_with_body(
-                "update emotion http status",
-                status.as_u16(),
-                &body,
-            ));
-        }
-        let json = parse_proxy_callback_json(&body)
-            .ok_or_else(|| QzoneError::unknown("invalid update response body"))?;
-        if let Ok(_pretty) = serde_json::to_string_pretty(&json) {
-            debug_log!("qzone update response json:\n{}", _pretty);
-        }
-        if let Some(err) = classify_response_error(&json) {
-            return Err(err.with_context("update response"));
-        }
-        Ok(())
     }
 
     async fn upload_image(&self, image: &[u8]) -> Result<Value, QzoneError> {
@@ -1581,32 +1189,114 @@ fn should_mention(author: &IngressAuthor) -> bool {
     !sender_name.is_empty()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequeuePostPlan {
+    post_id: PostId,
+    priority: SendPriority,
+    seq: u64,
+}
+
 fn collect_batch_post_ids(
     state: &QzoneState,
     group_id: &str,
     leader: PostId,
     leader_priority: SendPriority,
-) -> Vec<PostId> {
+    started_at_ms: i64,
+    max_queue: usize,
+    max_images_per_post: usize,
+    include_original_images: bool,
+) -> (Vec<PostId>, Vec<RequeuePostPlan>) {
     let mut queued = state
         .send_plans
         .iter()
-        .filter(|(_, plan)| plan.group_id == group_id && plan.priority == leader_priority)
-        .map(|(post_id, plan)| (plan.seq, *post_id))
+        .filter(|(_, plan)| {
+            plan.group_id == group_id
+                && plan.priority == leader_priority
+                && plan.not_before_ms <= started_at_ms
+        })
+        .map(|(post_id, plan)| (*post_id, plan.clone()))
         .collect::<Vec<_>>();
-    queued.sort_by_key(|(seq, post_id)| (*seq, post_id.0));
+    queued.sort_by_key(|(post_id, plan)| (plan.seq, post_id.0));
 
-    let mut out = Vec::with_capacity(queued.len().saturating_add(1));
-    out.push(leader);
-    for (_, post_id) in queued {
-        if post_id != leader {
-            out.push(post_id);
+    let requeue_posts = queued
+        .iter()
+        .filter_map(|(post_id, plan)| {
+            (*post_id != leader).then_some(RequeuePostPlan {
+                post_id: *post_id,
+                priority: plan.priority,
+                seq: plan.seq,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let max_batch_posts = if max_queue == 0 {
+        usize::MAX
+    } else {
+        max_queue.max(1)
+    };
+    let mut batch = Vec::with_capacity(max_batch_posts.min(queued.len().saturating_add(1)));
+    let mut total_images = 0usize;
+    let mut append_post = |post_id: PostId, is_leader: bool| -> bool {
+        let image_count = count_post_send_images(state, post_id, include_original_images);
+        if !is_leader {
+            if batch.len() >= max_batch_posts {
+                return false;
+            }
+            if max_images_per_post > 0
+                && total_images.saturating_add(image_count) > max_images_per_post
+            {
+                return false;
+            }
+        }
+        batch.push(post_id);
+        total_images = total_images.saturating_add(image_count);
+        true
+    };
+    let _ = append_post(leader, true);
+    if leader_priority != SendPriority::Normal || max_batch_posts <= 1 {
+        return (batch, requeue_posts);
+    }
+    for (post_id, _) in queued {
+        if post_id == leader {
+            continue;
+        }
+        if !append_post(post_id, false) {
+            break;
         }
     }
-    out
+    (batch, requeue_posts)
+}
+
+fn count_post_send_images(
+    state: &QzoneState,
+    post_id: PostId,
+    include_original_images: bool,
+) -> usize {
+    let mut total = render_preview_blobs(state, post_id).len();
+    if !include_original_images {
+        return total;
+    }
+    if let Some(draft) = resolve_draft_for_send(state, post_id) {
+        total = total.saturating_add(
+            draft
+                .blocks
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        block,
+                        DraftBlock::Attachment {
+                            kind: MediaKind::Image,
+                            ..
+                        }
+                    )
+                })
+                .count(),
+        );
+    }
+    total
 }
 
 struct PostAssets {
-    post_id: PostId,
     draft: Draft,
     preview_blobs: Vec<BlobId>,
     include_original_images: bool,
@@ -1633,58 +1323,12 @@ fn collect_post_assets(
             )));
         }
         out.push(PostAssets {
-            post_id: *post_id,
             draft,
             preview_blobs,
             include_original_images,
         });
     }
     Ok(out)
-}
-
-fn build_qzone_publication_items(
-    assets: &[PostAssets],
-    external_codes: &HashMap<PostId, ExternalCode>,
-    review_codes: &HashMap<PostId, ReviewCode>,
-) -> Vec<QzonePublicationItem> {
-    assets
-        .iter()
-        .map(|asset| QzonePublicationItem {
-            post_id: asset.post_id,
-            external_code: external_codes
-                .get(&asset.post_id)
-                .copied()
-                .or_else(|| {
-                    review_codes
-                        .get(&asset.post_id)
-                        .map(|value| *value as ExternalCode)
-                })
-                .unwrap_or(asset.post_id.0 as ExternalCode),
-            image_offset: 0,
-            image_count: expected_image_count(asset),
-        })
-        .collect()
-}
-
-fn expected_image_count(asset: &PostAssets) -> usize {
-    let mut count = asset.preview_blobs.len();
-    if asset.include_original_images {
-        count += asset
-            .draft
-            .blocks
-            .iter()
-            .filter(|block| {
-                matches!(
-                    block,
-                    DraftBlock::Attachment {
-                        kind: MediaKind::Image,
-                        ..
-                    }
-                )
-            })
-            .count();
-    }
-    count
 }
 
 #[cfg(debug_assertions)]
@@ -1743,9 +1387,6 @@ fn render_preview_blobs(state: &QzoneState, post_id: PostId) -> Vec<BlobId> {
     let Some(render) = state.render_blobs.get(&post_id) else {
         return Vec::new();
     };
-    if !render.pngs.is_empty() {
-        return render.pngs.clone();
-    }
     if let Some(png) = render.png {
         return vec![png];
     }
@@ -1755,9 +1396,7 @@ fn render_preview_blobs(state: &QzoneState, post_id: PostId) -> Vec<BlobId> {
 fn collect_post_blob_ids(state: &QzoneState, post_id: PostId) -> Vec<BlobId> {
     let mut blob_ids = Vec::new();
     if let Some(render) = state.render_blobs.get(&post_id) {
-        if !render.pngs.is_empty() {
-            blob_ids.extend(render.pngs.iter().copied());
-        } else if let Some(png) = render.png {
+        if let Some(png) = render.png {
             blob_ids.push(png);
         }
     }
@@ -2550,16 +2189,6 @@ fn classify_response_error(json: &Value) -> Option<QzoneError> {
             return Some(classify_json_response_error(ret, message, json));
         }
     }
-    let code = json.get("code").and_then(|v| v.as_i64());
-    if let Some(code) = code {
-        if code != 0 {
-            let message = json
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("qzone error");
-            return Some(classify_json_response_error(code, message, json));
-        }
-    }
     None
 }
 
@@ -2963,7 +2592,6 @@ fn field_to_string(data: &Value, key: &str) -> Result<String, QzoneError> {
 mod tests {
     use super::*;
     use image::{Delay, Frame as ImageFrame, Rgba, RgbaImage};
-    use oqqwall_rust_core::Id128;
     use serde_json::json;
 
     #[test]
@@ -3047,110 +2675,82 @@ mod tests {
     }
 
     #[test]
-    fn classify_response_error_reads_qzone_update_code() {
-        let json = json!({
-            "code": -10005,
-            "message": "您未输入内容，随便写点什么吧",
-            "subcode": -4004
-        });
+    fn collect_batch_post_ids_respects_max_queue_limit() {
+        let mut state = QzoneState::default();
+        let leader = seed_batch_post(&mut state, 1, 1, 2, 0);
+        let second = seed_batch_post(&mut state, 2, 2, 2, 0);
+        let third = seed_batch_post(&mut state, 3, 3, 2, 0);
 
-        let err = classify_response_error(&json).expect("expected update response error");
-        assert!(err.message.contains("未输入内容"));
-        assert!(err.message.contains("code=-10005"));
+        let (batch, requeue) =
+            collect_batch_post_ids(&state, "g", leader, SendPriority::Normal, 1_000, 2, 0, true);
+
+        assert_eq!(batch, vec![leader, second]);
+        assert_eq!(requeue_ids(&requeue), vec![second, third]);
     }
 
     #[test]
-    fn withdrawn_qzone_text_appends_sorted_unique_markers() {
-        let post_a = Id128(10);
-        let post_b = Id128(20);
-        let withdrawn = [post_b, post_a].into_iter().collect::<BTreeSet<_>>();
-        let text = build_withdrawn_qzone_text(
-            "#5~#6\n#5 [已删除]",
-            &[
-                QzonePublicationItem {
-                    post_id: post_a,
-                    external_code: 5,
-                    image_offset: 0,
-                    image_count: 1,
-                },
-                QzonePublicationItem {
-                    post_id: post_b,
-                    external_code: 6,
-                    image_offset: 0,
-                    image_count: 1,
-                },
-            ],
-            &withdrawn,
-        );
+    fn collect_batch_post_ids_stops_before_image_limit_overflow() {
+        let mut state = QzoneState::default();
+        let leader = seed_batch_post(&mut state, 1, 1, 3, 0);
+        let second = seed_batch_post(&mut state, 2, 2, 3, 0);
+        let third = seed_batch_post(&mut state, 3, 3, 5, 0);
 
-        assert_eq!(text, "#5~#6\n#5 [已删除]\n#6 [已删除]");
+        let (batch, requeue) =
+            collect_batch_post_ids(&state, "g", leader, SendPriority::Normal, 1_000, 3, 6, true);
+
+        assert_eq!(batch, vec![leader, second]);
+        assert_eq!(requeue_ids(&requeue), vec![second, third]);
     }
 
-    #[test]
-    fn split_publication_items_preserves_chunk_offsets() {
-        let post_a = Id128(10);
-        let post_b = Id128(20);
-        let chunks = split_publication_items_by_image_chunks(
-            &[
-                QzonePublicationItem {
-                    post_id: post_a,
-                    external_code: 5,
-                    image_offset: 0,
-                    image_count: 3,
-                },
-                QzonePublicationItem {
-                    post_id: post_b,
-                    external_code: 6,
-                    image_offset: 0,
-                    image_count: 2,
-                },
-            ],
-            2,
-        );
-
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(
-            chunks[0],
-            vec![QzonePublicationItem {
-                post_id: post_a,
-                external_code: 5,
-                image_offset: 0,
-                image_count: 2,
-            }]
-        );
-        assert_eq!(
-            chunks[1],
-            vec![
-                QzonePublicationItem {
-                    post_id: post_a,
-                    external_code: 5,
-                    image_offset: 2,
-                    image_count: 1,
-                },
-                QzonePublicationItem {
-                    post_id: post_b,
-                    external_code: 6,
-                    image_offset: 0,
-                    image_count: 1,
-                },
-            ]
-        );
-        assert_eq!(
-            chunks[2],
-            vec![QzonePublicationItem {
-                post_id: post_b,
-                external_code: 6,
-                image_offset: 1,
-                image_count: 1,
-            }]
-        );
+    fn requeue_ids(plans: &[RequeuePostPlan]) -> Vec<PostId> {
+        plans.iter().map(|plan| plan.post_id).collect()
     }
 
-    #[test]
-    fn require_remote_id_rejects_unusable_tid() {
-        assert!(require_remote_id("").is_err());
-        assert!(require_remote_id(" unknown ").is_err());
-        assert_eq!(require_remote_id("tid-a").expect("tid"), "tid-a");
+    fn seed_batch_post(
+        state: &mut QzoneState,
+        raw_post_id: u128,
+        seq: u64,
+        total_images: usize,
+        not_before_ms: i64,
+    ) -> PostId {
+        let post_id = PostId::from_u128(raw_post_id);
+        state.send_plans.insert(
+            post_id,
+            SendPlanMeta {
+                group_id: "g".to_string(),
+                not_before_ms,
+                priority: SendPriority::Normal,
+                seq,
+            },
+        );
+        if total_images > 0 {
+            state.render_blobs.insert(
+                post_id,
+                RenderBlobs {
+                    png: Some(BlobId::from_u128(raw_post_id.saturating_add(10_000))),
+                },
+            );
+        }
+        let ingress_id = IngressId::from_u128(raw_post_id.saturating_add(20_000));
+        let attachments = (0..total_images.saturating_sub(1))
+            .map(|idx| oqqwall_rust_core::draft::IngressAttachment {
+                kind: MediaKind::Image,
+                name: None,
+                reference: MediaReference::RemoteUrl {
+                    url: format!("file:///tmp/{}_{}.png", raw_post_id, idx),
+                },
+                size_bytes: None,
+            })
+            .collect();
+        state.post_ingress.insert(post_id, vec![ingress_id]);
+        state.ingress_messages.insert(
+            ingress_id,
+            IngressMessage {
+                text: String::new(),
+                attachments,
+            },
+        );
+        post_id
     }
 
     fn make_rgba_pattern(width: u32, height: u32, transparent: bool) -> RgbaImage {
