@@ -1,0 +1,82 @@
+name: package-split-release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: crates/app/webview-ui/package-lock.json
+
+      - name: 缓存 Cargo 依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 构建 WebView 前端
+        working-directory: crates/app/webview-ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: 构建固定工具链镜像
+        run: |
+          docker build --network host -t rust-glibc231:20.04-oqqwall -f Dockerfile.rust-glibc231-toolchain .
+
+      - name: 执行拆分打包脚本
+        run: |
+          docker run --rm --network host \
+            --user "$(id -u):$(id -g)" \
+            -v "$PWD:/work" -w /work \
+            -v "$HOME/.cargo/registry:/root/.cargo/registry" \
+            -v "$HOME/.cargo/git:/root/.cargo/git" \
+            rust-glibc231:20.04-oqqwall \
+            bash -c '
+              export PATH="/usr/local/cargo/bin:$PATH"
+              cargo --version
+              bash ./scripts/package_split_release.sh
+            '
+
+      - name: 生成校验文件
+        run: |
+          sha256sum dist/OQQWall_RUST dist/OQQWall_RUST-res-*.tar.gz > dist/SHA256SUMS.txt
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: OQQWall_RUST-split-release
+          path: |
+            dist/OQQWall_RUST
+            dist/OQQWall_RUST-res-*.tar.gz
+            dist/SHA256SUMS.txt
+
+      - name: 发布到 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/OQQWall_RUST
+            dist/OQQWall_RUST-res-*.tar.gz
+            dist/SHA256SUMS.txt
