@@ -48,9 +48,12 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) -> Result
             friend_request_window_sec: group.friend_request_window_sec,
             friend_add_message: group.friend_add_message.clone(),
             max_queue: core_config.max_queue(&group.group_id),
+            max_images_per_post: core_config.max_images_per_post(&group.group_id),
+            user_notifications: Arc::new(Mutex::new(group.user_notifications.clone())),
             quick_replies: Arc::new(Mutex::new(group.quick_replies.clone())),
             review_shortcuts: Arc::new(Mutex::new(group.review_shortcuts.clone())),
             global_shortcuts: Arc::new(Mutex::new(group.global_shortcuts.clone())),
+            agent_commands: Arc::new(Mutex::new(group.agent_commands.clone())),
         };
         let _ws_log = base_url_for_log(&runtime.napcat.base_url);
         debug_log!(
@@ -107,8 +110,6 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) -> Result
     }
     debug_log!("spawn renderer");
     let renderer_config = RendererRuntimeConfig {
-        canvas_width_px: config.renderer_canvas_width_px,
-        max_height_px: config.renderer_max_height_px,
         napcat_by_group: napcat_by_group.clone(),
         default_napcat: config.fallback_napcat.clone(),
         watermark_text_by_group,

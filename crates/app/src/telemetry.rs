@@ -29,11 +29,7 @@ macro_rules! debug_log {
 
 #[cfg(not(debug_assertions))]
 macro_rules! debug_log {
-    ($($arg:tt)*) => {{
-        if false {
-            oqqwall_rust_infra::debug_log::log(format_args!($($arg)*));
-        }
-    }};
+    ($($arg:tt)*) => {};
 }
 
 macro_rules! telemetry_log {
@@ -57,8 +53,8 @@ pub fn spawn_submission_telemetry(
     let local_dir = resolve_local_dir(data_dir, &telemetry.local_dir);
     let store = match TelemetryStore::open(local_dir, telemetry.upload_batch_size) {
         Ok(store) => store,
-        Err(_err) => {
-            debug_log!("telemetry disabled: init failed");
+        Err(err) => {
+            debug_log!("telemetry disabled: init failed: {}", err);
             return None;
         }
     };
@@ -109,8 +105,8 @@ impl TelemetryRuntime {
                     match recv {
                         Ok(env) => self.handle_event(&env.event).await,
                         Err(RecvError::Closed) => break,
-                        Err(RecvError::Lagged(_skipped)) => {
-                            debug_log!("telemetry lagged");
+                        Err(RecvError::Lagged(skipped)) => {
+                            debug_log!("telemetry lagged: skipped={}", skipped);
                         }
                     }
                 }
@@ -138,8 +134,8 @@ impl TelemetryRuntime {
             return;
         }
         for (sample, chat_record) in samples {
-            if let Err(_err) = self.store.enqueue(sample, &chat_record) {
-                debug_log!("telemetry enqueue failed");
+            if let Err(err) = self.store.enqueue(sample, &chat_record) {
+                debug_log!("telemetry enqueue failed: {}", err);
             }
         }
     }
@@ -712,8 +708,12 @@ impl TelemetryStore {
             if needed.contains(stem) {
                 continue;
             }
-            if let Err(_err) = fs::remove_file(&path) {
-                debug_log!("cleanup telemetry object failed: {}", path.display());
+            if let Err(err) = fs::remove_file(&path) {
+                debug_log!(
+                    "cleanup telemetry object failed: {}: {}",
+                    path.display(),
+                    err
+                );
             }
         }
         Ok(())
@@ -808,6 +808,7 @@ mod tests {
                 group_id: "10001".to_string(),
                 platform_msg_id: "m11".to_string(),
                 received_at_ms: 3000,
+                route_meta: None,
             },
         );
         state.ingress_messages.insert(
@@ -827,6 +828,7 @@ mod tests {
                 group_id: "10001".to_string(),
                 platform_msg_id: "m12".to_string(),
                 received_at_ms: 4000,
+                route_meta: None,
             },
         );
         state.ingress_messages.insert(

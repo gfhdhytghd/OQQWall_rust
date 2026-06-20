@@ -1513,11 +1513,7 @@ fn draft_preview_text(draft: &Draft) -> String {
     for block in &draft.blocks {
         let text = match block {
             DraftBlock::Paragraph { text } => text.as_str(),
-            DraftBlock::Reply { preview, text } => text
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(preview.body.as_str()),
+            DraftBlock::Reply { preview } => preview.body.as_str(),
             DraftBlock::Poke => "[戳一戳]",
             DraftBlock::JsonCard { .. } => "[卡片]",
             DraftBlock::Forward { .. } => "[合并转发聊天记录]",
@@ -1774,10 +1770,6 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                 "Render.PngReady",
                 format!("post={} blob={}", short_id(*post_id), short_id(*blob_id)),
             ),
-            RenderEvent::PngBatchReady { post_id, blob_ids } => (
-                "Render.PngBatchReady",
-                format!("post={} blobs={}", short_id(*post_id), blob_ids.len()),
-            ),
             RenderEvent::RenderFailed {
                 post_id,
                 attempt,
@@ -1859,35 +1851,9 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                     decided_at_ms
                 ),
             ),
-            ReviewEvent::ReviewDecisionReasonRecorded {
-                review_id,
-                decision,
-                reason,
-            } => (
-                "Review.DecisionReasonRecorded",
-                format!(
-                    "review={} decision={:?} reason_len={}",
-                    short_id(*review_id),
-                    decision,
-                    reason.as_deref().unwrap_or("").len()
-                ),
-            ),
             ReviewEvent::ReviewCommentAdded { review_id, text } => (
                 "Review.CommentAdded",
                 format!("review={} text_len={}", short_id(*review_id), text.len()),
-            ),
-            ReviewEvent::ReviewSubmitterNoticeRequested {
-                review_id,
-                kind,
-                reason,
-            } => (
-                "Review.SubmitterNoticeRequested",
-                format!(
-                    "review={} kind={:?} reason_len={}",
-                    short_id(*review_id),
-                    kind,
-                    reason.as_deref().unwrap_or("").len()
-                ),
             ),
             ReviewEvent::ReviewReplyRequested { review_id, text } => (
                 "Review.ReplyRequested",
@@ -2118,66 +2084,6 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
             SendEvent::SendGaveUp { post_id, reason } => (
                 "Send.GaveUp",
                 format!("post={} reason_len={}", short_id(*post_id), reason.len()),
-            ),
-            SendEvent::QzonePostPublished {
-                account_id,
-                remote_id,
-                items,
-                ..
-            } => (
-                "Send.QzonePostPublished",
-                format!(
-                    "account={} remote={} items={}",
-                    account_id,
-                    remote_id,
-                    items.len()
-                ),
-            ),
-            SendEvent::QzonePostWithdrawRequested {
-                post_id,
-                account_id,
-                remote_id,
-                withdrawn_post_ids,
-                ..
-            } => (
-                "Send.QzonePostWithdrawRequested",
-                format!(
-                    "post={} account={} remote={} withdrawn={}",
-                    short_id(*post_id),
-                    account_id,
-                    remote_id,
-                    withdrawn_post_ids.len()
-                ),
-            ),
-            SendEvent::QzonePostWithdrawSucceeded {
-                post_id,
-                account_id,
-                remote_id,
-                ..
-            } => (
-                "Send.QzonePostWithdrawSucceeded",
-                format!(
-                    "post={} account={} remote={}",
-                    short_id(*post_id),
-                    account_id,
-                    remote_id
-                ),
-            ),
-            SendEvent::QzonePostWithdrawFailed {
-                post_id,
-                account_id,
-                remote_id,
-                error,
-                ..
-            } => (
-                "Send.QzonePostWithdrawFailed",
-                format!(
-                    "post={} account={} remote={} error_len={}",
-                    short_id(*post_id),
-                    account_id,
-                    remote_id,
-                    error.len()
-                ),
             ),
         },
         Event::Blob(blob) => match blob {

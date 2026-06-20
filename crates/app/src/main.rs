@@ -25,7 +25,6 @@ use engine::Engine;
 use oqqwall_rust::tui::oqqwall_tui;
 use oqqwall_rust_core::Command;
 use std::env;
-use std::io::IsTerminal;
 use tokio::time::{Duration, sleep};
 
 #[tokio::main]
@@ -33,7 +32,7 @@ async fn main() {
     let args: Vec<String> = env::args().collect();
     debug_log!("debug build: args={:?}", args);
     if args.len() > 1 && (args[1] == "oobe" || args[1] == "--oobe") {
-        if let Err(err) = oobe::run(&args[1..]) {
+        if let Err(err) = oobe::run(&args[1..]).await {
             eprintln!("{}", err);
             std::process::exit(1);
         }
@@ -47,8 +46,8 @@ async fn main() {
         return;
     }
 
-    println!("系统已启动");
-    let app_config = match load_app_config_with_auto_oobe() {
+    println!("OQQWall service starting...");
+    let app_config = match load_app_config_with_auto_oobe().await {
         Ok(config) => config,
         Err(err) => {
             eprintln!("{err}");
@@ -87,7 +86,7 @@ async fn main() {
         app_config.webview_port
     );
     if let Err(err) = spawn_napcat_drivers(&handle, &app_config) {
-        eprintln!("启动失败: {}", err);
+        eprintln!("startup failed: {}", err);
         std::process::exit(1);
     }
     debug_log!("drivers spawned");
@@ -122,23 +121,26 @@ fn now_ms() -> i64 {
     now.as_millis() as i64
 }
 
-fn load_app_config_with_auto_oobe() -> Result<AppConfig, String> {
+async fn load_app_config_with_auto_oobe() -> Result<AppConfig, String> {
     let config_path = config::resolve_config_path();
     let has_config = config::config_exists(&config_path)?;
     if !has_config {
-        if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-            return Err(format!(
-                "未找到配置文件 '{}'，且当前无交互终端，无法自动执行 OOBE。请手动运行: OQQWall_RUST oobe --config {}",
-                config_path, config_path
-            ));
-        }
-        println!("未找到配置文件 '{}'，正在进入 OOBE 初始化...", config_path);
-        let oobe_args = vec![
-            "oobe".to_string(),
-            "--config".to_string(),
-            config_path.clone(),
-        ];
-        oobe::run(&oobe_args)?;
+        println!(
+            "config file '{}' was not found; starting Web OOBE bootstrap...",
+            config_path
+        );
+        oobe::run_auto(config_path, None).await?;
+        return AppConfig::load();
     }
-    AppConfig::load()
+    match AppConfig::load() {
+        Ok(config) => Ok(config),
+        Err(err) => {
+            println!(
+                "config file '{}' is invalid; starting Web OOBE bootstrap...",
+                config_path
+            );
+            oobe::run_auto(config_path, Some(err)).await?;
+            AppConfig::load()
+        }
+    }
 }

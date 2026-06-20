@@ -85,18 +85,6 @@ const COMMON_FIELDS: &[FieldSpec] = &[
         aliases: &[],
     },
     FieldSpec {
-        key: "renderer.canvas_width_px",
-        kind: FieldKind::Text,
-        hint: "Renderer canvas width in pixels",
-        aliases: &["canvas_width_px"],
-    },
-    FieldSpec {
-        key: "renderer.max_height_px",
-        kind: FieldKind::Text,
-        hint: "Renderer maximum output height in pixels",
-        aliases: &["max_height_px"],
-    },
-    FieldSpec {
         key: "telemetry.enabled",
         kind: FieldKind::Bool { default: true },
         hint: "Enable submission telemetry collection",
@@ -1984,22 +1972,6 @@ impl ConfigEditor {
             errors.push("common: 启用 webview 时 webview.host 不能为空".to_string());
         }
 
-        for key in ["renderer.canvas_width_px", "renderer.max_height_px"] {
-            if let Some(value) = get_path_value(&self.common, key) {
-                if matches!(value, Value::Null) {
-                    continue;
-                }
-                let valid = match value {
-                    Value::Number(n) => n.as_u64().map(|v| v > 0).unwrap_or(false),
-                    Value::String(s) => s.trim().parse::<u64>().map(|v| v > 0).unwrap_or(false),
-                    _ => false,
-                };
-                if !valid {
-                    errors.push(format!("common: {key} 必须是正整数"));
-                }
-            }
-        }
-
         let global_admins = extract_admin_list(self.other_root.get("webview_global_admins"));
         for (username, password, role) in &global_admins {
             if username.trim().is_empty() {
@@ -2724,10 +2696,6 @@ fn normalize_tui_common(common_obj: &mut Map<String, Value>) -> bool {
         }
     }
 
-    if normalize_tui_renderer(common_obj) {
-        changed = true;
-    }
-
     if normalize_tui_telemetry(common_obj) {
         changed = true;
     }
@@ -2743,39 +2711,6 @@ fn normalize_tui_common(common_obj: &mut Map<String, Value>) -> bool {
         if common_obj.remove(key).is_some() {
             changed = true;
         }
-    }
-
-    changed
-}
-
-fn normalize_tui_renderer(common_obj: &mut Map<String, Value>) -> bool {
-    let mut changed = false;
-    let mut renderer_obj = common_obj
-        .get("renderer")
-        .and_then(|value| value.as_object())
-        .cloned()
-        .unwrap_or_default();
-
-    if let Some(value) = common_obj.remove("canvas_width_px") {
-        if !renderer_obj.contains_key("canvas_width_px") {
-            renderer_obj.insert("canvas_width_px".to_string(), value);
-        }
-        changed = true;
-    }
-    if let Some(value) = common_obj.remove("max_height_px") {
-        if !renderer_obj.contains_key("max_height_px") {
-            renderer_obj.insert("max_height_px".to_string(), value);
-        }
-        changed = true;
-    }
-    if !renderer_obj.is_empty()
-        && common_obj
-            .get("renderer")
-            .and_then(|value| value.as_object())
-            != Some(&renderer_obj)
-    {
-        common_obj.insert("renderer".to_string(), Value::Object(renderer_obj));
-        changed = true;
     }
 
     changed
@@ -3038,8 +2973,6 @@ fn field_summary_text(spec: FieldSpec) -> &'static str {
         "webview.host" => "WebView 监听地址",
         "webview.port" => "WebView 监听端口",
         "webview.session_ttl_sec" => "WebView 会话有效期",
-        "renderer.canvas_width_px" => "渲染画布宽度",
-        "renderer.max_height_px" => "渲染最大高度",
         "telemetry.enabled" => "启用投稿遥测",
         "telemetry.local_dir" => "遥测本地目录",
         "telemetry.upload_enabled" => "启用遥测上传",
@@ -3087,8 +3020,6 @@ fn field_detail_text(spec: FieldSpec) -> String {
         "webview.host" => "WebView 绑定地址。127.0.0.1 仅本机可访问，0.0.0.0 允许局域网/外网访问（需自行做好安全控制）。".to_string(),
         "webview.port" => "WebView 监听端口，默认 10924。避免与其他服务冲突。".to_string(),
         "webview.session_ttl_sec" => "登录会话有效期（秒）。太短会频繁掉线，太长会增加会话泄露风险。".to_string(),
-        "renderer.canvas_width_px" => "渲染 PNG 的画布宽度（像素），默认 384。调宽后会影响排版宽度和输出尺寸。".to_string(),
-        "renderer.max_height_px" => "渲染 PNG 的最大高度（像素），默认 2304。内容超出时会按渲染器策略截断。".to_string(),
         "telemetry.enabled" => "是否记录投稿遥测并在审核完成后生成训练样本。默认开启。".to_string(),
         "telemetry.local_dir" => "遥测本地目录，相对 OQQWALL_DATA_DIR 解析；默认 data/telemetry。".to_string(),
         "telemetry.upload_enabled" => "是否启用批量上传。默认开启；上传目标和鉴权为内置固定值，不在配置中暴露。".to_string(),
@@ -3366,26 +3297,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_tui_common_migrates_renderer_flat_keys() {
-        let mut common = serde_json::from_value::<Map<String, Value>>(json!({
-            "canvas_width_px": 512,
-            "max_height_px": 4096
-        }))
-        .expect("common");
-        assert!(normalize_tui_common(&mut common));
-        assert_eq!(get_path_value(&common, "canvas_width_px"), None);
-        assert_eq!(get_path_value(&common, "max_height_px"), None);
-        assert_eq!(
-            get_path_value(&common, "renderer.canvas_width_px").and_then(|value| value.as_u64()),
-            Some(512)
-        );
-        assert_eq!(
-            get_path_value(&common, "renderer.max_height_px").and_then(|value| value.as_u64()),
-            Some(4096)
-        );
-    }
-
-    #[test]
     fn common_fields_include_telemetry_entries() {
         let keys: Vec<&str> = COMMON_FIELDS.iter().map(|spec| spec.key).collect();
         assert!(keys.contains(&"telemetry.enabled"));
@@ -3394,12 +3305,5 @@ mod tests {
         assert!(keys.contains(&"telemetry.upload_interval_sec"));
         assert!(keys.contains(&"telemetry.upload_batch_size"));
         assert!(keys.contains(&"telemetry.max_append_messages"));
-    }
-
-    #[test]
-    fn common_fields_include_renderer_entries() {
-        let keys: Vec<&str> = COMMON_FIELDS.iter().map(|spec| spec.key).collect();
-        assert!(keys.contains(&"renderer.canvas_width_px"));
-        assert!(keys.contains(&"renderer.max_height_px"));
     }
 }

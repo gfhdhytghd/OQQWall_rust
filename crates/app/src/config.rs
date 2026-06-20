@@ -5,8 +5,12 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use oqqwall_rust_core::{CoreConfig, GroupConfig};
-use oqqwall_rust_drivers::napcat::NapCatConfig;
-use oqqwall_rust_drivers::renderer::{DEFAULT_CANVAS_WIDTH_PX, DEFAULT_MAX_HEIGHT_PX};
+use oqqwall_rust_drivers::napcat::{
+    AgentCommandConfig, NapCatConfig, SendSuccessReplyConfig, TagValueMappingEntry,
+    TagValueMappingGroup,
+    UserNotificationSettings, UserNotificationTemplate, normalize_agent_command_config,
+    validate_agent_command_config, validate_agent_command_name,
+};
 use oqqwall_rust_drivers::shortcut::{
     is_builtin_review_command_name, validate_global_shortcut_definition,
     validate_review_shortcut_definition, validate_shortcut_name,
@@ -47,11 +51,13 @@ pub struct AppGroupConfig {
     pub napcat: NapCatConfig,
     pub friend_request_window_sec: u32,
     pub friend_add_message: Option<String>,
+    pub user_notifications: UserNotificationSettings,
     pub individual_image_in_posts: bool,
     pub watermark_text: Option<String>,
     pub quick_replies: HashMap<String, String>,
     pub review_shortcuts: HashMap<String, String>,
     pub global_shortcuts: HashMap<String, String>,
+    pub agent_commands: HashMap<String, AgentCommandConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,8 +101,6 @@ pub struct AppConfig {
     pub webview_port: u16,
     pub webview_session_ttl_sec: i64,
     pub webview_admins: Vec<WebviewAdminAccount>,
-    pub renderer_canvas_width_px: u32,
-    pub renderer_max_height_px: u32,
     pub telemetry: TelemetryConfig,
     core_config: CoreConfig,
     #[cfg(debug_assertions)]
@@ -128,7 +132,7 @@ impl AppConfig {
         self.core_config.clone()
     }
 
-    fn from_value(root: &Value) -> Result<Self, String> {
+    pub(crate) fn from_value(root: &Value) -> Result<Self, String> {
         let root_obj = root
             .as_object()
             .ok_or_else(|| "config must be a json object".to_string())?;
@@ -154,7 +158,6 @@ impl AppConfig {
         let default_friend_add_message = parse_string(common.get("friend_add_message"));
         let common_web_api = common.get("web_api").and_then(|value| value.as_object());
         let common_webview = common.get("webview").and_then(|value| value.as_object());
-        let common_renderer = common.get("renderer").and_then(|value| value.as_object());
         let common_telemetry = common.get("telemetry").and_then(|value| value.as_object());
         let web_api_enabled = common_web_api
             .and_then(|obj| parse_bool(obj.get("enabled")))
@@ -183,14 +186,6 @@ impl AppConfig {
             .and_then(|obj| parse_i64(obj.get("session_ttl_sec")))
             .unwrap_or(12 * 60 * 60)
             .clamp(300, 7 * 24 * 60 * 60);
-        let renderer_canvas_width_px = common_renderer
-            .and_then(|obj| parse_u32(obj.get("canvas_width_px")))
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_CANVAS_WIDTH_PX);
-        let renderer_max_height_px = common_renderer
-            .and_then(|obj| parse_u32(obj.get("max_height_px")))
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_MAX_HEIGHT_PX);
         let telemetry_enabled = common_telemetry
             .and_then(|obj| parse_bool(obj.get("enabled")))
             .unwrap_or(true);
@@ -233,7 +228,7 @@ impl AppConfig {
             max_append_messages: telemetry_max_append_messages,
         };
         debug_log!(
-            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={} at_unprived_sender={} web_api_enabled={} web_api_port={} web_api_token_present={} webview_enabled={} webview_host={} webview_port={} webview_admins={} renderer_canvas_width_px={} renderer_max_height_px={} telemetry_enabled={} telemetry_upload_enabled={} telemetry_endpoint_present={}",
+            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={} at_unprived_sender={} web_api_enabled={} web_api_port={} web_api_token_present={} webview_enabled={} webview_host={} webview_port={} webview_admins={} telemetry_enabled={} telemetry_upload_enabled={} telemetry_endpoint_present={}",
             tz_offset_minutes,
             default_process_waittime_ms,
             max_cache_mb,
@@ -245,8 +240,6 @@ impl AppConfig {
             webview_host,
             webview_port,
             parse_admin_entries(root_obj.get("webview_global_admins")).len(),
-            renderer_canvas_width_px,
-            renderer_max_height_px,
             telemetry.enabled,
             telemetry.upload_enabled,
             telemetry.upload_endpoint.is_some()
@@ -278,6 +271,11 @@ impl AppConfig {
                 .unwrap_or(default_friend_request_window_sec);
             let friend_add_message = parse_string(group_value.get("friend_add_message"))
                 .or_else(|| default_friend_add_message.clone());
+            let user_notifications = parse_user_notification_settings(
+                group_value.get("user_notifications"),
+                group_value.get("send_success_reply"),
+            )
+            .map_err(|err| format!("group {}: {}", group_id, err))?;
             let individual_image_in_posts =
                 parse_bool(group_value.get("individual_image_in_posts")).unwrap_or(true);
             let watermark_text = nonempty(parse_string(group_value.get("watermark_text")));
@@ -287,6 +285,8 @@ impl AppConfig {
                 parse_review_shortcuts(group_value.get("review_shortcuts"), &quick_replies)
                     .map_err(|err| format!("group {}: {}", group_id, err))?;
             let global_shortcuts = parse_global_shortcuts(group_value.get("global_shortcuts"))
+                .map_err(|err| format!("group {}: {}", group_id, err))?;
+            let agent_commands = parse_agent_commands(group_value.get("agent_commands"))
                 .map_err(|err| format!("group {}: {}", group_id, err))?;
             let _napcat_ws_log = base_url_for_log(&napcat.base_url);
             debug_log!(
@@ -302,11 +302,13 @@ impl AppConfig {
                 napcat,
                 friend_request_window_sec,
                 friend_add_message,
+                user_notifications,
                 individual_image_in_posts,
                 watermark_text,
                 quick_replies,
                 review_shortcuts,
                 global_shortcuts,
+                agent_commands,
             });
             for admin in parse_admin_entries(group_value.get("webview_admins")) {
                 let username = admin.username.trim().to_string();
@@ -334,11 +336,13 @@ impl AppConfig {
                 napcat,
                 friend_request_window_sec: default_friend_request_window_sec,
                 friend_add_message: default_friend_add_message,
+                user_notifications: UserNotificationSettings::default(),
                 individual_image_in_posts: true,
                 watermark_text: None,
                 quick_replies: HashMap::new(),
                 review_shortcuts: HashMap::new(),
                 global_shortcuts: HashMap::new(),
+                agent_commands: HashMap::new(),
             });
         }
         #[cfg(debug_assertions)]
@@ -380,8 +384,6 @@ impl AppConfig {
             webview_port,
             webview_session_ttl_sec,
             webview_admins,
-            renderer_canvas_width_px,
-            renderer_max_height_px,
             telemetry,
             core_config,
             #[cfg(debug_assertions)]
@@ -400,6 +402,54 @@ pub fn config_exists(path: &str) -> Result<bool, String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(format!("failed to check config {}: {}", path, err)),
     }
+}
+
+pub fn load_group_user_notification_settings(
+    group_id: &str,
+) -> Result<UserNotificationSettings, String> {
+    let path = resolve_config_path();
+    let root = read_config_root(&path)?;
+    let group = get_group_config(&root, group_id)?;
+    parse_user_notification_settings(
+        group.get("user_notifications"),
+        group.get("send_success_reply"),
+    )
+}
+
+pub fn save_group_user_notification_settings(
+    group_id: &str,
+    config: &UserNotificationSettings,
+) -> Result<(), String> {
+    let path = resolve_config_path();
+    let mut root = read_config_root(&path)?;
+    {
+        let group = get_group_config_mut(&mut root, group_id)?;
+        group.remove("send_success_reply");
+        group.insert(
+            "user_notifications".to_string(),
+            user_notification_settings_to_value(config),
+        );
+    }
+    let _ = normalize_config_in_place(&mut root)?;
+    write_normalized_config(&path, &root)
+}
+
+pub(crate) fn load_config_root_for_edit() -> Result<Value, String> {
+    let path = resolve_config_path();
+    let mut root = read_config_root(&path)?;
+    if normalize_config_in_place(&mut root)? {
+        write_normalized_config(&path, &root)?;
+    }
+    Ok(root)
+}
+
+pub(crate) fn save_config_root_for_edit(root: &Value) -> Result<Value, String> {
+    let path = resolve_config_path();
+    let mut normalized = root.clone();
+    let _ = normalize_config_in_place(&mut normalized)?;
+    AppConfig::from_value(&normalized)?;
+    write_normalized_config(&path, &normalized)?;
+    Ok(normalized)
 }
 
 #[cfg(debug_assertions)]
@@ -440,6 +490,53 @@ fn split_config(root: &Value) -> Result<(Value, std::collections::HashMap<String
         map.insert(key.clone(), value.clone());
     }
     Ok((common, map))
+}
+
+fn read_config_root(path: &str) -> Result<Value, String> {
+    let data = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read config {}: {}", path, err))?;
+    serde_json::from_str(&data).map_err(|err| format!("invalid config json {}: {}", path, err))
+}
+
+fn get_group_config<'a>(root: &'a Value, group_id: &str) -> Result<&'a Map<String, Value>, String> {
+    let obj = root
+        .as_object()
+        .ok_or_else(|| "config root must be an object".to_string())?;
+    if let Some(groups) = obj.get("groups").and_then(|value| value.as_object()) {
+        return groups
+            .get(group_id)
+            .and_then(|value| value.as_object())
+            .ok_or_else(|| format!("group {} not found in config", group_id));
+    }
+    obj.get(group_id)
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| format!("group {} not found in config", group_id))
+}
+
+fn get_group_config_mut<'a>(
+    root: &'a mut Value,
+    group_id: &str,
+) -> Result<&'a mut Map<String, Value>, String> {
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| "config root must be an object".to_string())?;
+    let has_groups = obj
+        .get("groups")
+        .and_then(|value| value.as_object())
+        .is_some();
+    if has_groups {
+        let groups = obj
+            .get_mut("groups")
+            .and_then(|value| value.as_object_mut())
+            .ok_or_else(|| "config.groups must be an object".to_string())?;
+        return groups
+            .get_mut(group_id)
+            .and_then(|value| value.as_object_mut())
+            .ok_or_else(|| format!("group {} not found in config", group_id));
+    }
+    obj.get_mut(group_id)
+        .and_then(|value| value.as_object_mut())
+        .ok_or_else(|| format!("group {} not found in config", group_id))
 }
 
 fn parse_string(value: Option<&Value>) -> Option<String> {
@@ -489,6 +586,343 @@ fn parse_u64(value: Option<&Value>) -> Option<u64> {
 
 fn parse_duration_ms(value: Option<&Value>) -> Option<i64> {
     parse_i64(value)
+}
+
+fn parse_send_success_reply_config(
+    value: Option<&Value>,
+) -> Result<SendSuccessReplyConfig, String> {
+    let Some(value) = value else {
+        return Ok(SendSuccessReplyConfig::default());
+    };
+    let Value::Object(obj) = value else {
+        return Err("send_success_reply must be an object".to_string());
+    };
+    let enabled = match obj.get("enabled") {
+        Some(raw) => parse_bool(Some(raw))
+            .ok_or_else(|| "send_success_reply.enabled must be a boolean".to_string())?,
+        None => false,
+    };
+    let text_template = match obj.get("text_template") {
+        Some(raw) => parse_string(Some(raw))
+            .ok_or_else(|| "send_success_reply.text_template must be a string".to_string())?,
+        None => String::new(),
+    };
+    let images = match obj.get("images") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                parse_string(Some(item))
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        "send_success_reply.images must contain only strings".to_string()
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(Value::String(single)) => {
+            let trimmed = single.trim();
+            if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![trimmed.to_string()]
+            }
+        }
+        Some(_) => return Err("send_success_reply.images must be an array".to_string()),
+        None => Vec::new(),
+    };
+    Ok(SendSuccessReplyConfig {
+        enabled,
+        text_template,
+        images,
+    })
+}
+
+fn parse_user_notification_settings(
+    value: Option<&Value>,
+    legacy_send_success_reply: Option<&Value>,
+) -> Result<UserNotificationSettings, String> {
+    let legacy_send_success = parse_send_success_reply_config(legacy_send_success_reply)?;
+    let mut defaults = UserNotificationSettings::default();
+    defaults.send_succeeded.enabled = legacy_send_success.enabled;
+    defaults.send_succeeded.text_template = legacy_send_success.text_template;
+    defaults.send_succeeded.images = legacy_send_success.images;
+
+    let Some(value) = value else {
+        return Ok(defaults);
+    };
+    let Value::Object(obj) = value else {
+        return Err("user_notifications must be an object".to_string());
+    };
+
+    Ok(UserNotificationSettings {
+        queue_entered: parse_user_notification_template(
+            obj.get("queue_entered"),
+            "user_notifications.queue_entered",
+            defaults.queue_entered.clone(),
+        )?,
+        review_queued: parse_user_notification_template(
+            obj.get("review_queued"),
+            "user_notifications.review_queued",
+            defaults.review_queued.clone(),
+        )?,
+        send_succeeded: parse_user_notification_template(
+            obj.get("send_succeeded"),
+            "user_notifications.send_succeeded",
+            defaults.send_succeeded.clone(),
+        )?,
+        rejected: parse_user_notification_template(
+            obj.get("rejected"),
+            "user_notifications.rejected",
+            defaults.rejected.clone(),
+        )?,
+        webhook_tag_map: parse_string_map_config(
+            obj.get("webhook_tag_map"),
+            "user_notifications.webhook_tag_map",
+        )?,
+        tag_value_maps: parse_tag_value_map_config(
+            obj.get("tag_value_maps"),
+            obj.get("tag_value_map"),
+            "user_notifications.tag_value_maps",
+        )?,
+    })
+}
+
+fn parse_user_notification_template(
+    value: Option<&Value>,
+    field_name: &str,
+    default_config: UserNotificationTemplate,
+) -> Result<UserNotificationTemplate, String> {
+    let Some(value) = value else {
+        return Ok(default_config);
+    };
+    let Value::Object(obj) = value else {
+        return Err(format!("{} must be an object", field_name));
+    };
+    let enabled = match obj.get("enabled") {
+        Some(raw) => parse_bool(Some(raw))
+            .ok_or_else(|| format!("{}.enabled must be a boolean", field_name))?,
+        None => default_config.enabled,
+    };
+    let include_post_tags = match obj.get("include_post_tags") {
+        Some(raw) => parse_bool(Some(raw))
+            .ok_or_else(|| format!("{}.include_post_tags must be a boolean", field_name))?,
+        None => default_config.include_post_tags,
+    };
+    let text_template = match obj.get("text_template") {
+        Some(raw) => parse_string(Some(raw))
+            .ok_or_else(|| format!("{}.text_template must be a string", field_name))?,
+        None => default_config.text_template,
+    };
+    let tags = parse_string_list_config(obj.get("tags"), &format!("{}.tags", field_name))?;
+    let images = parse_string_list_config(obj.get("images"), &format!("{}.images", field_name))?;
+    Ok(UserNotificationTemplate {
+        enabled,
+        include_post_tags,
+        text_template,
+        tags,
+        images,
+    })
+}
+
+fn parse_string_list_config(
+    value: Option<&Value>,
+    field_name: &str,
+) -> Result<Vec<String>, String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                parse_string(Some(item))
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| format!("{} must contain only strings", field_name))
+            })
+            .collect::<Result<Vec<_>, _>>(),
+        Some(Value::String(single)) => {
+            let trimmed = single.trim();
+            if trimmed.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![trimmed.to_string()])
+            }
+        }
+        Some(_) => Err(format!("{} must be an array", field_name)),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn parse_string_map_config(
+    value: Option<&Value>,
+    field_name: &str,
+) -> Result<HashMap<String, String>, String> {
+    let Some(value) = value else {
+        return Ok(HashMap::new());
+    };
+    let Value::Object(obj) = value else {
+        return Err(format!("{} must be an object", field_name));
+    };
+    let mut out = HashMap::new();
+    for (key, raw_value) in obj {
+        let normalized_key = key.trim();
+        if normalized_key.is_empty() {
+            continue;
+        }
+        let value = parse_string(Some(raw_value))
+            .ok_or_else(|| format!("{} values must be strings", field_name))?;
+        let normalized_value = value.trim();
+        if normalized_value.is_empty() {
+            continue;
+        }
+        out.insert(normalized_key.to_string(), normalized_value.to_string());
+    }
+    Ok(out)
+}
+
+fn parse_tag_value_map_config(
+    groups_value: Option<&Value>,
+    legacy_value: Option<&Value>,
+    field_name: &str,
+) -> Result<Vec<TagValueMappingGroup>, String> {
+    if let Some(Value::Array(items)) = groups_value {
+        return items
+            .iter()
+            .map(|item| {
+                let Value::Object(obj) = item else {
+                    return Err(format!("{} must contain only objects", field_name));
+                };
+                let tag = parse_string(obj.get("tag"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if tag.is_empty() {
+                    return Err(format!("{} entries must include a tag", field_name));
+                }
+                let mappings = if let Some(Value::Array(items)) = obj.get("mappings") {
+                    items
+                        .iter()
+                        .map(|item| {
+                            let Value::Object(mapping_obj) = item else {
+                                return Err(format!(
+                                    "{}.mappings must contain only objects",
+                                    field_name
+                                ));
+                            };
+                            let source = parse_string(mapping_obj.get("source"))
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
+                            let target = parse_string(mapping_obj.get("target"))
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
+                            if source.is_empty() || target.is_empty() {
+                                return Err(format!(
+                                    "{}.mappings entries must include source and target",
+                                    field_name
+                                ));
+                            }
+                            Ok(TagValueMappingEntry { source, target })
+                        })
+                        .collect::<Result<Vec<_>, String>>()?
+                } else {
+                    let sources = parse_string_list_config(
+                        obj.get("sources"),
+                        &format!("{}.sources", field_name),
+                    )?;
+                    sources
+                        .into_iter()
+                        .map(|source| TagValueMappingEntry {
+                            source,
+                            target: tag.clone(),
+                        })
+                        .collect()
+                };
+                Ok(TagValueMappingGroup {
+                    tag,
+                    mappings,
+                    sources: Vec::new(),
+                })
+            })
+            .collect();
+    }
+    if let Some(Value::Object(obj)) = legacy_value {
+        let mut groups: HashMap<String, Vec<TagValueMappingEntry>> = HashMap::new();
+        for (source, tag_value) in obj {
+            let source = parse_string(Some(&Value::String(source.clone())))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let tag = parse_string(Some(tag_value))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if source.is_empty() || tag.is_empty() {
+                continue;
+            }
+            groups
+                .entry(tag.clone())
+                .or_default()
+                .push(TagValueMappingEntry { source, target: tag });
+        }
+        return Ok(groups
+            .into_iter()
+            .map(|(tag, mappings)| TagValueMappingGroup {
+                tag,
+                mappings,
+                sources: Vec::new(),
+            })
+            .collect());
+    }
+    Ok(Vec::new())
+}
+
+fn user_notification_settings_to_value(config: &UserNotificationSettings) -> Value {
+    serde_json::json!({
+        "queue_entered": user_notification_template_to_value(&config.queue_entered),
+        "review_queued": user_notification_template_to_value(&config.review_queued),
+        "send_succeeded": user_notification_template_to_value(&config.send_succeeded),
+        "rejected": user_notification_template_to_value(&config.rejected),
+        "webhook_tag_map": string_map_to_value(&config.webhook_tag_map),
+        "tag_value_maps": tag_value_maps_to_value(&config.tag_value_maps),
+    })
+}
+
+fn user_notification_template_to_value(config: &UserNotificationTemplate) -> Value {
+    serde_json::json!({
+        "enabled": config.enabled,
+        "include_post_tags": config.include_post_tags,
+        "text_template": config.text_template,
+        "tags": config.tags,
+        "images": config.images,
+    })
+}
+
+fn string_map_to_value(map: &HashMap<String, String>) -> Value {
+    let mut entries = map.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+    let obj = entries
+        .into_iter()
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect::<Map<String, Value>>();
+    Value::Object(obj)
+}
+
+fn tag_value_maps_to_value(groups: &[TagValueMappingGroup]) -> Value {
+    let mut values = groups
+        .iter()
+        .map(|group| {
+            serde_json::json!({
+                "tag": group.tag,
+                "mappings": group.mappings,
+            })
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        let left_tag = left.get("tag").and_then(|value| value.as_str()).unwrap_or("");
+        let right_tag = right.get("tag").and_then(|value| value.as_str()).unwrap_or("");
+        left_tag.cmp(right_tag)
+    });
+    Value::Array(values)
 }
 
 fn is_numeric(value: &str) -> bool {
@@ -616,9 +1050,6 @@ fn normalize_config_in_place(root: &mut Value) -> Result<bool, String> {
         if normalize_common_web(common_obj) {
             changed = true;
         }
-        if normalize_common_renderer(common_obj) {
-            changed = true;
-        }
         if normalize_common_unsupported(common_obj) {
             changed = true;
         }
@@ -708,39 +1139,6 @@ fn normalize_common_web(common_obj: &mut Map<String, Value>) -> bool {
             changed = true;
         }
     }
-    changed
-}
-
-fn normalize_common_renderer(common_obj: &mut Map<String, Value>) -> bool {
-    let mut changed = false;
-    let mut renderer_obj = common_obj
-        .get("renderer")
-        .and_then(|value| value.as_object())
-        .cloned()
-        .unwrap_or_default();
-
-    if let Some(value) = common_obj.remove("canvas_width_px") {
-        if !renderer_obj.contains_key("canvas_width_px") {
-            renderer_obj.insert("canvas_width_px".to_string(), value);
-        }
-        changed = true;
-    }
-    if let Some(value) = common_obj.remove("max_height_px") {
-        if !renderer_obj.contains_key("max_height_px") {
-            renderer_obj.insert("max_height_px".to_string(), value);
-        }
-        changed = true;
-    }
-    if !renderer_obj.is_empty()
-        && common_obj
-            .get("renderer")
-            .and_then(|value| value.as_object())
-            != Some(&renderer_obj)
-    {
-        common_obj.insert("renderer".to_string(), Value::Object(renderer_obj));
-        changed = true;
-    }
-
     changed
 }
 
@@ -1003,6 +1401,35 @@ fn parse_review_shortcuts(
 
 fn parse_global_shortcuts(value: Option<&Value>) -> Result<HashMap<String, String>, String> {
     parse_shortcut_map(value, validate_global_shortcut_definition, None)
+}
+
+fn parse_agent_commands(
+    value: Option<&Value>,
+) -> Result<HashMap<String, AgentCommandConfig>, String> {
+    let Some(value) = value else {
+        return Ok(HashMap::new());
+    };
+    let Value::Object(map) = value else {
+        return Err("agent_commands must be an object".to_string());
+    };
+    let mut out = HashMap::new();
+    for (raw_key, raw_value) in map {
+        let key = validate_agent_command_name(raw_key)
+            .map_err(|err| format!("agent command '{}': {}", raw_key, err))?;
+        let parsed =
+            serde_json::from_value::<AgentCommandConfig>(raw_value.clone()).map_err(|err| {
+                format!(
+                    "agent_commands['{}'] has invalid format: {}",
+                    raw_key.replace('\'', "\\'"),
+                    err
+                )
+            })?;
+        let normalized = normalize_agent_command_config(&parsed);
+        validate_agent_command_config(&key, &normalized)
+            .map_err(|err| format!("agent command '{}': {}", raw_key, err))?;
+        out.insert(key, normalized);
+    }
+    Ok(out)
 }
 
 fn parse_shortcut_map(
@@ -1322,6 +1749,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_agent_commands_accepts_structured_blocks() {
+        let value = json!({
+            "help": {
+                "enabled": true,
+                "description": "show help",
+                "blocks": [
+                    {
+                        "kind": "reply_private_message",
+                        "text_template": "hello <sender_id>",
+                        "tags": ["3344846508"],
+                        "images": ["https://example.com/help.png"]
+                    },
+                    {
+                        "kind": "send_webhook",
+                        "url": "https://example.com/hook",
+                        "source_webhook": "hook://agent",
+                        "text_template": "<command_args>",
+                        "tags": ["notice"]
+                    }
+                ]
+            }
+        });
+        let parsed = parse_agent_commands(Some(&value)).expect("agent commands");
+        assert!(parsed.contains_key("help"));
+        assert_eq!(parsed["help"].blocks.len(), 2);
+    }
+
+    #[test]
+    fn parse_agent_commands_rejects_builtin_private_command_name() {
+        let value = json!({
+            "开始投稿": {
+                "enabled": true,
+                "blocks": [
+                    {
+                        "kind": "reply_private_message",
+                        "text_template": "should fail"
+                    }
+                ]
+            }
+        });
+        let err = parse_agent_commands(Some(&value)).expect_err("should fail");
+        assert!(err.contains("内置私聊指令"));
+    }
+
+    #[test]
     fn resolve_config_path_defaults_to_config_json() {
         let key = "OQQWALL_CONFIG";
         unsafe {
@@ -1426,37 +1898,6 @@ mod tests {
             .expect("builtin token");
         assert!(token.starts_with("t_"));
         assert_eq!(token.len(), 34);
-    }
-
-    #[test]
-    fn renderer_config_reads_common_renderer_dimensions() {
-        let root = json!({
-            "common": {
-                "napcat_base_url": "127.0.0.1:3001/oqqwall/ws",
-                "renderer": {
-                    "canvas_width_px": 512,
-                    "max_height_px": 4096
-                }
-            }
-        });
-        let config = AppConfig::from_value(&root).expect("config");
-        assert_eq!(config.renderer_canvas_width_px, 512);
-        assert_eq!(config.renderer_max_height_px, 4096);
-    }
-
-    #[test]
-    fn normalize_config_migrates_renderer_flat_keys() {
-        let mut root = json!({
-            "common": {
-                "canvas_width_px": 512,
-                "max_height_px": 4096
-            }
-        });
-        assert!(normalize_config_in_place(&mut root).expect("normalize"));
-        assert_eq!(root["common"].get("canvas_width_px"), None);
-        assert_eq!(root["common"].get("max_height_px"), None);
-        assert_eq!(root["common"]["renderer"]["canvas_width_px"], json!(512));
-        assert_eq!(root["common"]["renderer"]["max_height_px"], json!(4096));
     }
 
     #[test]
