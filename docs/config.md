@@ -75,15 +75,6 @@
 | `webview.port` | number/string | `10924` | WebView 监听端口 |
 | `webview.session_ttl_sec` | number/string | `43200` | 登录会话有效期，范围会钳制到 300 秒至 7 天 |
 
-### Renderer
-
-`common.renderer` 控制投稿预览 PNG 的渲染尺寸。
-
-| Key | 类型 | 默认值 | 作用 |
-| --- | --- | --- | --- |
-| `renderer.canvas_width_px` | number/string | `384` | 渲染 PNG 的画布宽度，影响正文排版宽度和输出图片宽度 |
-| `renderer.max_height_px` | number/string | `2304` | 渲染 PNG 的最大高度，超出时按渲染器截断策略处理 |
-
 ### Telemetry
 
 `common.telemetry` 控制投稿遥测与训练样本本地缓存/上传。上传 endpoint 和 token 为程序内置固定值，不通过配置文件暴露。
@@ -181,10 +172,6 @@ ws://127.0.0.1:3001/oqqwall/ws/3995477265
       "host": "127.0.0.1",
       "port": 10924,
       "session_ttl_sec": 43200
-    },
-    "renderer": {
-      "canvas_width_px": 384,
-      "max_height_px": 2304
     },
     "telemetry": {
       "enabled": true,
