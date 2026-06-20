@@ -1,4 +1,4 @@
-use crate::draft::IngressMessage;
+use crate::draft::{IngressMessage, IngressRouteMeta};
 use crate::event::Event;
 use crate::ids::{AuditMsgId, ExternalCode, GroupId, ReviewCode, ReviewId, TimestampMs};
 
@@ -22,6 +22,7 @@ pub struct IngressCommand {
     pub group_id: GroupId,
     pub platform_msg_id: String,
     pub message: IngressMessage,
+    pub route_meta: Option<IngressRouteMeta>,
     pub received_at_ms: TimestampMs,
     pub close_immediately: bool,
 }
@@ -57,8 +58,8 @@ pub struct ReviewActionBatchCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewAction {
     Approve,
-    Reject { reason: Option<String> },
-    Delete { reason: Option<String> },
+    Reject,
+    Delete,
     Defer { delay_ms: TimestampMs },
     Skip,
     Immediate,

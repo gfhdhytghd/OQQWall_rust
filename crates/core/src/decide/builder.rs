@@ -19,16 +19,15 @@ pub fn build_draft_from_messages(messages: &[IngressMessage]) -> Draft {
 }
 
 fn append_blocks_from_text(text: &str, blocks: &mut Vec<DraftBlock>) {
-    let mut message_blocks = Vec::new();
     let mut literal = String::new();
     let mut remaining = text.trim();
 
     while !remaining.is_empty() {
         if remaining.starts_with("[[") {
             if let Some((block, consumed)) = parse_special_marker(remaining) {
-                push_reply_text_or_paragraph(&literal, &mut message_blocks);
+                push_paragraph(&literal, blocks);
                 literal.clear();
-                message_blocks.push(block);
+                blocks.push(block);
                 remaining = &remaining[consumed..];
                 continue;
             }
@@ -41,30 +40,7 @@ fn append_blocks_from_text(text: &str, blocks: &mut Vec<DraftBlock>) {
         remaining = &remaining[ch.len_utf8()..];
     }
 
-    push_reply_text_or_paragraph(&literal, &mut message_blocks);
-    blocks.extend(message_blocks);
-}
-
-fn push_reply_text_or_paragraph(text: &str, blocks: &mut Vec<DraftBlock>) {
-    let cleaned = text.trim();
-    if cleaned.is_empty() {
-        return;
-    }
-    if let Some(DraftBlock::Reply {
-        text: reply_text, ..
-    }) = blocks.last_mut()
-    {
-        if reply_text
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_none()
-        {
-            *reply_text = Some(cleaned.to_string());
-            return;
-        }
-    }
-    push_paragraph(cleaned, blocks);
+    push_paragraph(&literal, blocks);
 }
 
 fn push_paragraph(text: &str, blocks: &mut Vec<DraftBlock>) {

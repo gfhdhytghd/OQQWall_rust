@@ -225,7 +225,7 @@ fn build_withdraw_events(
         return Vec::new();
     }
     let Some(plan) = state.send_plans.get(&post_id) else {
-        return build_published_withdraw_events(state, cmd, post_id);
+        return Vec::new();
     };
     if plan.group_id != cmd.group_id {
         return Vec::new();
@@ -284,70 +284,4 @@ fn build_withdraw_events(
     }));
 
     events
-}
-
-fn build_published_withdraw_events(
-    state: &StateView,
-    cmd: &GlobalActionCommand,
-    post_id: crate::ids::PostId,
-) -> Vec<Event> {
-    let Some(external_code) = state.external_code_by_post.get(&post_id).copied() else {
-        return vec![Event::Manual(
-            crate::event::ManualEvent::ManualInterventionRequired {
-                post_id,
-                reason: "missing external code for published withdraw".to_string(),
-            },
-        )];
-    };
-    let Some(publication_keys) = state.qzone_publications_by_post.get(&post_id) else {
-        return vec![Event::Manual(
-            crate::event::ManualEvent::ManualInterventionRequired {
-                post_id,
-                reason: format!(
-                    "missing qzone publication for #{} published withdraw",
-                    external_code
-                ),
-            },
-        )];
-    };
-    if publication_keys.is_empty() {
-        return Vec::new();
-    }
-
-    let mut events = Vec::new();
-    for key in publication_keys {
-        let Some(publication) = state.qzone_publications.get(key) else {
-            continue;
-        };
-        if publication.group_id != cmd.group_id {
-            continue;
-        }
-        let mut withdrawn = publication
-            .withdrawn_posts
-            .union(&publication.pending_withdrawn_posts)
-            .copied()
-            .collect::<Vec<_>>();
-        if withdrawn.contains(&post_id) {
-            continue;
-        }
-        withdrawn.push(post_id);
-        withdrawn.sort_by_key(|id| id.0);
-        withdrawn.dedup();
-        events.push(Event::Send(SendEvent::QzonePostWithdrawRequested {
-            post_id,
-            group_id: cmd.group_id.clone(),
-            account_id: publication.account_id.clone(),
-            remote_id: publication.remote_id.clone(),
-            text: publication.text.clone(),
-            items: publication.items.clone(),
-            withdrawn_post_ids: withdrawn,
-            requested_at_ms: cmd.now_ms,
-        }));
-    }
-
-    if events.is_empty() {
-        Vec::new()
-    } else {
-        events
-    }
 }

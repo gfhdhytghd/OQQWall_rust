@@ -17,9 +17,7 @@ pub fn decide_driver_event(state: &StateView, event: &Event, config: &CoreConfig
     let mut out = vec![event.clone()];
 
     let derived = match event {
-        Event::Render(
-            RenderEvent::PngReady { post_id, .. } | RenderEvent::PngBatchReady { post_id, .. },
-        ) => {
+        Event::Render(RenderEvent::PngReady { post_id, .. }) => {
             if !state.posts.contains_key(post_id) {
                 return out;
             }

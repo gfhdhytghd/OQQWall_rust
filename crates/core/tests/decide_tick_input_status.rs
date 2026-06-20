@@ -34,6 +34,7 @@ fn build_state(status: Option<(InputStatusKind, i64)>, wait_ms: i64) -> (StateVi
                 platform_msg_id: "msg-1".to_string(),
                 received_at_ms: t0,
                 message,
+                route_meta: None,
             }),
             t0,
         ),

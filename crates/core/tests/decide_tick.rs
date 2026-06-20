@@ -51,6 +51,7 @@ fn tick_closes_session_and_creates_draft() {
             }],
         },
         received_at_ms: 1_000,
+        route_meta: None,
         close_immediately: false,
     };
 
@@ -119,6 +120,7 @@ fn tick_closes_explicit_immediate_session_without_waiting() {
             attachments: Vec::new(),
         },
         received_at_ms: 1_000,
+        route_meta: None,
         close_immediately: true,
     };
 
@@ -270,7 +272,6 @@ fn tick_retries_review_publish_after_failure() {
             needs_republish: false,
             decided_by: None,
             decided_at_ms: None,
-            decision_reason: None,
             publish_retry_at_ms: Some(900),
             publish_last_error: Some("send failed".to_string()),
             publish_attempt: 2,
@@ -313,7 +314,6 @@ fn tick_retries_render_after_failure() {
         post_id,
         RenderMeta {
             png_blob: None,
-            png_blobs: Vec::new(),
             last_error: Some("render failed".to_string()),
             last_attempt: 1,
             retry_at_ms: Some(900),

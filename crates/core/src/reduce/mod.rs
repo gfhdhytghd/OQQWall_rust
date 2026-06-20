@@ -5,11 +5,10 @@ use crate::event::{
     IngressEvent, InputStatusKind, ManualEvent, MediaEvent, RenderEvent, ReviewEvent,
     ScheduleEvent, SendEvent, SessionEvent,
 };
-use crate::ids::{BlobId, PostId};
 use crate::state::{
     AccountRuntime, BlobMeta, GroupRuntime, InputStatusMeta, MediaFetchKey, MediaFetchMeta,
-    PostMeta, PostStage, QzonePublicationMeta, RenderMeta, ReviewMeta, SendDueKey, SendPlan,
-    SendingMeta, SessionKey, SessionMeta, StateView,
+    PostMeta, PostStage, RenderMeta, ReviewMeta, SendDueKey, SendPlan, SendingMeta, SessionKey,
+    SessionMeta, StateView,
 };
 
 pub fn reduce(state: &StateView, env: &EventEnvelope) -> StateView {
@@ -51,6 +50,7 @@ fn reduce_ingress(state: &mut StateView, event: &IngressEvent) {
             sender_name,
             group_id,
             platform_msg_id,
+            route_meta,
             received_at_ms,
             message,
         }
@@ -62,6 +62,7 @@ fn reduce_ingress(state: &mut StateView, event: &IngressEvent) {
             sender_name,
             group_id,
             platform_msg_id,
+            route_meta,
             received_at_ms,
             message,
         } => {
@@ -75,6 +76,7 @@ fn reduce_ingress(state: &mut StateView, event: &IngressEvent) {
                     sender_name: sender_name.clone(),
                     group_id: group_id.clone(),
                     platform_msg_id: platform_msg_id.clone(),
+                    route_meta: route_meta.clone(),
                     received_at_ms: *received_at_ms,
                 },
             );
@@ -300,23 +302,27 @@ fn reduce_render(state: &mut StateView, event: &RenderEvent) {
         } => {
             let meta = state.render.entry(*post_id).or_insert(RenderMeta {
                 png_blob: None,
-                png_blobs: Vec::new(),
                 last_error: None,
                 last_attempt: 0,
                 retry_at_ms: None,
             });
             meta.png_blob = None;
-            meta.png_blobs.clear();
             meta.last_attempt = *attempt;
             meta.retry_at_ms = None;
             meta.last_error = None;
             state.update_post_stage(*post_id, PostStage::RenderRequested);
         }
         RenderEvent::PngReady { post_id, blob_id } => {
-            reduce_png_ready(state, *post_id, &[*blob_id]);
-        }
-        RenderEvent::PngBatchReady { post_id, blob_ids } => {
-            reduce_png_ready(state, *post_id, blob_ids);
+            let meta = state.render.entry(*post_id).or_insert(RenderMeta {
+                png_blob: None,
+                last_error: None,
+                last_attempt: 0,
+                retry_at_ms: None,
+            });
+            meta.png_blob = Some(*blob_id);
+            meta.last_error = None;
+            meta.retry_at_ms = None;
+            state.update_post_stage(*post_id, PostStage::Rendered);
         }
         RenderEvent::RenderFailed {
             post_id,
@@ -326,7 +332,6 @@ fn reduce_render(state: &mut StateView, event: &RenderEvent) {
         } => {
             let meta = state.render.entry(*post_id).or_insert(RenderMeta {
                 png_blob: None,
-                png_blobs: Vec::new(),
                 last_error: None,
                 last_attempt: 0,
                 retry_at_ms: None,
@@ -337,30 +342,6 @@ fn reduce_render(state: &mut StateView, event: &RenderEvent) {
             state.update_post_stage(*post_id, PostStage::Failed);
         }
     }
-}
-
-fn reduce_png_ready(state: &mut StateView, post_id: PostId, blob_ids: &[BlobId]) {
-    if blob_ids.is_empty() {
-        return;
-    }
-    let meta = state.render.entry(post_id).or_insert(RenderMeta {
-        png_blob: None,
-        png_blobs: Vec::new(),
-        last_error: None,
-        last_attempt: 0,
-        retry_at_ms: None,
-    });
-    if meta.png_blob.is_none() {
-        meta.png_blob = blob_ids.first().copied();
-    }
-    for blob_id in blob_ids {
-        if !meta.png_blobs.contains(blob_id) {
-            meta.png_blobs.push(*blob_id);
-        }
-    }
-    meta.last_error = None;
-    meta.retry_at_ms = None;
-    state.update_post_stage(post_id, PostStage::Rendered);
 }
 
 fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
@@ -383,7 +364,6 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                     needs_republish: false,
                     decided_by: None,
                     decided_at_ms: None,
-                    decision_reason: None,
                     publish_retry_at_ms: None,
                     publish_last_error: None,
                     publish_attempt: 0,
@@ -472,7 +452,6 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                 meta.decision = Some(*decision);
                 meta.decided_by = Some(decided_by.clone());
                 meta.decided_at_ms = Some(*decided_at_ms);
-                meta.decision_reason = None;
             }
             if let Some(post_id) = post_id {
                 let stage = match decision {
@@ -480,16 +459,9 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                     crate::event::ReviewDecision::Rejected => PostStage::Rejected,
                     crate::event::ReviewDecision::Deferred => PostStage::ReviewPending,
                     crate::event::ReviewDecision::Skipped => PostStage::Skipped,
-                    crate::event::ReviewDecision::Deleted => PostStage::Deleted,
+                    crate::event::ReviewDecision::Deleted => PostStage::Rejected,
                 };
                 state.update_post_stage(post_id, stage);
-            }
-        }
-        ReviewEvent::ReviewDecisionReasonRecorded {
-            review_id, reason, ..
-        } => {
-            if let Some(meta) = state.reviews.get_mut(review_id) {
-                meta.decision_reason = reason.clone();
             }
         }
         ReviewEvent::ReviewExternalNumberSet {
@@ -558,7 +530,6 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
             }
         }
         ReviewEvent::ReviewCommentAdded { .. }
-        | ReviewEvent::ReviewSubmitterNoticeRequested { .. }
         | ReviewEvent::ReviewReplyRequested { .. }
         | ReviewEvent::ReviewExpandRequested { .. }
         | ReviewEvent::ReviewDisplayRequested { .. }
@@ -769,140 +740,7 @@ fn reduce_send(state: &mut StateView, event: &SendEvent) {
             }
             state.update_post_stage(*post_id, PostStage::Manual);
         }
-        SendEvent::QzonePostPublished {
-            group_id,
-            account_id,
-            remote_id,
-            text,
-            items,
-        } => {
-            let key = crate::event::QzonePublicationKey {
-                account_id: account_id.clone(),
-                remote_id: remote_id.clone(),
-            };
-            state.qzone_publications.insert(
-                key.clone(),
-                QzonePublicationMeta {
-                    group_id: group_id.clone(),
-                    account_id: account_id.clone(),
-                    remote_id: remote_id.clone(),
-                    text: text.clone(),
-                    items: items.clone(),
-                    withdrawn_posts: Default::default(),
-                    pending_withdrawn_posts: Default::default(),
-                },
-            );
-            for item in items {
-                state
-                    .qzone_publications_by_post
-                    .entry(item.post_id)
-                    .or_default()
-                    .insert(key.clone());
-            }
-        }
-        SendEvent::QzonePostWithdrawRequested {
-            account_id,
-            remote_id,
-            withdrawn_post_ids,
-            ..
-        } => {
-            let key = crate::event::QzonePublicationKey {
-                account_id: account_id.clone(),
-                remote_id: remote_id.clone(),
-            };
-            if let Some(publication) = state.qzone_publications.get_mut(&key) {
-                publication
-                    .pending_withdrawn_posts
-                    .extend(withdrawn_post_ids.iter().copied());
-            }
-        }
-        SendEvent::QzonePostWithdrawSucceeded {
-            post_id,
-            account_id,
-            remote_id,
-            text,
-            withdrawn_post_ids,
-            ..
-        } => {
-            let effective_withdrawn_post_ids =
-                effective_withdrawn_post_ids(*post_id, withdrawn_post_ids);
-            let key = crate::event::QzonePublicationKey {
-                account_id: account_id.clone(),
-                remote_id: remote_id.clone(),
-            };
-            if let Some(publication) = state.qzone_publications.get_mut(&key) {
-                publication.text = text.clone();
-                publication
-                    .withdrawn_posts
-                    .extend(effective_withdrawn_post_ids.iter().copied());
-                for withdrawn_post_id in &effective_withdrawn_post_ids {
-                    publication
-                        .pending_withdrawn_posts
-                        .remove(withdrawn_post_id);
-                }
-            }
-            if let Some(meta) = state.posts.get_mut(post_id) {
-                meta.last_error = None;
-            }
-            for withdrawn_post_id in &effective_withdrawn_post_ids {
-                if let Some(meta) = state.posts.get_mut(withdrawn_post_id) {
-                    meta.last_error = None;
-                }
-                if qzone_post_fully_withdrawn(state, *withdrawn_post_id) {
-                    state.update_post_stage(*withdrawn_post_id, PostStage::Withdrawn);
-                }
-            }
-        }
-        SendEvent::QzonePostWithdrawFailed {
-            post_id,
-            account_id,
-            remote_id,
-            withdrawn_post_ids,
-            error,
-        } => {
-            let effective_withdrawn_post_ids =
-                effective_withdrawn_post_ids(*post_id, withdrawn_post_ids);
-            let key = crate::event::QzonePublicationKey {
-                account_id: account_id.clone(),
-                remote_id: remote_id.clone(),
-            };
-            if let Some(publication) = state.qzone_publications.get_mut(&key) {
-                for withdrawn_post_id in &effective_withdrawn_post_ids {
-                    publication
-                        .pending_withdrawn_posts
-                        .remove(withdrawn_post_id);
-                }
-            }
-            if let Some(meta) = state.posts.get_mut(post_id) {
-                meta.last_error = Some(error.clone());
-            }
-        }
     }
-}
-
-fn effective_withdrawn_post_ids(
-    post_id: crate::ids::PostId,
-    withdrawn_post_ids: &[crate::ids::PostId],
-) -> Vec<crate::ids::PostId> {
-    if withdrawn_post_ids.is_empty() {
-        vec![post_id]
-    } else {
-        withdrawn_post_ids.to_vec()
-    }
-}
-
-fn qzone_post_fully_withdrawn(state: &StateView, post_id: crate::ids::PostId) -> bool {
-    let Some(publication_keys) = state.qzone_publications_by_post.get(&post_id) else {
-        return false;
-    };
-    !publication_keys.is_empty()
-        && publication_keys.iter().all(|key| {
-            state
-                .qzone_publications
-                .get(key)
-                .map(|publication| publication.withdrawn_posts.contains(&post_id))
-                .unwrap_or(false)
-        })
 }
 
 fn reduce_blob(state: &mut StateView, event: &BlobEvent) {

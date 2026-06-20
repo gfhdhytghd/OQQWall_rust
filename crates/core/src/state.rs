@@ -1,9 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::draft::{Draft, IngressMessage, MediaReference};
-use crate::event::{
-    InputStatusKind, QzonePublicationItem, QzonePublicationKey, ReviewDecision, SendPriority,
-};
+use crate::draft::{Draft, IngressMessage, IngressRouteMeta, MediaReference};
+use crate::event::{InputStatusKind, ReviewDecision, SendPriority};
 use crate::ids::{
     AccountId, AuditMsgId, BlobId, EventId, ExternalCode, GroupId, IngressId, PostId, ReviewCode,
     ReviewId, SessionId, TimestampMs,
@@ -18,6 +16,8 @@ pub struct IngressMeta {
     pub sender_name: Option<String>,
     pub group_id: GroupId,
     pub platform_msg_id: String,
+    #[serde(default)]
+    pub route_meta: Option<IngressRouteMeta>,
     pub received_at_ms: TimestampMs,
 }
 
@@ -55,11 +55,9 @@ pub enum PostStage {
     Sending,
     Sent,
     Rejected,
-    Deleted,
     Skipped,
     Manual,
     Failed,
-    Withdrawn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,8 +82,6 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderMeta {
     pub png_blob: Option<BlobId>,
-    #[serde(default)]
-    pub png_blobs: Vec<BlobId>,
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_attempt: u32,
@@ -104,8 +100,6 @@ pub struct ReviewMeta {
     pub needs_republish: bool,
     pub decided_by: Option<String>,
     pub decided_at_ms: Option<TimestampMs>,
-    #[serde(default)]
-    pub decision_reason: Option<String>,
     #[serde(default)]
     pub publish_retry_at_ms: Option<TimestampMs>,
     #[serde(default)]
@@ -183,19 +177,6 @@ pub struct GroupRuntime {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QzonePublicationMeta {
-    pub group_id: GroupId,
-    pub account_id: AccountId,
-    pub remote_id: String,
-    pub text: String,
-    pub items: Vec<QzonePublicationItem>,
-    #[serde(default)]
-    pub withdrawn_posts: BTreeSet<PostId>,
-    #[serde(default)]
-    pub pending_withdrawn_posts: BTreeSet<PostId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobMeta {
     pub blob_id: BlobId,
     pub size_bytes: u64,
@@ -244,10 +225,6 @@ pub struct StateView {
 
     pub accounts: HashMap<AccountId, AccountRuntime>,
     pub group_runtime: HashMap<GroupId, GroupRuntime>,
-    #[serde(default)]
-    pub qzone_publications: HashMap<QzonePublicationKey, QzonePublicationMeta>,
-    #[serde(default)]
-    pub qzone_publications_by_post: HashMap<PostId, BTreeSet<QzonePublicationKey>>,
 
     pub blobs: HashMap<BlobId, BlobMeta>,
     pub manual_interventions: HashSet<PostId>,
@@ -285,8 +262,6 @@ impl Default for StateView {
             next_send_seq: 1,
             accounts: HashMap::new(),
             group_runtime: HashMap::new(),
-            qzone_publications: HashMap::new(),
-            qzone_publications_by_post: HashMap::new(),
             blobs: HashMap::new(),
             manual_interventions: HashSet::new(),
         }

@@ -16,8 +16,8 @@ pub use command::{
 pub use config::{CoreConfig, GroupConfig, TimeWindow};
 pub use decide::builder::build_draft_from_messages;
 pub use draft::{
-    Draft, DraftBlock, ForwardItem, IngressAttachment, IngressMessage, MediaKind, MediaReference,
-    ReplyPreview, forward_marker, json_card_marker, poke_marker, reply_marker,
+    Draft, DraftBlock, ForwardItem, IngressAttachment, IngressMessage, IngressRouteMeta, MediaKind,
+    MediaReference, ReplyPreview, forward_marker, json_card_marker, poke_marker, reply_marker,
 };
 pub use event::{Event, EventEnvelope};
 pub use ids::{

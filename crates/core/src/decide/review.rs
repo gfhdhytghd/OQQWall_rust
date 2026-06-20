@@ -9,9 +9,7 @@ use crate::event::{
     DraftEvent, Event, EventEnvelope, IngressEvent, RenderEvent, ReviewDecision, ReviewEvent,
     ScheduleEvent, SendPriority,
 };
-use crate::ids::{
-    ActorId, ExternalCode, Id128, IngressId, PostId, ReviewCode, ReviewId, TimestampMs,
-};
+use crate::ids::{ActorId, ExternalCode, Id128, IngressId, PostId, ReviewCode, ReviewId};
 use crate::safety::detect_safe;
 use crate::state::StateView;
 
@@ -39,31 +37,31 @@ pub fn decide_review_action(
         ReviewAction::Approve => {
             build_approve_events(state, cmd, config, review_id, post_id, group_id)
         }
-        ReviewAction::Reject { reason } => {
-            let mut events = build_terminal_decision_events(
+        ReviewAction::Reject => {
+            let mut events = vec![Event::Review(ReviewEvent::ReviewDecisionRecorded {
                 review_id,
-                ReviewDecision::Rejected,
-                reason,
-                &cmd.operator_id,
-                cmd.now_ms,
-            );
+                decision: ReviewDecision::Rejected,
+                decided_by: cmd.operator_id.clone(),
+                decided_at_ms: cmd.now_ms,
+            })];
             if state.send_plans.contains_key(&post_id) {
                 events.push(Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id }));
             }
             events
         }
-        ReviewAction::Delete { reason } => {
-            let mut events = build_terminal_decision_events(
+        ReviewAction::Delete => {
+            let mut events = vec![Event::Review(ReviewEvent::ReviewDecisionRecorded {
                 review_id,
-                ReviewDecision::Deleted,
-                reason,
-                &cmd.operator_id,
-                cmd.now_ms,
-            );
+                decision: ReviewDecision::Deleted,
+                decided_by: cmd.operator_id.clone(),
+                decided_at_ms: cmd.now_ms,
+            })];
             if let Some(event) = maybe_assign_external_code(state, &group_id, post_id) {
                 events.push(event);
             }
-            events.push(Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id }));
+            if state.send_plans.contains_key(&post_id) {
+                events.push(Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id }));
+            }
             events
         }
         ReviewAction::Defer { delay_ms } => vec![
@@ -180,45 +178,6 @@ pub fn decide_review_action(
             build_merge_events(state, cmd, review_id, *review_code)
         }
     }
-}
-
-fn build_terminal_decision_events(
-    review_id: ReviewId,
-    decision: ReviewDecision,
-    reason: &Option<String>,
-    decided_by: &str,
-    decided_at_ms: TimestampMs,
-) -> Vec<Event> {
-    let reason = normalize_review_reason(reason);
-    let mut events = vec![
-        Event::Review(ReviewEvent::ReviewDecisionRecorded {
-            review_id,
-            decision,
-            decided_by: decided_by.to_string(),
-            decided_at_ms,
-        }),
-        Event::Review(ReviewEvent::ReviewDecisionReasonRecorded {
-            review_id,
-            decision,
-            reason: reason.clone(),
-        }),
-    ];
-    if matches!(decision, ReviewDecision::Rejected) {
-        events.push(Event::Review(ReviewEvent::ReviewSubmitterNoticeRequested {
-            review_id,
-            kind: crate::event::ReviewSubmitterNoticeKind::Rejected,
-            reason,
-        }));
-    }
-    events
-}
-
-fn normalize_review_reason(reason: &Option<String>) -> Option<String> {
-    reason
-        .as_deref()
-        .map(str::trim)
-        .filter(|reason| !reason.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 pub fn decide_review_action_batch(
@@ -478,6 +437,7 @@ fn build_ingress_sync_events(state: &StateView, post_id: crate::ids::PostId) -> 
             sender_name: meta.sender_name.clone(),
             group_id: meta.group_id.clone(),
             platform_msg_id: meta.platform_msg_id.clone(),
+            route_meta: meta.route_meta.clone(),
             received_at_ms: meta.received_at_ms,
             message: message.clone(),
         }));
@@ -666,12 +626,8 @@ fn count_group_queue_images(
 fn count_post_images(state: &StateView, post_id: PostId) -> usize {
     let mut total: usize = 0;
     if let Some(render) = state.render.get(&post_id) {
-        if render.png_blobs.is_empty() {
-            if render.png_blob.is_some() {
-                total = total.saturating_add(1);
-            }
-        } else {
-            total = total.saturating_add(render.png_blobs.len());
+        if render.png_blob.is_some() {
+            total = total.saturating_add(1);
         }
     }
     if let Some(ingress_ids) = state.post_ingress.get(&post_id) {

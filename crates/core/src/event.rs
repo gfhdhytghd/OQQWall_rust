@@ -1,4 +1,4 @@
-use crate::draft::{Draft, IngressMessage};
+use crate::draft::{Draft, IngressMessage, IngressRouteMeta};
 use crate::ids::{
     AccountId, ActorId, AuditMsgId, BlobId, CorrelationId, EventId, ExternalCode, GroupId,
     IngressId, PostId, RemotePostId, ReviewCode, ReviewId, SessionId, TimestampMs,
@@ -64,6 +64,8 @@ pub enum IngressEvent {
         sender_name: Option<String>,
         group_id: GroupId,
         platform_msg_id: String,
+        #[serde(default)]
+        route_meta: Option<IngressRouteMeta>,
         received_at_ms: TimestampMs,
         message: IngressMessage,
     },
@@ -75,6 +77,8 @@ pub enum IngressEvent {
         sender_name: Option<String>,
         group_id: GroupId,
         platform_msg_id: String,
+        #[serde(default)]
+        route_meta: Option<IngressRouteMeta>,
         received_at_ms: TimestampMs,
         message: IngressMessage,
     },
@@ -178,10 +182,6 @@ pub enum RenderEvent {
         post_id: PostId,
         blob_id: BlobId,
     },
-    PngBatchReady {
-        post_id: PostId,
-        blob_ids: Vec<BlobId>,
-    },
     RenderFailed {
         post_id: PostId,
         attempt: u32,
@@ -220,19 +220,9 @@ pub enum ReviewEvent {
         decided_by: String,
         decided_at_ms: TimestampMs,
     },
-    ReviewDecisionReasonRecorded {
-        review_id: ReviewId,
-        decision: ReviewDecision,
-        reason: Option<String>,
-    },
     ReviewCommentAdded {
         review_id: ReviewId,
         text: String,
-    },
-    ReviewSubmitterNoticeRequested {
-        review_id: ReviewId,
-        kind: ReviewSubmitterNoticeKind,
-        reason: Option<String>,
     },
     ReviewReplyRequested {
         review_id: ReviewId,
@@ -301,12 +291,6 @@ pub enum ReviewDecision {
     Deleted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ReviewSubmitterNoticeKind {
-    Rejected,
-    Deleted,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum SendPriority {
     High,
@@ -346,21 +330,6 @@ pub enum GroupFlushReason {
     Manual,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct QzonePublicationKey {
-    pub account_id: AccountId,
-    pub remote_id: RemotePostId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QzonePublicationItem {
-    pub post_id: PostId,
-    pub external_code: ExternalCode,
-    #[serde(default)]
-    pub image_offset: usize,
-    pub image_count: usize,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendEvent {
     SendStarted {
@@ -397,40 +366,6 @@ pub enum SendEvent {
     SendGaveUp {
         post_id: PostId,
         reason: String,
-    },
-    QzonePostPublished {
-        group_id: GroupId,
-        account_id: AccountId,
-        remote_id: RemotePostId,
-        text: String,
-        items: Vec<QzonePublicationItem>,
-    },
-    QzonePostWithdrawRequested {
-        post_id: PostId,
-        group_id: GroupId,
-        account_id: AccountId,
-        remote_id: RemotePostId,
-        text: String,
-        items: Vec<QzonePublicationItem>,
-        withdrawn_post_ids: Vec<PostId>,
-        requested_at_ms: TimestampMs,
-    },
-    QzonePostWithdrawSucceeded {
-        post_id: PostId,
-        account_id: AccountId,
-        remote_id: RemotePostId,
-        text: String,
-        #[serde(default)]
-        withdrawn_post_ids: Vec<PostId>,
-        withdrawn_at_ms: TimestampMs,
-    },
-    QzonePostWithdrawFailed {
-        post_id: PostId,
-        account_id: AccountId,
-        remote_id: RemotePostId,
-        #[serde(default)]
-        withdrawn_post_ids: Vec<PostId>,
-        error: String,
     },
 }
 

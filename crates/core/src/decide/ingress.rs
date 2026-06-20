@@ -42,6 +42,7 @@ pub fn decide_ingress(state: &StateView, cmd: &IngressCommand, config: &CoreConf
         sender_name: cmd.sender_name.clone(),
         group_id: cmd.group_id.clone(),
         platform_msg_id: cmd.platform_msg_id.clone(),
+        route_meta: cmd.route_meta.clone(),
         received_at_ms: cmd.received_at_ms,
         message: cmd.message.clone(),
     }));
