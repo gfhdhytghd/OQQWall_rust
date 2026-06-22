@@ -5,7 +5,7 @@ use crate::event::{
     IngressEvent, InputStatusKind, ManualEvent, MediaEvent, RenderEvent, ReviewEvent,
     ScheduleEvent, SendEvent, SessionEvent,
 };
-use crate::ids::{BlobId, PostId};
+use crate::ids::BlobId;
 use crate::state::{
     AccountRuntime, BlobMeta, GroupRuntime, InputStatusMeta, MediaFetchKey, MediaFetchMeta,
     PostMeta, PostStage, QzonePublicationMeta, RenderMeta, ReviewMeta, SendDueKey, SendPlan,
@@ -51,6 +51,7 @@ fn reduce_ingress(state: &mut StateView, event: &IngressEvent) {
             sender_name,
             group_id,
             platform_msg_id,
+            route_meta,
             received_at_ms,
             message,
         }
@@ -62,6 +63,7 @@ fn reduce_ingress(state: &mut StateView, event: &IngressEvent) {
             sender_name,
             group_id,
             platform_msg_id,
+            route_meta,
             received_at_ms,
             message,
         } => {
@@ -75,6 +77,7 @@ fn reduce_ingress(state: &mut StateView, event: &IngressEvent) {
                     sender_name: sender_name.clone(),
                     group_id: group_id.clone(),
                     platform_msg_id: platform_msg_id.clone(),
+                    route_meta: route_meta.clone(),
                     received_at_ms: *received_at_ms,
                 },
             );
@@ -339,7 +342,7 @@ fn reduce_render(state: &mut StateView, event: &RenderEvent) {
     }
 }
 
-fn reduce_png_ready(state: &mut StateView, post_id: PostId, blob_ids: &[BlobId]) {
+fn reduce_png_ready(state: &mut StateView, post_id: crate::ids::PostId, blob_ids: &[BlobId]) {
     if blob_ids.is_empty() {
         return;
     }
@@ -472,7 +475,6 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                 meta.decision = Some(*decision);
                 meta.decided_by = Some(decided_by.clone());
                 meta.decided_at_ms = Some(*decided_at_ms);
-                meta.decision_reason = None;
             }
             if let Some(post_id) = post_id {
                 let stage = match decision {

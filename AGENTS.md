@@ -45,8 +45,10 @@
 - Persistent data and snapshots belong under `data/`; do not commit generated files in `target/`.
 
 ## Container Build Environment
+- On this machine, prefer **WSL Linux filesystem builds** over Windows-side `cargo`.
+- Read `WSL_BUILD_NOTE.md` before running Rust compilation commands from a Windows-hosted checkout.
 - Use `Dockerfile.rust-glibc231-toolchain` to build a fixed toolchain image based on `rust-glibc231:20.04`.
-- The image includes required build deps: `python3`, `pkg-config`, `libfreetype6-dev`, `libfontconfig1-dev`, `ffmpeg`, `ca-certificates`.
+- The image includes required build deps: `python3`, `pkg-config`, `libfreetype6-dev`, `libfontconfig1-dev`, `ca-certificates`.
 - `cargo build`, `cargo test`, and `cargo check` should all run in this container environment for consistency.
 - Build image:
   - `docker build --network host -t rust-glibc231:20.04-oqqwall -f Dockerfile.rust-glibc231-toolchain .`

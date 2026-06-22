@@ -1,4 +1,4 @@
-use crate::draft::{Draft, IngressMessage};
+use crate::draft::{Draft, IngressMessage, IngressRouteMeta};
 use crate::ids::{
     AccountId, ActorId, AuditMsgId, BlobId, CorrelationId, EventId, ExternalCode, GroupId,
     IngressId, PostId, RemotePostId, ReviewCode, ReviewId, SessionId, TimestampMs,
@@ -64,6 +64,8 @@ pub enum IngressEvent {
         sender_name: Option<String>,
         group_id: GroupId,
         platform_msg_id: String,
+        #[serde(default)]
+        route_meta: Option<IngressRouteMeta>,
         received_at_ms: TimestampMs,
         message: IngressMessage,
     },
@@ -75,6 +77,8 @@ pub enum IngressEvent {
         sender_name: Option<String>,
         group_id: GroupId,
         platform_msg_id: String,
+        #[serde(default)]
+        route_meta: Option<IngressRouteMeta>,
         received_at_ms: TimestampMs,
         message: IngressMessage,
     },
@@ -358,6 +362,7 @@ pub struct QzonePublicationItem {
     pub external_code: ExternalCode,
     #[serde(default)]
     pub image_offset: usize,
+    #[serde(default)]
     pub image_count: usize,
 }
 
@@ -420,7 +425,6 @@ pub enum SendEvent {
         account_id: AccountId,
         remote_id: RemotePostId,
         text: String,
-        #[serde(default)]
         withdrawn_post_ids: Vec<PostId>,
         withdrawn_at_ms: TimestampMs,
     },
@@ -428,7 +432,6 @@ pub enum SendEvent {
         post_id: PostId,
         account_id: AccountId,
         remote_id: RemotePostId,
-        #[serde(default)]
         withdrawn_post_ids: Vec<PostId>,
         error: String,
     },

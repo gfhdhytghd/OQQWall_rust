@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::draft::{Draft, IngressMessage, MediaReference};
+use crate::draft::{Draft, IngressMessage, IngressRouteMeta, MediaReference};
 use crate::event::{
     InputStatusKind, QzonePublicationItem, QzonePublicationKey, ReviewDecision, SendPriority,
 };
@@ -18,6 +18,8 @@ pub struct IngressMeta {
     pub sender_name: Option<String>,
     pub group_id: GroupId,
     pub platform_msg_id: String,
+    #[serde(default)]
+    pub route_meta: Option<IngressRouteMeta>,
     pub received_at_ms: TimestampMs,
 }
 

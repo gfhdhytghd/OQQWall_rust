@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::future::Future;
@@ -12,17 +12,14 @@ use oqqwall_rust_core::command::{
     ReviewActionBatchCommand, ReviewActionCommand, ShortcutScope,
 };
 use oqqwall_rust_core::draft::{
-    IngressAttachment, IngressMessage, MediaKind, MediaReference, ReplyPreview, json_card_marker,
-    poke_marker, reply_marker,
+    IngressAttachment, IngressMessage, IngressRouteMeta, MediaKind, MediaReference, ReplyPreview,
+    json_card_marker, poke_marker, reply_marker,
 };
 use oqqwall_rust_core::event::{
-    BlobEvent, DraftEvent, Event, IngressEvent, InputStatusKind, MediaEvent, QzonePublicationItem,
-    RenderEvent, ReviewDecision, ReviewEvent, ReviewSubmitterNoticeKind, ScheduleEvent, SendEvent,
-    SendPriority,
+    BlobEvent, DraftEvent, Event, IngressEvent, InputStatusKind, MediaEvent, ReviewDecision,
+    ReviewEvent, ScheduleEvent, SendEvent, SendPriority,
 };
-use oqqwall_rust_core::ids::{
-    AccountId, BlobId, ExternalCode, IngressId, PostId, RemotePostId, ReviewCode, ReviewId,
-};
+use oqqwall_rust_core::ids::{BlobId, ExternalCode, IngressId, PostId, ReviewCode, ReviewId};
 use oqqwall_rust_core::{Command, IngressCommand, StateView, derive_blob_id, derive_ingress_id};
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use std::path::{Path, PathBuf};
@@ -30,6 +27,8 @@ use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use tokio::net::TcpListener;
@@ -69,6 +68,736 @@ pub struct NapCatConfig {
     pub access_token: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendSuccessReplyConfig {
+    pub enabled: bool,
+    pub text_template: String,
+    pub images: Vec<String>,
+}
+
+impl Default for SendSuccessReplyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            text_template: "#<code>已发送".to_string(),
+            images: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserNotificationStage {
+    QueueEntered,
+    ReviewQueued,
+    SendSucceeded,
+    Rejected,
+}
+
+impl UserNotificationStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UserNotificationStage::QueueEntered => "queue_entered",
+            UserNotificationStage::ReviewQueued => "review_queued",
+            UserNotificationStage::SendSucceeded => "send_succeeded",
+            UserNotificationStage::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserNotificationTemplate {
+    pub enabled: bool,
+    pub include_post_tags: bool,
+    pub text_template: String,
+    pub tags: Vec<String>,
+    pub images: Vec<String>,
+}
+
+impl UserNotificationTemplate {
+    pub fn queue_entered_default() -> Self {
+        Self {
+            enabled: false,
+            include_post_tags: false,
+            text_template: "#<code>已进入发送队列".to_string(),
+            tags: Vec::new(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn send_succeeded_default() -> Self {
+        Self {
+            enabled: true,
+            include_post_tags: false,
+            text_template: "#<code>已发送".to_string(),
+            tags: Vec::new(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn rejected_default() -> Self {
+        Self {
+            enabled: true,
+            include_post_tags: false,
+            text_template: "你的投稿已被拒，请修改后再发送".to_string(),
+            tags: Vec::new(),
+            images: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TagValueMappingGroup {
+    pub tag: String,
+    #[serde(default)]
+    pub mappings: Vec<TagValueMappingEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TagValueMappingEntry {
+    pub source: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserNotificationSettings {
+    pub queue_entered: UserNotificationTemplate,
+    pub review_queued: UserNotificationTemplate,
+    pub send_succeeded: UserNotificationTemplate,
+    pub rejected: UserNotificationTemplate,
+    #[serde(default)]
+    pub webhook_tag_map: HashMap<String, String>,
+    #[serde(default)]
+    pub tag_value_maps: Vec<TagValueMappingGroup>,
+}
+
+impl Default for UserNotificationSettings {
+    fn default() -> Self {
+        Self {
+            queue_entered: UserNotificationTemplate::queue_entered_default(),
+            review_queued: UserNotificationTemplate::queue_entered_default(),
+            send_succeeded: UserNotificationTemplate::send_succeeded_default(),
+            rejected: UserNotificationTemplate::rejected_default(),
+            webhook_tag_map: HashMap::new(),
+            tag_value_maps: Vec::new(),
+        }
+    }
+}
+
+impl UserNotificationSettings {
+    pub fn stage(&self, stage: UserNotificationStage) -> &UserNotificationTemplate {
+        match stage {
+            UserNotificationStage::QueueEntered => &self.queue_entered,
+            UserNotificationStage::ReviewQueued => &self.review_queued,
+            UserNotificationStage::SendSucceeded => &self.send_succeeded,
+            UserNotificationStage::Rejected => &self.rejected,
+        }
+    }
+}
+
+fn agent_command_enabled_default() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCommandConfig {
+    #[serde(default = "agent_command_enabled_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub blocks: Vec<AgentCommandBlock>,
+}
+
+impl Default for AgentCommandConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            description: String::new(),
+            blocks: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommandQueueInsertPosition {
+    Before,
+    After,
+}
+
+impl Default for AgentCommandQueueInsertPosition {
+    fn default() -> Self {
+        Self::Before
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommandShortcutScope {
+    Review,
+    Global,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum AgentCommandReviewAction {
+    Approve,
+    Reject,
+    Delete,
+    Defer {
+        #[serde(default)]
+        delay_ms: String,
+    },
+    Skip,
+    Immediate,
+    Refresh,
+    Rerender,
+    SelectAllMessages,
+    ToggleAnonymous,
+    ExpandAudit,
+    Show,
+    Comment {
+        #[serde(default)]
+        text_template: String,
+    },
+    Reply {
+        #[serde(default)]
+        text_template: String,
+    },
+    Blacklist {
+        #[serde(default)]
+        reason_template: String,
+    },
+    QuickReply {
+        #[serde(default)]
+        key_template: String,
+    },
+    Merge {
+        #[serde(default)]
+        target_review_code: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum AgentCommandGlobalAction {
+    Help,
+    Recall {
+        #[serde(default)]
+        review_code: String,
+    },
+    Withdraw {
+        #[serde(default)]
+        review_code: String,
+    },
+    Info {
+        #[serde(default)]
+        review_code: String,
+    },
+    ManualRelogin,
+    AutoRelogin,
+    PendingList,
+    PendingClear,
+    SendQueueClear,
+    SendQueueFlush,
+    SendInFlightClear,
+    BlacklistList,
+    BlacklistAdd {
+        #[serde(default)]
+        sender_id: String,
+        #[serde(default)]
+        reason_template: String,
+    },
+    BlacklistRemove {
+        #[serde(default)]
+        sender_id: String,
+    },
+    SetExternalNumber {
+        #[serde(default)]
+        value_template: String,
+    },
+    QuickReplyList,
+    QuickReplyAdd {
+        #[serde(default)]
+        key_template: String,
+        #[serde(default)]
+        text_template: String,
+    },
+    QuickReplyDelete {
+        #[serde(default)]
+        key_template: String,
+    },
+    ShortcutList,
+    ShortcutAdd {
+        scope: AgentCommandShortcutScope,
+        #[serde(default)]
+        key_template: String,
+        #[serde(default)]
+        definition_template: String,
+    },
+    ShortcutDelete {
+        scope: AgentCommandShortcutScope,
+        #[serde(default)]
+        key_template: String,
+    },
+    SelfCheck,
+    SystemRepair,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentCommandBlock {
+    ReplyPrivateMessage {
+        #[serde(default)]
+        text_template: String,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        images: Vec<String>,
+    },
+    StartSubmissionSession,
+    FinishSubmissionSession,
+    ResumeSubmissionSession,
+    SubmitSubmissionSession,
+    CancelSubmissionSession,
+    InsertQueuedPost {
+        #[serde(default)]
+        moving_post_code: String,
+        #[serde(default)]
+        anchor_post_code: String,
+        #[serde(default)]
+        position: AgentCommandQueueInsertPosition,
+    },
+    ExecuteReviewAction {
+        #[serde(default)]
+        review_code: String,
+        action: AgentCommandReviewAction,
+    },
+    ExecuteGlobalAction {
+        action: AgentCommandGlobalAction,
+    },
+    SendWebhook {
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        source_webhook: String,
+        #[serde(default)]
+        text_template: String,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        images: Vec<String>,
+    },
+}
+
+pub fn validate_agent_command_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim().trim_start_matches('#').trim();
+    if trimmed.is_empty() {
+        return Err("agent 指令名不能为空".to_string());
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("agent 指令名不能包含空白字符".to_string());
+    }
+    if is_builtin_private_submission_command_name(trimmed) {
+        return Err(format!("agent 指令名与内置私聊指令冲突：{}", trimmed));
+    }
+    Ok(trimmed.to_string())
+}
+
+pub fn normalize_agent_command_config(config: &AgentCommandConfig) -> AgentCommandConfig {
+    AgentCommandConfig {
+        enabled: config.enabled,
+        description: config.description.trim().to_string(),
+        blocks: config
+            .blocks
+            .iter()
+            .map(normalize_agent_command_block)
+            .collect(),
+    }
+}
+
+pub fn validate_agent_command_config(
+    name: &str,
+    config: &AgentCommandConfig,
+) -> Result<(), String> {
+    let normalized_name = validate_agent_command_name(name)?;
+    if config.blocks.is_empty() {
+        return Err(format!(
+            "agent_commands['{}'] 至少需要一个积木块",
+            normalized_name
+        ));
+    }
+    for (index, block) in config.blocks.iter().enumerate() {
+        validate_agent_command_block(&normalized_name, index, block)?;
+    }
+    Ok(())
+}
+
+fn normalize_agent_command_block(block: &AgentCommandBlock) -> AgentCommandBlock {
+    match block {
+        AgentCommandBlock::ReplyPrivateMessage {
+            text_template,
+            tags,
+            images,
+        } => AgentCommandBlock::ReplyPrivateMessage {
+            text_template: text_template.replace("\r\n", "\n"),
+            tags: normalize_agent_command_values(tags),
+            images: normalize_agent_command_values(images),
+        },
+        AgentCommandBlock::StartSubmissionSession => AgentCommandBlock::StartSubmissionSession,
+        AgentCommandBlock::FinishSubmissionSession => AgentCommandBlock::FinishSubmissionSession,
+        AgentCommandBlock::ResumeSubmissionSession => AgentCommandBlock::ResumeSubmissionSession,
+        AgentCommandBlock::SubmitSubmissionSession => AgentCommandBlock::SubmitSubmissionSession,
+        AgentCommandBlock::CancelSubmissionSession => AgentCommandBlock::CancelSubmissionSession,
+        AgentCommandBlock::InsertQueuedPost {
+            moving_post_code,
+            anchor_post_code,
+            position,
+        } => AgentCommandBlock::InsertQueuedPost {
+            moving_post_code: moving_post_code.trim().to_string(),
+            anchor_post_code: anchor_post_code.trim().to_string(),
+            position: position.clone(),
+        },
+        AgentCommandBlock::ExecuteReviewAction {
+            review_code,
+            action,
+        } => AgentCommandBlock::ExecuteReviewAction {
+            review_code: review_code.trim().to_string(),
+            action: normalize_agent_command_review_action(action),
+        },
+        AgentCommandBlock::ExecuteGlobalAction { action } => {
+            AgentCommandBlock::ExecuteGlobalAction {
+                action: normalize_agent_command_global_action(action),
+            }
+        }
+        AgentCommandBlock::SendWebhook {
+            url,
+            source_webhook,
+            text_template,
+            tags,
+            images,
+        } => AgentCommandBlock::SendWebhook {
+            url: url.trim().to_string(),
+            source_webhook: source_webhook.trim().to_string(),
+            text_template: text_template.replace("\r\n", "\n"),
+            tags: normalize_agent_command_values(tags),
+            images: normalize_agent_command_values(images),
+        },
+    }
+}
+
+fn normalize_agent_command_values(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect()
+}
+
+fn normalize_agent_command_review_action(
+    action: &AgentCommandReviewAction,
+) -> AgentCommandReviewAction {
+    match action {
+        AgentCommandReviewAction::Approve => AgentCommandReviewAction::Approve,
+        AgentCommandReviewAction::Reject => AgentCommandReviewAction::Reject,
+        AgentCommandReviewAction::Delete => AgentCommandReviewAction::Delete,
+        AgentCommandReviewAction::Defer { delay_ms } => AgentCommandReviewAction::Defer {
+            delay_ms: delay_ms.trim().to_string(),
+        },
+        AgentCommandReviewAction::Skip => AgentCommandReviewAction::Skip,
+        AgentCommandReviewAction::Immediate => AgentCommandReviewAction::Immediate,
+        AgentCommandReviewAction::Refresh => AgentCommandReviewAction::Refresh,
+        AgentCommandReviewAction::Rerender => AgentCommandReviewAction::Rerender,
+        AgentCommandReviewAction::SelectAllMessages => AgentCommandReviewAction::SelectAllMessages,
+        AgentCommandReviewAction::ToggleAnonymous => AgentCommandReviewAction::ToggleAnonymous,
+        AgentCommandReviewAction::ExpandAudit => AgentCommandReviewAction::ExpandAudit,
+        AgentCommandReviewAction::Show => AgentCommandReviewAction::Show,
+        AgentCommandReviewAction::Comment { text_template } => AgentCommandReviewAction::Comment {
+            text_template: text_template.replace("\r\n", "\n"),
+        },
+        AgentCommandReviewAction::Reply { text_template } => AgentCommandReviewAction::Reply {
+            text_template: text_template.replace("\r\n", "\n"),
+        },
+        AgentCommandReviewAction::Blacklist { reason_template } => {
+            AgentCommandReviewAction::Blacklist {
+                reason_template: reason_template.replace("\r\n", "\n"),
+            }
+        }
+        AgentCommandReviewAction::QuickReply { key_template } => {
+            AgentCommandReviewAction::QuickReply {
+                key_template: key_template.trim().to_string(),
+            }
+        }
+        AgentCommandReviewAction::Merge { target_review_code } => AgentCommandReviewAction::Merge {
+            target_review_code: target_review_code.trim().to_string(),
+        },
+    }
+}
+
+fn normalize_agent_command_global_action(
+    action: &AgentCommandGlobalAction,
+) -> AgentCommandGlobalAction {
+    match action {
+        AgentCommandGlobalAction::Help => AgentCommandGlobalAction::Help,
+        AgentCommandGlobalAction::Recall { review_code } => AgentCommandGlobalAction::Recall {
+            review_code: review_code.trim().to_string(),
+        },
+        AgentCommandGlobalAction::Withdraw { review_code } => AgentCommandGlobalAction::Withdraw {
+            review_code: review_code.trim().to_string(),
+        },
+        AgentCommandGlobalAction::Info { review_code } => AgentCommandGlobalAction::Info {
+            review_code: review_code.trim().to_string(),
+        },
+        AgentCommandGlobalAction::ManualRelogin => AgentCommandGlobalAction::ManualRelogin,
+        AgentCommandGlobalAction::AutoRelogin => AgentCommandGlobalAction::AutoRelogin,
+        AgentCommandGlobalAction::PendingList => AgentCommandGlobalAction::PendingList,
+        AgentCommandGlobalAction::PendingClear => AgentCommandGlobalAction::PendingClear,
+        AgentCommandGlobalAction::SendQueueClear => AgentCommandGlobalAction::SendQueueClear,
+        AgentCommandGlobalAction::SendQueueFlush => AgentCommandGlobalAction::SendQueueFlush,
+        AgentCommandGlobalAction::SendInFlightClear => AgentCommandGlobalAction::SendInFlightClear,
+        AgentCommandGlobalAction::BlacklistList => AgentCommandGlobalAction::BlacklistList,
+        AgentCommandGlobalAction::BlacklistAdd {
+            sender_id,
+            reason_template,
+        } => AgentCommandGlobalAction::BlacklistAdd {
+            sender_id: sender_id.trim().to_string(),
+            reason_template: reason_template.replace("\r\n", "\n"),
+        },
+        AgentCommandGlobalAction::BlacklistRemove { sender_id } => {
+            AgentCommandGlobalAction::BlacklistRemove {
+                sender_id: sender_id.trim().to_string(),
+            }
+        }
+        AgentCommandGlobalAction::SetExternalNumber { value_template } => {
+            AgentCommandGlobalAction::SetExternalNumber {
+                value_template: value_template.trim().to_string(),
+            }
+        }
+        AgentCommandGlobalAction::QuickReplyList => AgentCommandGlobalAction::QuickReplyList,
+        AgentCommandGlobalAction::QuickReplyAdd {
+            key_template,
+            text_template,
+        } => AgentCommandGlobalAction::QuickReplyAdd {
+            key_template: key_template.trim().to_string(),
+            text_template: text_template.replace("\r\n", "\n"),
+        },
+        AgentCommandGlobalAction::QuickReplyDelete { key_template } => {
+            AgentCommandGlobalAction::QuickReplyDelete {
+                key_template: key_template.trim().to_string(),
+            }
+        }
+        AgentCommandGlobalAction::ShortcutList => AgentCommandGlobalAction::ShortcutList,
+        AgentCommandGlobalAction::ShortcutAdd {
+            scope,
+            key_template,
+            definition_template,
+        } => AgentCommandGlobalAction::ShortcutAdd {
+            scope: scope.clone(),
+            key_template: key_template.trim().to_string(),
+            definition_template: definition_template.replace("\r\n", "\n"),
+        },
+        AgentCommandGlobalAction::ShortcutDelete {
+            scope,
+            key_template,
+        } => AgentCommandGlobalAction::ShortcutDelete {
+            scope: scope.clone(),
+            key_template: key_template.trim().to_string(),
+        },
+        AgentCommandGlobalAction::SelfCheck => AgentCommandGlobalAction::SelfCheck,
+        AgentCommandGlobalAction::SystemRepair => AgentCommandGlobalAction::SystemRepair,
+    }
+}
+
+fn validate_agent_command_block(
+    command_name: &str,
+    index: usize,
+    block: &AgentCommandBlock,
+) -> Result<(), String> {
+    match block {
+        AgentCommandBlock::ReplyPrivateMessage { .. }
+        | AgentCommandBlock::StartSubmissionSession
+        | AgentCommandBlock::FinishSubmissionSession
+        | AgentCommandBlock::ResumeSubmissionSession
+        | AgentCommandBlock::SubmitSubmissionSession
+        | AgentCommandBlock::CancelSubmissionSession => Ok(()),
+        AgentCommandBlock::InsertQueuedPost {
+            moving_post_code,
+            anchor_post_code,
+            ..
+        } => {
+            validate_agent_command_required_field(
+                command_name,
+                index,
+                "要移动的投稿编号",
+                moving_post_code,
+            )?;
+            validate_agent_command_required_field(
+                command_name,
+                index,
+                "目标投稿编号",
+                anchor_post_code,
+            )
+        }
+        AgentCommandBlock::ExecuteReviewAction {
+            review_code,
+            action,
+        } => {
+            validate_agent_command_required_field(
+                command_name,
+                index,
+                "审核目标编号",
+                review_code,
+            )?;
+            validate_agent_command_review_action(command_name, index, action)
+        }
+        AgentCommandBlock::ExecuteGlobalAction { action } => {
+            validate_agent_command_global_action(command_name, index, action)
+        }
+        AgentCommandBlock::SendWebhook { url, .. } => {
+            if url.trim().is_empty() {
+                Err(format!(
+                    "agent_commands['{}'] 的第 {} 个积木缺少 webhook 地址",
+                    command_name,
+                    index + 1
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+fn validate_agent_command_required_field(
+    command_name: &str,
+    index: usize,
+    field_label: &str,
+    value: &str,
+) -> Result<(), String> {
+    if value.trim().is_empty() {
+        Err(format!(
+            "agent_commands['{}'] 的第 {} 个积木缺少{}",
+            command_name,
+            index + 1,
+            field_label
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_agent_command_review_action(
+    command_name: &str,
+    index: usize,
+    action: &AgentCommandReviewAction,
+) -> Result<(), String> {
+    match action {
+        AgentCommandReviewAction::Approve
+        | AgentCommandReviewAction::Reject
+        | AgentCommandReviewAction::Delete
+        | AgentCommandReviewAction::Skip
+        | AgentCommandReviewAction::Immediate
+        | AgentCommandReviewAction::Refresh
+        | AgentCommandReviewAction::Rerender
+        | AgentCommandReviewAction::SelectAllMessages
+        | AgentCommandReviewAction::ToggleAnonymous
+        | AgentCommandReviewAction::ExpandAudit
+        | AgentCommandReviewAction::Show => Ok(()),
+        AgentCommandReviewAction::Defer { delay_ms } => {
+            validate_agent_command_required_field(command_name, index, "延期毫秒数", delay_ms)
+        }
+        AgentCommandReviewAction::Comment { text_template }
+        | AgentCommandReviewAction::Reply { text_template } => {
+            validate_agent_command_required_field(command_name, index, "文本内容", text_template)
+        }
+        AgentCommandReviewAction::Blacklist { .. } => Ok(()),
+        AgentCommandReviewAction::QuickReply { key_template } => {
+            validate_agent_command_required_field(command_name, index, "快捷回复键", key_template)
+        }
+        AgentCommandReviewAction::Merge { target_review_code } => {
+            validate_agent_command_required_field(
+                command_name,
+                index,
+                "合并目标编号",
+                target_review_code,
+            )
+        }
+    }
+}
+
+fn validate_agent_command_global_action(
+    command_name: &str,
+    index: usize,
+    action: &AgentCommandGlobalAction,
+) -> Result<(), String> {
+    match action {
+        AgentCommandGlobalAction::Help
+        | AgentCommandGlobalAction::ManualRelogin
+        | AgentCommandGlobalAction::AutoRelogin
+        | AgentCommandGlobalAction::PendingList
+        | AgentCommandGlobalAction::PendingClear
+        | AgentCommandGlobalAction::SendQueueClear
+        | AgentCommandGlobalAction::SendQueueFlush
+        | AgentCommandGlobalAction::SendInFlightClear
+        | AgentCommandGlobalAction::BlacklistList
+        | AgentCommandGlobalAction::QuickReplyList
+        | AgentCommandGlobalAction::ShortcutList
+        | AgentCommandGlobalAction::SelfCheck
+        | AgentCommandGlobalAction::SystemRepair => Ok(()),
+        AgentCommandGlobalAction::Recall { review_code }
+        | AgentCommandGlobalAction::Withdraw { review_code }
+        | AgentCommandGlobalAction::Info { review_code } => {
+            validate_agent_command_required_field(command_name, index, "目标编号", review_code)
+        }
+        AgentCommandGlobalAction::BlacklistAdd { sender_id, .. }
+        | AgentCommandGlobalAction::BlacklistRemove { sender_id } => {
+            validate_agent_command_required_field(command_name, index, "用户 QQ", sender_id)
+        }
+        AgentCommandGlobalAction::SetExternalNumber { value_template } => {
+            validate_agent_command_required_field(
+                command_name,
+                index,
+                "外部编号起始值",
+                value_template,
+            )
+        }
+        AgentCommandGlobalAction::QuickReplyAdd {
+            key_template,
+            text_template,
+        } => {
+            validate_agent_command_required_field(command_name, index, "快捷回复键", key_template)?;
+            validate_agent_command_required_field(
+                command_name,
+                index,
+                "快捷回复内容",
+                text_template,
+            )
+        }
+        AgentCommandGlobalAction::QuickReplyDelete { key_template } => {
+            validate_agent_command_required_field(command_name, index, "快捷回复键", key_template)
+        }
+        AgentCommandGlobalAction::ShortcutAdd {
+            key_template,
+            definition_template,
+            ..
+        } => {
+            validate_agent_command_required_field(command_name, index, "快捷指令名", key_template)?;
+            validate_agent_command_required_field(
+                command_name,
+                index,
+                "快捷指令定义",
+                definition_template,
+            )
+        }
+        AgentCommandGlobalAction::ShortcutDelete { key_template, .. } => {
+            validate_agent_command_required_field(command_name, index, "快捷指令名", key_template)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NapCatRuntimeConfig {
     pub napcat: NapCatConfig,
@@ -79,9 +808,12 @@ pub struct NapCatRuntimeConfig {
     pub friend_request_window_sec: u32,
     pub friend_add_message: Option<String>,
     pub max_queue: usize,
+    pub max_images_per_post: usize,
+    pub user_notifications: Arc<std::sync::Mutex<UserNotificationSettings>>,
     pub quick_replies: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pub review_shortcuts: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pub global_shortcuts: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pub agent_commands: Arc<std::sync::Mutex<HashMap<String, AgentCommandConfig>>>,
 }
 
 const MAX_FORWARD_DEPTH: u32 = 4;
@@ -93,12 +825,19 @@ const FRIEND_SUPPRESS_REMOVE_CHARS: &str =
 static STARTUP_NOTICE_SENT: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
 static WS_SESSIONS: OnceLock<std::sync::Mutex<HashMap<String, NapCatWsSession>>> = OnceLock::new();
 static GROUP_ACCOUNTS: OnceLock<std::sync::Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+static GROUP_USER_NOTIFICATION_SETTINGS: OnceLock<
+    std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<UserNotificationSettings>>>>,
+> = OnceLock::new();
+static AGENT_WEBHOOK_CLIENT: OnceLock<Client> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct ReviewInfo {
     review_code: ReviewCode,
     post_id: PostId,
     group_id: String,
+    decision: Option<ReviewDecision>,
+    decided_by: Option<String>,
+    decided_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,18 +857,12 @@ struct SendingInfo {
 }
 
 #[derive(Debug, Clone)]
-struct QzonePublicationInfo {
-    group_id: String,
-    pending_withdraw: bool,
-    withdrawn: bool,
-}
-
-#[derive(Debug, Clone)]
 struct IngressSummary {
     user_id: String,
     sender_name: Option<String>,
     text: String,
     attachments: Vec<IngressAttachment>,
+    route_meta: Option<IngressRouteMeta>,
 }
 
 #[derive(Debug, Clone)]
@@ -216,20 +949,18 @@ struct NapCatState {
     review_by_code: HashMap<ReviewCode, ReviewId>,
     review_publish_attempts: HashMap<ReviewId, u32>,
     ingress_summary: HashMap<IngressId, IngressSummary>,
-    ingress_by_platform_msg_id: HashMap<String, IngressId>,
     pending_summary: HashMap<IngressId, String>,
     post_ingress: HashMap<PostId, Vec<IngressId>>,
     post_group: HashMap<PostId, String>,
+    post_created_at_ms: HashMap<PostId, i64>,
     post_safe: HashMap<PostId, bool>,
-    post_render_blobs: HashMap<PostId, Vec<BlobId>>,
+    post_review_id: HashMap<PostId, ReviewId>,
     post_review_code: HashMap<PostId, ReviewCode>,
     post_external_code: HashMap<PostId, ExternalCode>,
     review_submitter: HashMap<ReviewId, String>,
     blacklist: HashMap<String, HashMap<String, Option<String>>>,
     send_plans: HashMap<PostId, SendPlanInfo>,
     sending: HashMap<PostId, SendingInfo>,
-    qzone_publications_by_post:
-        HashMap<PostId, HashMap<(AccountId, RemotePostId), QzonePublicationInfo>>,
     audit_msg_to_review: HashMap<String, ReviewId>,
     processed_reviews: HashSet<ReviewId>,
     pending: HashMap<String, PendingAction>,
@@ -304,30 +1035,21 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
                 sender_name: meta.sender_name.clone(),
                 text,
                 attachments,
+                route_meta: meta.route_meta.clone(),
             },
         );
-        if !meta.platform_msg_id.trim().is_empty() {
-            state
-                .ingress_by_platform_msg_id
-                .insert(meta.platform_msg_id.clone(), *ingress_id);
-        }
     }
     for (post_id, ingress_ids) in &view.post_ingress {
         state.post_ingress.insert(*post_id, ingress_ids.clone());
     }
     for (post_id, post) in &view.posts {
         state.post_group.insert(*post_id, post.group_id.clone());
+        state
+            .post_created_at_ms
+            .insert(*post_id, post.created_at_ms);
         state.post_safe.insert(*post_id, post.is_safe);
-    }
-    for (post_id, render) in &view.render {
-        let mut blob_ids = render.png_blobs.clone();
-        if blob_ids.is_empty() {
-            if let Some(blob_id) = render.png_blob {
-                blob_ids.push(blob_id);
-            }
-        }
-        if !blob_ids.is_empty() {
-            state.post_render_blobs.insert(*post_id, blob_ids);
+        if let Some(review_id) = post.review_id {
+            state.post_review_id.insert(*post_id, review_id);
         }
     }
     for (review_id, review) in &view.reviews {
@@ -342,6 +1064,9 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
                 review_code: review.review_code,
                 post_id: review.post_id,
                 group_id,
+                decision: review.decision,
+                decided_by: review.decided_by.clone(),
+                decided_at_ms: review.decided_at_ms,
             },
         );
         state.review_by_code.insert(review.review_code, *review_id);
@@ -402,80 +1127,12 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
             },
         );
     }
-    for (key, publication) in &view.qzone_publications {
-        register_qzone_publication(
-            &mut state,
-            &publication.group_id,
-            &key.account_id,
-            &key.remote_id,
-            &publication.items,
-            &publication.withdrawn_posts,
-            &publication.pending_withdrawn_posts,
-        );
-    }
     for (blob_id, meta) in &view.blobs {
         if let Some(path) = meta.persisted_path.as_ref() {
             state.blob_paths.insert(*blob_id, path.clone());
         }
     }
     state
-}
-
-fn register_qzone_publication(
-    state: &mut NapCatState,
-    group_id: &str,
-    account_id: &AccountId,
-    remote_id: &RemotePostId,
-    items: &[QzonePublicationItem],
-    withdrawn_posts: &BTreeSet<PostId>,
-    pending_withdrawn_posts: &BTreeSet<PostId>,
-) {
-    for item in items {
-        let publication = state
-            .qzone_publications_by_post
-            .entry(item.post_id)
-            .or_default()
-            .entry((account_id.clone(), remote_id.clone()))
-            .or_insert_with(|| QzonePublicationInfo {
-                group_id: group_id.to_string(),
-                pending_withdraw: false,
-                withdrawn: false,
-            });
-        publication.group_id = group_id.to_string();
-        publication.pending_withdraw |= pending_withdrawn_posts.contains(&item.post_id);
-        publication.withdrawn |= withdrawn_posts.contains(&item.post_id);
-    }
-}
-
-fn mark_qzone_publication_withdraw(
-    state: &mut NapCatState,
-    account_id: &AccountId,
-    remote_id: &RemotePostId,
-    post_ids: &[PostId],
-    pending_withdraw: bool,
-    withdrawn: Option<bool>,
-) {
-    let key = (account_id.clone(), remote_id.clone());
-    for post_id in post_ids {
-        let Some(publications) = state.qzone_publications_by_post.get_mut(post_id) else {
-            continue;
-        };
-        let Some(publication) = publications.get_mut(&key) else {
-            continue;
-        };
-        publication.pending_withdraw = pending_withdraw;
-        if let Some(withdrawn) = withdrawn {
-            publication.withdrawn = withdrawn;
-        }
-    }
-}
-
-fn effective_withdrawn_post_ids(post_id: PostId, withdrawn_post_ids: &[PostId]) -> Vec<PostId> {
-    if withdrawn_post_ids.is_empty() {
-        vec![post_id]
-    } else {
-        withdrawn_post_ids.to_vec()
-    }
 }
 
 #[derive(Clone)]
@@ -658,6 +1315,10 @@ pub fn spawn_napcat_ws(
         let mut fallback_entry: Option<RuntimeEntry> = None;
         for runtime in runtimes {
             set_group_accounts(&runtime.group_id, runtime.accounts.clone());
+            set_group_user_notification_settings(
+                &runtime.group_id,
+                runtime.user_notifications.clone(),
+            );
             if runtime.accounts.is_empty() {
                 let entry = RuntimeEntry {
                     runtime: runtime.clone(),
@@ -902,6 +1563,7 @@ async fn run_napcat_session(
             if let Some(command) = parse_inbound_event(
                 &runtime_read,
                 &state_read,
+                &cmd_tx_read,
                 &out_tx_read,
                 &account_id_read,
                 &value,
@@ -932,6 +1594,7 @@ async fn run_napcat_session(
                 &state_bus,
                 &out_tx_bus,
                 &account_id_bus,
+                env.ts_ms,
                 env.event,
             )
             .await;
@@ -971,6 +1634,11 @@ fn group_accounts() -> &'static std::sync::Mutex<HashMap<String, Vec<String>>> {
     GROUP_ACCOUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+fn group_user_notification_settings()
+-> &'static std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<UserNotificationSettings>>>> {
+    GROUP_USER_NOTIFICATION_SETTINGS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 fn register_ws_session(account_id: &str, session: NapCatWsSession) {
     let mut guard = match ws_sessions().lock() {
         Ok(guard) => guard,
@@ -1005,6 +1673,38 @@ fn set_group_accounts(group_id: &str, accounts: Vec<String>) {
         Err(err) => err.into_inner(),
     };
     guard.insert(group_id.to_string(), accounts);
+}
+
+fn set_group_user_notification_settings(
+    group_id: &str,
+    config: Arc<std::sync::Mutex<UserNotificationSettings>>,
+) {
+    let mut guard = match group_user_notification_settings().lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    };
+    guard.insert(group_id.to_string(), config);
+}
+
+pub fn update_group_user_notification_settings(
+    group_id: &str,
+    config: UserNotificationSettings,
+) -> Result<(), String> {
+    let guard = match group_user_notification_settings().lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    };
+    let Some(shared) = guard.get(group_id).cloned() else {
+        return Err(format!(
+            "group {} user_notifications runtime not found",
+            group_id
+        ));
+    };
+    let mut shared_guard = shared
+        .lock()
+        .map_err(|_| format!("group {} user_notifications lock poisoned", group_id))?;
+    *shared_guard = config;
+    Ok(())
 }
 
 pub fn napcat_account_for_group(group_id: &str) -> Option<String> {
@@ -1106,6 +1806,7 @@ async fn build_action_from_event(
     state: &Arc<Mutex<NapCatState>>,
     out_tx: &mpsc::Sender<String>,
     account_id: &str,
+    event_timestamp_ms: i64,
     event: Event,
 ) -> Option<String> {
     if !is_effective_primary_account(runtime, account_id) {
@@ -1117,16 +1818,16 @@ async fn build_action_from_event(
             ingress_id,
             user_id,
             sender_name,
-            platform_msg_id,
             message,
+            route_meta,
             ..
         })
         | Event::Ingress(IngressEvent::MessageSynced {
             ingress_id,
             user_id,
             sender_name,
-            platform_msg_id,
             message,
+            route_meta,
             ..
         }) => {
             let mut guard = state.lock().await;
@@ -1142,13 +1843,9 @@ async fn build_action_from_event(
                     sender_name,
                     text: summary_text,
                     attachments,
+                    route_meta,
                 },
             );
-            if !platform_msg_id.trim().is_empty() {
-                guard
-                    .ingress_by_platform_msg_id
-                    .insert(platform_msg_id, ingress_id);
-            }
             None
         }
         Event::Ingress(IngressEvent::MessageIgnored { ingress_id, .. }) => {
@@ -1160,9 +1857,6 @@ async fn build_action_from_event(
             let mut guard = state.lock().await;
             guard.pending_summary.remove(&ingress_id);
             guard.ingress_summary.remove(&ingress_id);
-            guard
-                .ingress_by_platform_msg_id
-                .retain(|_, indexed_ingress_id| *indexed_ingress_id != ingress_id);
             for ingress_ids in guard.post_ingress.values_mut() {
                 ingress_ids.retain(|id| *id != ingress_id);
             }
@@ -1173,38 +1867,16 @@ async fn build_action_from_event(
             ingress_ids,
             group_id,
             is_safe,
+            created_at_ms,
             ..
         }) => {
             let mut guard = state.lock().await;
             guard.post_ingress.insert(post_id, ingress_ids);
             guard.post_group.insert(post_id, group_id);
+            guard.post_created_at_ms.insert(post_id, created_at_ms);
             guard.post_safe.insert(post_id, is_safe);
             None
         }
-        Event::Render(RenderEvent::RenderRequested { post_id, .. }) => {
-            let mut guard = state.lock().await;
-            guard.post_render_blobs.remove(&post_id);
-            None
-        }
-        Event::Render(RenderEvent::PngReady { post_id, blob_id }) => {
-            let mut guard = state.lock().await;
-            let blobs = guard.post_render_blobs.entry(post_id).or_default();
-            if !blobs.contains(&blob_id) {
-                blobs.push(blob_id);
-            }
-            None
-        }
-        Event::Render(RenderEvent::PngBatchReady { post_id, blob_ids }) => {
-            let mut guard = state.lock().await;
-            let blobs = guard.post_render_blobs.entry(post_id).or_default();
-            for blob_id in blob_ids {
-                if !blobs.contains(&blob_id) {
-                    blobs.push(blob_id);
-                }
-            }
-            None
-        }
-        Event::Render(RenderEvent::RenderFailed { .. }) => None,
         Event::Review(ReviewEvent::ReviewInfoSynced {
             review_id,
             post_id,
@@ -1212,14 +1884,19 @@ async fn build_action_from_event(
         }) => {
             let mut guard = state.lock().await;
             let group_id = guard.post_group.get(&post_id).cloned().unwrap_or_default();
+            let previous = guard.review_info.get(&review_id).cloned();
             guard.review_info.insert(
                 review_id,
                 ReviewInfo {
                     review_code,
                     post_id,
                     group_id,
+                    decision: previous.as_ref().and_then(|info| info.decision),
+                    decided_by: previous.as_ref().and_then(|info| info.decided_by.clone()),
+                    decided_at_ms: previous.and_then(|info| info.decided_at_ms),
                 },
             );
+            guard.post_review_id.insert(post_id, review_id);
             guard.review_by_code.insert(review_code, review_id);
             guard.post_review_code.insert(post_id, review_code);
             if let Some(user_id) = resolve_post_submitter(&guard, post_id) {
@@ -1264,19 +1941,63 @@ async fn build_action_from_event(
             );
             let mut guard = state.lock().await;
             let group_id = guard.post_group.get(&post_id).cloned().unwrap_or_default();
+            let previous = guard.review_info.get(&review_id).cloned();
             guard.review_info.insert(
                 review_id,
                 ReviewInfo {
                     review_code,
                     post_id,
                     group_id,
+                    decision: previous.as_ref().and_then(|info| info.decision),
+                    decided_by: previous.as_ref().and_then(|info| info.decided_by.clone()),
+                    decided_at_ms: previous.and_then(|info| info.decided_at_ms),
                 },
             );
+            guard.post_review_id.insert(post_id, review_id);
             guard.review_by_code.insert(review_code, review_id);
             guard.post_review_code.insert(post_id, review_code);
             if let Some(user_id) = resolve_post_submitter(&guard, post_id) {
                 guard.review_submitter.insert(review_id, user_id);
             }
+            let group_id = guard.post_group.get(&post_id).cloned().unwrap_or_default();
+            if !group_id.is_empty() && group_id != runtime.group_id {
+                return None;
+            }
+            let Some(user_id) = resolve_post_submitter(&guard, post_id) else {
+                debug_log!("napcat review queued notify skipped: missing submitter info");
+                return None;
+            };
+            let settings = runtime
+                .user_notifications
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone();
+            let context = build_user_notification_context(
+                &guard,
+                runtime,
+                &settings,
+                post_id,
+                UserNotificationStage::ReviewQueued,
+                "",
+                event_timestamp_ms,
+                None,
+            );
+            let message = build_user_notification_message(
+                &settings,
+                UserNotificationStage::ReviewQueued,
+                &context,
+            );
+            if message.is_empty() {
+                return None;
+            }
+            let payload = serde_json::json!({
+                "action": "send_private_msg",
+                "params": {
+                    "user_id": json_id(&user_id),
+                    "message": message
+                }
+            });
+            let _ = out_tx.send(payload.to_string()).await;
             None
         }
         Event::Review(ReviewEvent::ReviewExternalCodeAssigned {
@@ -1327,12 +2048,24 @@ async fn build_action_from_event(
             review_id,
             decision,
             decided_by,
+            decided_at_ms,
             ..
         }) => {
+            let settings = runtime
+                .user_notifications
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone();
+            let should_notify_reject = matches!(decision, ReviewDecision::Rejected);
             let should_notify_recall_deleted =
                 matches!(decision, ReviewDecision::Deleted) && decided_by == "system_recall";
-            let recall_group_msg = {
+            let (submitter, reject_post_id, recall_group_msg) = {
                 let mut guard = state.lock().await;
+                if let Some(info) = guard.review_info.get_mut(&review_id) {
+                    info.decision = Some(decision);
+                    info.decided_by = Some(decided_by.clone());
+                    info.decided_at_ms = Some(decided_at_ms);
+                }
                 match decision {
                     ReviewDecision::Approved
                     | ReviewDecision::Rejected
@@ -1344,13 +2077,24 @@ async fn build_action_from_event(
                         guard.processed_reviews.remove(&review_id);
                     }
                 }
-                if should_notify_recall_deleted {
+                let submitter = if should_notify_reject {
+                    resolve_review_submitter(&guard, review_id)
+                } else {
+                    None
+                };
+                let reject_post_id = if should_notify_reject {
+                    guard.review_info.get(&review_id).map(|info| info.post_id)
+                } else {
+                    None
+                };
+                let recall_group_msg = if should_notify_recall_deleted {
                     guard.review_info.get(&review_id).map(|info| {
                         format!("发件者撤回了#{}的全部内容,已自动删除稿件", info.review_code)
                     })
                 } else {
                     None
-                }
+                };
+                (submitter, reject_post_id, recall_group_msg)
             };
             if let Some(text) = recall_group_msg {
                 let target_group_id = runtime
@@ -1366,37 +2110,76 @@ async fn build_action_from_event(
                 });
                 return Some(payload.to_string());
             }
-            None
-        }
-        Event::Review(ReviewEvent::ReviewDecisionReasonRecorded { .. }) => None,
-        Event::Review(ReviewEvent::ReviewSubmitterNoticeRequested {
-            review_id,
-            kind,
-            reason,
-        }) => {
-            if matches!(kind, ReviewSubmitterNoticeKind::Deleted) {
+            /*
+            if stacking_enabled {
+                let text = format!("{}宸插瓨鍏ユ殏瀛樺尯", label_plain);
+                let payload = serde_json::json!({
+                    "action": "send_group_msg",
+                    "params": {
+                        "group_id": json_id(target_group_id),
+                        "message": message_segments_from_text(&text)
+                    }
+                });
+                return Some(payload.to_string());
+            }
+            */
+            if !should_notify_reject {
                 return None;
             }
-            let submitter = {
-                let guard = state.lock().await;
-                resolve_review_submitter(&guard, review_id)
-            };
             let Some((group_id, user_id)) = submitter else {
-                debug_log!(
-                    "napcat submitter notice skipped: missing submitter info review_id={}",
-                    review_id.0
-                );
+                debug_log!("napcat reject notify skipped: missing submitter info");
                 return None;
             };
             if !group_id.is_empty() && group_id != runtime.group_id {
                 return None;
             }
-            let text = format_review_submitter_notice(kind, reason.as_deref());
+            /*
+            let text = "你的投稿已被拒，请修改后再发送";
+            */
+            let Some(post_id) = reject_post_id else {
+                debug_log!("napcat reject notify skipped: missing post info");
+                return None;
+            };
+            let context = {
+                let guard = state.lock().await;
+                build_user_notification_context(
+                    &guard,
+                    runtime,
+                    &settings,
+                    post_id,
+                    UserNotificationStage::Rejected,
+                    "",
+                    decided_at_ms,
+                    None,
+                )
+            };
+            let message = build_user_notification_message(
+                &settings,
+                UserNotificationStage::Rejected,
+                &context,
+            );
+            if message.is_empty() {
+                return None;
+            }
+            /*
+            if stacking_enabled {
+                let text = format!("{}宸插瓨鍏ユ殏瀛樺尯", label_plain);
+                let payload = serde_json::json!({
+                    "action": "send_group_msg",
+                    "params": {
+                        "group_id": json_id(&audit_group_id),
+                        "message": message_segments_from_text(&text)
+                    }
+                });
+                return Some(payload.to_string());
+            }
+            let text = format!("{}姝ｅ湪鍙戦€?..", label);
+            */
             let payload = serde_json::json!({
                 "action": "send_private_msg",
                 "params": {
                     "user_id": json_id(&user_id),
-                    "message": message_segments_from_text(&text)
+                    "message": message
                 }
             });
             Some(payload.to_string())
@@ -1528,7 +2311,12 @@ async fn build_action_from_event(
             seq,
         }) => {
             let stacking_enabled = runtime.max_queue > 1;
-            let (label, label_plain, code_text, submitter_id, should_notify, audit_group_id) = {
+            let settings = runtime
+                .user_notifications
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone();
+            let (label, label_plain, submitter_id, should_notify, audit_group_id, user_message) = {
                 let mut guard = state.lock().await;
                 guard.send_plans.insert(
                     post_id,
@@ -1539,13 +2327,34 @@ async fn build_action_from_event(
                         seq,
                     },
                 );
+                let queue_event_ms = guard
+                    .post_review_id
+                    .get(&post_id)
+                    .and_then(|review_id| guard.review_info.get(review_id))
+                    .and_then(|info| info.decided_at_ms)
+                    .unwrap_or(not_before_ms);
+                let context = build_user_notification_context(
+                    &guard,
+                    runtime,
+                    &settings,
+                    post_id,
+                    UserNotificationStage::QueueEntered,
+                    "",
+                    queue_event_ms,
+                    Some(not_before_ms),
+                );
+                let user_message = build_user_notification_message(
+                    &settings,
+                    UserNotificationStage::QueueEntered,
+                    &context,
+                );
                 (
                     post_label(&guard, post_id),
                     post_label_plain(&guard, post_id),
-                    post_code_text(&guard, post_id),
                     resolve_post_submitter(&guard, post_id),
                     group_id == runtime.group_id,
                     runtime.audit_group_id.clone(),
+                    user_message,
                 )
             };
             if !should_notify {
@@ -1554,19 +2363,99 @@ async fn build_action_from_event(
             let Some(audit_group_id) = audit_group_id else {
                 return None;
             };
-            if stacking_enabled {
-                if let (Some(code), Some(user_id)) = (code_text, submitter_id) {
-                    let text = format!("#{}已通过审核,待发送", code);
+            if let Some(user_id) = submitter_id.as_ref() {
+                if !user_message.is_empty() {
                     let payload = serde_json::json!({
                         "action": "send_private_msg",
                         "params": {
-                            "user_id": json_id(&user_id),
-                            "message": message_segments_from_text(&text)
+                            "user_id": json_id(user_id),
+                            "message": user_message
                         }
                     });
                     let _ = out_tx.send(payload.to_string()).await;
                 }
-                let text = format!("{}已存入暂存区", label_plain);
+            }
+            /*
+                let code_text: Option<String> = None;
+                if stacking_enabled {
+                    if let (Some(code), Some(user_id)) = (code_text, submitter_id) {
+                        let text = format!("#{}已通过审核,待发送", code);
+                        let payload = serde_json::json!({
+                            "action": "send_private_msg",
+                            "params": {
+                                "user_id": json_id(&user_id),
+                                "message": message_segments_from_text(&text)
+                            }
+                        });
+                        let _ = out_tx.send(payload.to_string()).await;
+                    }
+                    let text = format!("{}已存入暂存区", label_plain);
+                    let payload = serde_json::json!({
+                        "action": "send_group_msg",
+                        "params": {
+                            "group_id": json_id(&audit_group_id),
+                            "message": message_segments_from_text(&text)
+                        }
+                    });
+                    return Some(payload.to_string());
+                }
+                let text = format!("{}正在发送...", label);
+                let payload = serde_json::json!({
+                    "action": "send_group_msg",
+                    "params": {
+                        "group_id": json_id(&audit_group_id),
+                        "message": message_segments_from_text(&text)
+                    }
+                });
+                Some(payload.to_string())
+            }
+                * /
+                if stacking_enabled {
+                    let text = format!("{}宸插瓨鍏ユ殏瀛樺尯", label_plain);
+                    let payload = serde_json::json!({
+                        "action": "send_group_msg",
+                        "params": {
+                            "group_id": json_id(&audit_group_id),
+                            "message": message_segments_from_text(&text)
+                        }
+                    });
+                    return Some(payload.to_string());
+                }
+                let text = format!("{}姝ｅ湪鍙戦€?..", label);
+                let payload = serde_json::json!({
+                    "action": "send_group_msg",
+                    "params": {
+                        "group_id": json_id(&audit_group_id),
+                        "message": message_segments_from_text(&text)
+                    }
+                });
+                Some(payload.to_string())
+            }
+                */
+            if stacking_enabled {
+                /*
+                        let text = format!("{}宸插瓨鍏ユ殏瀛樺尯", label_plain);
+                        let payload = serde_json::json!({
+                            "action": "send_group_msg",
+                            "params": {
+                                "group_id": json_id(&audit_group_id),
+                                "message": message_segments_from_text(&text)
+                            }
+                        });
+                        return Some(payload.to_string());
+                    }
+                    let text = format!("{}姝ｅ湪鍙戦€?..", label);
+                    let payload = serde_json::json!({
+                        "action": "send_group_msg",
+                        "params": {
+                            "group_id": json_id(&audit_group_id),
+                            "message": message_segments_from_text(&text)
+                        }
+                    });
+                    Some(payload.to_string())
+                }
+                        */
+                let text = format!("{} queued", label_plain);
                 let payload = serde_json::json!({
                     "action": "send_group_msg",
                     "params": {
@@ -1576,7 +2465,7 @@ async fn build_action_from_event(
                 });
                 return Some(payload.to_string());
             }
-            let text = format!("{}正在发送...", label);
+            let text = format!("{} sending", label);
             let payload = serde_json::json!({
                 "action": "send_group_msg",
                 "params": {
@@ -1629,7 +2518,9 @@ async fn build_action_from_event(
                     &group_id,
                     post_id,
                     leader_priority,
+                    started_at_ms,
                     runtime.max_queue,
+                    runtime.max_images_per_post,
                 );
                 let batch_label = post_batch_label(&guard, &batch_posts);
                 for batch_post_id in batch_posts {
@@ -1665,52 +2556,18 @@ async fn build_action_from_event(
             });
             Some(payload.to_string())
         }
-        Event::Send(SendEvent::QzonePostPublished {
-            group_id,
-            account_id,
-            remote_id,
-            items,
-            ..
-        }) => {
-            let mut guard = state.lock().await;
-            register_qzone_publication(
-                &mut guard,
-                &group_id,
-                &account_id,
-                &remote_id,
-                &items,
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-            );
-            None
-        }
-        Event::Send(SendEvent::QzonePostWithdrawRequested {
+        Event::Send(SendEvent::SendSucceeded {
             post_id,
-            group_id,
             account_id,
-            remote_id,
-            items,
-            withdrawn_post_ids,
+            finished_at_ms,
             ..
         }) => {
-            let pending_withdrawn_posts =
-                effective_withdrawn_post_ids(post_id, &withdrawn_post_ids)
-                    .into_iter()
-                    .collect::<BTreeSet<_>>();
-            let mut guard = state.lock().await;
-            register_qzone_publication(
-                &mut guard,
-                &group_id,
-                &account_id,
-                &remote_id,
-                &items,
-                &BTreeSet::new(),
-                &pending_withdrawn_posts,
-            );
-            None
-        }
-        Event::Send(SendEvent::SendSucceeded { post_id, .. }) => {
-            let (group_id, send_code, submitter_id, _batch_label, _notify_group) = {
+            let settings = runtime
+                .user_notifications
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone();
+            let (group_id, submitter_id, context) = {
                 let mut guard = state.lock().await;
                 let sending_info = guard.sending.remove(&post_id);
                 let group_id = sending_info
@@ -1718,28 +2575,36 @@ async fn build_action_from_event(
                     .map(|info| info.group_id.clone())
                     .or_else(|| guard.post_group.get(&post_id).cloned())
                     .unwrap_or_else(|| runtime.group_id.clone());
-                let batch_label = sending_info
-                    .as_ref()
-                    .map(|info| info.batch_label.clone())
-                    .unwrap_or_else(|| post_label(&guard, post_id));
-                let notify_group = sending_info
-                    .as_ref()
-                    .map(|info| info.batch_leader == post_id)
-                    .unwrap_or(true);
-                let send_code = post_code_text(&guard, post_id);
                 let submitter_id = resolve_post_submitter(&guard, post_id);
-                (group_id, send_code, submitter_id, batch_label, notify_group)
+                let context = build_user_notification_context(
+                    &guard,
+                    runtime,
+                    &settings,
+                    post_id,
+                    UserNotificationStage::SendSucceeded,
+                    &account_id,
+                    finished_at_ms,
+                    None,
+                );
+                (group_id, submitter_id, context)
             };
             if group_id.is_empty() || group_id != runtime.group_id {
                 return None;
             }
-            if let (Some(code), Some(user_id)) = (send_code, submitter_id) {
-                let text = format!("#{}已发送", code);
+            if let Some(user_id) = submitter_id {
+                let message = build_user_notification_message(
+                    &settings,
+                    UserNotificationStage::SendSucceeded,
+                    &context,
+                );
+                if message.is_empty() {
+                    return None;
+                }
                 let payload = serde_json::json!({
                     "action": "send_private_msg",
                     "params": {
                         "user_id": json_id(&user_id),
-                        "message": message_segments_from_text(&text)
+                        "message": message
                     }
                 });
                 let _ = out_tx.send(payload.to_string()).await;
@@ -1919,86 +2784,6 @@ async fn build_action_from_event(
             });
             Some(payload.to_string())
         }
-        Event::Send(SendEvent::QzonePostWithdrawSucceeded {
-            post_id,
-            account_id,
-            remote_id,
-            withdrawn_post_ids,
-            ..
-        }) => {
-            let (group_id, label) = {
-                let mut guard = state.lock().await;
-                let effective_post_ids = effective_withdrawn_post_ids(post_id, &withdrawn_post_ids);
-                mark_qzone_publication_withdraw(
-                    &mut guard,
-                    &account_id,
-                    &remote_id,
-                    &effective_post_ids,
-                    false,
-                    Some(true),
-                );
-                let group_id = guard.post_group.get(&post_id).cloned().unwrap_or_default();
-                let label = post_code_text(&guard, post_id)
-                    .map(|code| format!("#{}", code))
-                    .unwrap_or_else(|| post_label(&guard, post_id));
-                (group_id, label)
-            };
-            if group_id.is_empty() || group_id != runtime.group_id {
-                return None;
-            }
-            let Some(audit_group_id) = runtime.audit_group_id.as_ref() else {
-                return None;
-            };
-            let text = format!("{} 已从空间动态撤回图片", label);
-            let payload = serde_json::json!({
-                "action": "send_group_msg",
-                "params": {
-                    "group_id": json_id(audit_group_id),
-                    "message": message_segments_from_text(&text)
-                }
-            });
-            Some(payload.to_string())
-        }
-        Event::Send(SendEvent::QzonePostWithdrawFailed {
-            post_id,
-            account_id,
-            remote_id,
-            withdrawn_post_ids,
-            error,
-        }) => {
-            let (group_id, label) = {
-                let mut guard = state.lock().await;
-                let effective_post_ids = effective_withdrawn_post_ids(post_id, &withdrawn_post_ids);
-                mark_qzone_publication_withdraw(
-                    &mut guard,
-                    &account_id,
-                    &remote_id,
-                    &effective_post_ids,
-                    false,
-                    None,
-                );
-                let group_id = guard.post_group.get(&post_id).cloned().unwrap_or_default();
-                let label = post_code_text(&guard, post_id)
-                    .map(|code| format!("#{}", code))
-                    .unwrap_or_else(|| post_label(&guard, post_id));
-                (group_id, label)
-            };
-            if group_id.is_empty() || group_id != runtime.group_id {
-                return None;
-            }
-            let Some(audit_group_id) = runtime.audit_group_id.as_ref() else {
-                return None;
-            };
-            let text = format!("{} 空间撤回失败：{}", label, error);
-            let payload = serde_json::json!({
-                "action": "send_group_msg",
-                "params": {
-                    "group_id": json_id(audit_group_id),
-                    "message": message_segments_from_text(&text)
-                }
-            });
-            Some(payload.to_string())
-        }
         Event::Review(ReviewEvent::ReviewPublishRequested { review_id }) => {
             let Some(group_id) = runtime.audit_group_id.as_ref() else {
                 return None;
@@ -2024,15 +2809,14 @@ async fn build_action_from_event(
             if let Some(user_id) = resolve_post_submitter_with_ingress(&guard, &ingress_ids) {
                 guard.review_submitter.insert(review_id, user_id);
             }
-            let render_blob_ids = rendered_png_blob_ids(&guard, info.post_id);
-            let previews = rendered_png_previews(info.post_id, &render_blob_ids, &guard.blob_paths);
+            let preview = rendered_png_preview(info.post_id);
             let is_safe = guard.post_safe.get(&info.post_id).copied().unwrap_or(true);
             let summary = build_audit_message(
                 info.review_code,
                 info.post_id,
                 &ingress_ids,
                 &guard.ingress_summary,
-                previews,
+                preview,
                 &guard.blob_paths,
                 is_safe,
             );
@@ -2174,6 +2958,7 @@ fn review_retry_delay_ms(attempt: u32) -> i64 {
 async fn parse_inbound_event(
     runtime: &NapCatRuntimeConfig,
     state: &Arc<Mutex<NapCatState>>,
+    cmd_tx: &mpsc::Sender<Command>,
     out_tx: &mpsc::Sender<String>,
     account_id: &str,
     value: &Value,
@@ -2734,14 +3519,6 @@ async fn parse_inbound_event(
                     let sender_name = extract_sender_name(&session.messages[0].message)
                         .or_else(|| Some(user_id.clone()));
                     let chat_id = format!("{}_submission_{}", user_id, session.started_at_ms);
-                    let mut local_reply_previews =
-                        reply_previews_from_buffered_messages(&session.messages);
-                    for buffered in &session.messages {
-                        local_reply_previews.extend(reply_previews_from_state(
-                            buffered.message.get("message"),
-                            &guard,
-                        ));
-                    }
                     let mut combined_text = String::new();
                     let mut combined_attachments = Vec::new();
                     let mut combined_summary = String::new();
@@ -2750,10 +3527,7 @@ async fn parse_inbound_event(
                             text,
                             summary_text,
                             attachments,
-                        } = extract_message_lite_with_reply_previews(
-                            buffered.message.get("message"),
-                            &local_reply_previews,
-                        );
+                        } = extract_message_lite(buffered.message.get("message"));
                         if !text.trim().is_empty() {
                             if !combined_text.is_empty() {
                                 combined_text.push_str("\n\n");
@@ -2799,6 +3573,7 @@ async fn parse_inbound_event(
                             text: combined_text,
                             attachments: combined_attachments,
                         },
+                        route_meta: None,
                         received_at_ms: started_at_ms,
                         close_immediately: true,
                     }));
@@ -2853,15 +3628,11 @@ async fn parse_inbound_event(
                 return None;
             }
         }
-        let local_reply_previews = {
-            let guard = state.lock().await;
-            reply_previews_from_state(value.get("message"), &guard)
-        };
         let ExtractedMessage {
             text,
             summary_text,
             attachments,
-        } = extract_message_lite_with_reply_previews(value.get("message"), &local_reply_previews);
+        } = extract_message_lite(value.get("message"));
         if raw_message.map(|raw| raw.is_empty()).unwrap_or(true)
             && is_auto_reply_message(&summary_text)
         {
@@ -2873,6 +3644,54 @@ async fn parse_inbound_event(
             text.len(),
             attachments.len()
         );
+        if let Some((command_name, command_args)) = parse_private_agent_command_line(raw_trimmed) {
+            let has_agent_command = {
+                let guard = runtime
+                    .agent_commands
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                guard
+                    .get(command_name.as_str())
+                    .map(|command| command.enabled)
+                    .unwrap_or(false)
+            };
+            if has_agent_command {
+                match execute_private_agent_command(
+                    runtime,
+                    state,
+                    cmd_tx,
+                    out_tx,
+                    &user_id,
+                    sender_name.as_deref(),
+                    &self_id,
+                    raw_trimmed,
+                    text.trim(),
+                    &command_name,
+                    &command_args,
+                    timestamp_ms,
+                )
+                .await
+                {
+                    Ok(()) => return None,
+                    Err(err) => {
+                        debug_log!(
+                            "agent command execution failed group_id={} user_id={} command={} err={}",
+                            runtime.group_id,
+                            user_id,
+                            command_name,
+                            err
+                        );
+                        send_private_text(
+                            out_tx,
+                            &user_id,
+                            &format!("指令 #{} 执行失败：{}", command_name, err),
+                        )
+                        .await;
+                        return None;
+                    }
+                }
+            }
+        }
         let ingress_id = derive_ingress_id(&[
             self_id.as_bytes(),
             user_id.as_bytes(),
@@ -2904,6 +3723,7 @@ async fn parse_inbound_event(
             group_id: runtime.group_id.clone(),
             platform_msg_id: message_id,
             message: IngressMessage { text, attachments },
+            route_meta: None,
             received_at_ms: timestamp_ms,
             close_immediately: false,
         }));
@@ -3271,15 +4091,6 @@ fn extract_message_chunks<'a>(
                                 summary_text.push_str(&placeholder);
                             }
                         }
-                        "json" => {
-                            let raw = data
-                                .and_then(|d| d.get("data"))
-                                .and_then(value_to_string)
-                                .or_else(|| data.and_then(|d| serde_json::to_string(d).ok()))
-                                .unwrap_or_default();
-                            text.push_str(&json_card_marker(&raw));
-                            summary_text.push_str("[卡片]");
-                        }
                         "forward" => {
                             let id = data
                                 .and_then(|d| d.get("id"))
@@ -3298,10 +4109,6 @@ fn extract_message_chunks<'a>(
                                     attachments: Vec::new(),
                                 });
                             }
-                        }
-                        "poke" => {
-                            text.push_str(poke_marker());
-                            summary_text.push_str("[戳一戳]");
                         }
                         "image" => {
                             let kind = image_kind_from_data(data);
@@ -3451,169 +4258,7 @@ async fn extract_message(
     )
 }
 
-pub(crate) async fn extract_message_lite_resolving_replies(
-    value: Option<&Value>,
-    account_id: &str,
-) -> ExtractedMessage {
-    let previews = resolve_reply_previews(value, account_id).await;
-    extract_message_lite_with_reply_previews(value, &previews)
-}
-
 pub(crate) fn extract_message_lite(value: Option<&Value>) -> ExtractedMessage {
-    extract_message_lite_with_reply_previews(value, &HashMap::new())
-}
-
-async fn resolve_reply_previews(
-    value: Option<&Value>,
-    account_id: &str,
-) -> HashMap<String, ReplyPreview> {
-    let mut previews = HashMap::new();
-    for id in collect_reply_ids(value) {
-        if previews.contains_key(&id) {
-            continue;
-        }
-        let preview = fetch_reply_preview(account_id, &id)
-            .await
-            .unwrap_or_else(|| fallback_reply_preview(Some(id.clone())));
-        previews.insert(id, preview);
-    }
-    previews
-}
-
-fn collect_reply_ids(value: Option<&Value>) -> Vec<String> {
-    let mut ids = Vec::new();
-    let Some(Value::Array(items)) = value else {
-        return ids;
-    };
-    for item in items {
-        if item.get("type").and_then(|v| v.as_str()) != Some("reply") {
-            continue;
-        }
-        if let Some(id) = item
-            .get("data")
-            .and_then(|data| data.get("id"))
-            .and_then(value_to_string)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-        {
-            ids.push(id);
-        }
-    }
-    ids
-}
-
-fn reply_previews_from_state(
-    value: Option<&Value>,
-    state: &NapCatState,
-) -> HashMap<String, ReplyPreview> {
-    let mut previews = HashMap::new();
-    for id in collect_reply_ids(value) {
-        if let Some(ingress_id) = state.ingress_by_platform_msg_id.get(&id) {
-            if let Some(summary) = state.ingress_summary.get(ingress_id) {
-                previews.insert(id.clone(), reply_preview_from_ingress_summary(id, summary));
-            }
-        }
-    }
-    previews
-}
-
-fn reply_previews_from_buffered_messages(
-    messages: &[BufferedMessage],
-) -> HashMap<String, ReplyPreview> {
-    let mut previews = HashMap::new();
-    for buffered in messages {
-        let Some(id) = value_opt_to_string(buffered.message.get("message_id"))
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        previews.insert(
-            id.clone(),
-            reply_preview_from_message_value(Some(id), &buffered.message),
-        );
-    }
-    previews
-}
-
-fn reply_preview_from_ingress_summary(id: String, summary: &IngressSummary) -> ReplyPreview {
-    let mut preview = fallback_reply_preview(Some(id));
-    preview.meta = summary.sender_name.clone();
-    let body = summary.text.trim();
-    if !body.is_empty() {
-        preview.body = body.to_string();
-    } else if let Some(attachment) = summary.attachments.first() {
-        preview.body = attachment_placeholder(attachment.kind).to_string();
-    }
-    preview
-}
-
-pub(crate) async fn fetch_reply_preview(account_id: &str, reply_id: &str) -> Option<ReplyPreview> {
-    let body = napcat_ws_request(
-        account_id,
-        "get_msg",
-        json!({ "message_id": json_id(reply_id) }),
-        Duration::from_secs(4),
-    )
-    .await
-    .map_err(|err| {
-        debug_log!("napcat reply get_msg failed: id={} err={}", reply_id, err);
-        err
-    })
-    .ok()?;
-    Some(reply_preview_from_get_msg_response(
-        Some(reply_id.to_string()),
-        &body,
-    ))
-}
-
-fn fallback_reply_preview(id: Option<String>) -> ReplyPreview {
-    ReplyPreview {
-        id,
-        meta: None,
-        body: "引用的消息".to_string(),
-        missing: false,
-    }
-}
-
-fn reply_preview_from_get_msg_response(id: Option<String>, response: &Value) -> ReplyPreview {
-    let message = response.get("data").unwrap_or(response);
-    reply_preview_from_message_value(id, message)
-}
-
-fn reply_preview_from_message_value(id: Option<String>, message: &Value) -> ReplyPreview {
-    let mut preview = fallback_reply_preview(id);
-    preview.meta = extract_sender_name(message);
-    if let Some(body) = reply_preview_body_from_message(message) {
-        preview.body = body;
-    }
-    preview
-}
-
-fn reply_preview_body_from_message(message: &Value) -> Option<String> {
-    let payload = message
-        .get("message")
-        .or_else(|| message.get("content"))
-        .or_else(|| message.get("raw_message"));
-    let extracted = extract_message_lite(payload);
-    let body = extracted.text.trim();
-    if !body.is_empty() {
-        return Some(body.to_string());
-    }
-    if let Some(attachment) = extracted.attachments.first() {
-        return Some(attachment_placeholder(attachment.kind).to_string());
-    }
-    let summary = extracted.summary_text.trim();
-    if !summary.is_empty() {
-        return Some(summary.to_string());
-    }
-    None
-}
-
-fn extract_message_lite_with_reply_previews(
-    value: Option<&Value>,
-    reply_previews: &HashMap<String, ReplyPreview>,
-) -> ExtractedMessage {
     let mut text = String::new();
     let mut summary_text = String::new();
     let mut attachments = Vec::new();
@@ -3639,13 +4284,16 @@ fn extract_message_lite_with_reply_previews(
                     }
                     "reply" => {
                         let id = data.and_then(|d| d.get("id")).and_then(value_to_string);
-                        let preview = id
+                        let body = id
                             .as_ref()
-                            .map(|id| id.trim())
-                            .filter(|id| !id.is_empty())
-                            .and_then(|id| reply_previews.get(id).cloned())
-                            .unwrap_or_else(|| fallback_reply_preview(id.clone()));
-                        text.push_str(&reply_marker(&preview));
+                            .map(|id| format!("引用的消息 ID: {}", id))
+                            .unwrap_or_else(|| "引用的消息".to_string());
+                        text.push_str(&reply_marker(&ReplyPreview {
+                            id: id.clone(),
+                            meta: None,
+                            body,
+                            missing: false,
+                        }));
                         if let Some(id) = id {
                             summary_text.push_str(&format!("[回复:{}]", id));
                         } else {
@@ -4221,13 +4869,6 @@ fn validate_global_action(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QzoneWithdrawStatus {
-    Available,
-    AlreadyWithdrawnOrPending,
-    Missing,
-}
-
 fn validate_withdraw_action(
     state: &NapCatState,
     group_id: &str,
@@ -4242,51 +4883,16 @@ fn validate_withdraw_action(
     if info.group_id != group_id {
         return Err("无权限操作该稿件");
     }
-    if let Some(plan) = state.send_plans.get(&info.post_id) {
-        if plan.group_id != group_id {
-            return Err("无权限操作该稿件");
-        }
-        if !state.post_external_code.contains_key(&info.post_id) {
-            return Err("该稿件缺少外部编号");
-        }
-        return Ok(());
-    }
-
-    match qzone_withdraw_status(state, group_id, info.post_id) {
-        QzoneWithdrawStatus::Available => {
-            if !state.post_external_code.contains_key(&info.post_id) {
-                return Err("该稿件缺少外部编号");
-            }
-            Ok(())
-        }
-        QzoneWithdrawStatus::AlreadyWithdrawnOrPending => Err("该稿件已撤回或正在撤回"),
-        QzoneWithdrawStatus::Missing => Err("该稿件不在暂存区且没有可撤回的空间动态"),
-    }
-}
-
-fn qzone_withdraw_status(
-    state: &NapCatState,
-    group_id: &str,
-    post_id: PostId,
-) -> QzoneWithdrawStatus {
-    let Some(publications) = state.qzone_publications_by_post.get(&post_id) else {
-        return QzoneWithdrawStatus::Missing;
+    let Some(plan) = state.send_plans.get(&info.post_id) else {
+        return Err("该稿件不在暂存区");
     };
-    let mut has_current_group_publication = false;
-    for publication in publications.values() {
-        if publication.group_id != group_id {
-            continue;
-        }
-        has_current_group_publication = true;
-        if !publication.pending_withdraw && !publication.withdrawn {
-            return QzoneWithdrawStatus::Available;
-        }
+    if plan.group_id != group_id {
+        return Err("无权限操作该稿件");
     }
-    if has_current_group_publication {
-        QzoneWithdrawStatus::AlreadyWithdrawnOrPending
-    } else {
-        QzoneWithdrawStatus::Missing
+    if !state.post_external_code.contains_key(&info.post_id) {
+        return Err("该稿件缺少外部编号");
     }
+    Ok(())
 }
 
 fn build_pending_list_text(state: &NapCatState, group_id: &str) -> String {
@@ -4488,6 +5094,11 @@ fn build_selfcheck_report(runtime: &NapCatRuntimeConfig, state: &NapCatState) ->
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .len();
+    let agent_commands = runtime
+        .agent_commands
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .len();
     let accounts_cfg = runtime.accounts.len();
     let online_accounts = group_accounts()
         .lock()
@@ -4510,7 +5121,7 @@ fn build_selfcheck_report(runtime: &NapCatRuntimeConfig, state: &NapCatState) ->
     };
 
     format!(
-        "系统自检报告\n组: {}\n审核群: {}\nNapCat: {} (token {})\n账号: 配置 {} 个, 在线 {} 个\n账号列表: {}\n待审核: {}\n待发送: {}\n发送中: {}\n黑名单: {}\n快捷回复: {}\n审核快捷指令: {}\n全局快捷指令: {}\n队列策略: max_post_stack={}",
+        "系统自检报告\n组: {}\n审核群: {}\nNapCat: {} (token {})\n账号: 配置 {} 个, 在线 {} 个\n账号列表: {}\n待审核: {}\n待发送: {}\n发送中: {}\n黑名单: {}\n快捷回复: {}\n审核快捷指令: {}\n全局快捷指令: {}\nAgent 指令: {}\n队列策略: max_post_stack={}",
         runtime.group_id,
         audit_group,
         ws_base,
@@ -4525,12 +5136,20 @@ fn build_selfcheck_report(runtime: &NapCatRuntimeConfig, state: &NapCatState) ->
         quick_replies,
         review_shortcuts,
         global_shortcuts,
+        agent_commands,
         runtime.max_queue
     )
 }
 
 fn quick_reply_key_conflicts(key: &str) -> bool {
     is_builtin_review_command_name(key)
+}
+
+fn is_builtin_private_submission_command_name(name: &str) -> bool {
+    matches!(
+        name.trim(),
+        "开始投稿" | "结束投稿" | "确认" | "取消" | "追加"
+    )
 }
 
 fn sort_quick_reply_map(map: &mut HashMap<String, String>) {
@@ -4612,26 +5231,70 @@ fn collect_batch_post_ids_for_notify(
     group_id: &str,
     leader: PostId,
     leader_priority: SendPriority,
+    started_at_ms: i64,
     max_queue: usize,
+    max_images_per_post: usize,
 ) -> Vec<PostId> {
-    if max_queue <= 1 || leader_priority != SendPriority::Normal {
-        return vec![leader];
-    }
     let mut queued = state
         .send_plans
         .iter()
-        .filter(|(_, plan)| plan.group_id == group_id && plan.priority == leader_priority)
+        .filter(|(_, plan)| {
+            plan.group_id == group_id
+                && plan.priority == leader_priority
+                && plan.not_before_ms <= started_at_ms
+        })
         .map(|(post_id, plan)| (plan.seq, *post_id))
         .collect::<Vec<_>>();
     queued.sort_by_key(|(seq, post_id)| (*seq, post_id.0));
-    let mut out = Vec::with_capacity(queued.len().saturating_add(1));
+    let max_batch_posts = if max_queue == 0 {
+        usize::MAX
+    } else {
+        max_queue.max(1)
+    };
+    let mut out = Vec::with_capacity(max_batch_posts.min(queued.len().saturating_add(1)));
+    let mut total_images = count_post_notify_images(state, leader);
     out.push(leader);
+    if leader_priority != SendPriority::Normal || max_batch_posts <= 1 {
+        return out;
+    }
     for (_, post_id) in queued {
         if post_id != leader {
+            if out.len() >= max_batch_posts {
+                break;
+            }
+            let image_count = count_post_notify_images(state, post_id);
+            if max_images_per_post > 0
+                && total_images.saturating_add(image_count) > max_images_per_post
+            {
+                break;
+            }
             out.push(post_id);
+            total_images = total_images.saturating_add(image_count);
         }
     }
     out
+}
+
+fn count_post_notify_images(state: &NapCatState, post_id: PostId) -> usize {
+    let mut total = 0usize;
+    if rendered_png_preview(post_id).is_some() {
+        total = total.saturating_add(1);
+    }
+    if let Some(ingress_ids) = state.post_ingress.get(&post_id) {
+        for ingress_id in ingress_ids {
+            let Some(summary) = state.ingress_summary.get(ingress_id) else {
+                continue;
+            };
+            total = total.saturating_add(
+                summary
+                    .attachments
+                    .iter()
+                    .filter(|attachment| attachment.kind == MediaKind::Image)
+                    .count(),
+            );
+        }
+    }
+    total
 }
 
 fn post_batch_label(state: &NapCatState, post_ids: &[PostId]) -> String {
@@ -4675,6 +5338,1606 @@ fn post_code_text(state: &NapCatState, post_id: PostId) -> Option<String> {
         })
 }
 
+#[derive(Debug, Clone, Default)]
+struct PostRouteMeta {
+    source_webhook: String,
+    source_webhook_tag: String,
+    raw_tags: Vec<String>,
+    mapped_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct UserNotificationTemplateContext {
+    stage: String,
+    code: String,
+    external_code: String,
+    internal_code: String,
+    post_id: String,
+    review_id: String,
+    group_id: String,
+    sender_id: String,
+    account_id: String,
+    send_time: String,
+    send_timestamp_ms: String,
+    reviewer: String,
+    reviewer_display: String,
+    reviewed_at: String,
+    queue_time: String,
+    queue_timestamp_ms: String,
+    scheduled_for: String,
+    scheduled_timestamp_ms: String,
+    source_webhook: String,
+    source_webhook_tag: String,
+    raw_tag_list: String,
+    tag_list: String,
+    tag_count: String,
+    mapped_tags: Vec<String>,
+}
+
+fn build_user_notification_context(
+    state: &NapCatState,
+    runtime: &NapCatRuntimeConfig,
+    settings: &UserNotificationSettings,
+    post_id: PostId,
+    stage: UserNotificationStage,
+    account_id: &str,
+    event_timestamp_ms: i64,
+    scheduled_timestamp_ms: Option<i64>,
+) -> UserNotificationTemplateContext {
+    let review_id = state.post_review_id.get(&post_id).copied().or_else(|| {
+        state
+            .review_info
+            .iter()
+            .find_map(|(review_id, info)| (info.post_id == post_id).then_some(*review_id))
+    });
+    let review_info = review_id.and_then(|id| state.review_info.get(&id));
+    let route_meta = collect_post_route_meta(state, settings, post_id);
+    let scheduled_for = scheduled_timestamp_ms
+        .map(|ts| format_local_datetime(ts, runtime.tz_offset_minutes))
+        .unwrap_or_default();
+    UserNotificationTemplateContext {
+        stage: stage.as_str().to_string(),
+        code: post_code_text(state, post_id).unwrap_or_default(),
+        external_code: state
+            .post_external_code
+            .get(&post_id)
+            .map(|code| code.to_string())
+            .unwrap_or_default(),
+        internal_code: state
+            .post_review_code
+            .get(&post_id)
+            .map(|code| code.to_string())
+            .unwrap_or_default(),
+        post_id: post_id.0.to_string(),
+        review_id: review_id.map(|id| id.0.to_string()).unwrap_or_default(),
+        group_id: state
+            .post_group
+            .get(&post_id)
+            .cloned()
+            .unwrap_or_else(|| runtime.group_id.clone()),
+        sender_id: resolve_post_submitter(state, post_id).unwrap_or_default(),
+        account_id: account_id.trim().to_string(),
+        send_time: if matches!(stage, UserNotificationStage::SendSucceeded) {
+            format_local_datetime(event_timestamp_ms, runtime.tz_offset_minutes)
+        } else {
+            String::new()
+        },
+        send_timestamp_ms: if matches!(stage, UserNotificationStage::SendSucceeded) {
+            event_timestamp_ms.to_string()
+        } else {
+            String::new()
+        },
+        reviewer: review_info
+            .and_then(|info| info.decided_by.as_deref())
+            .unwrap_or_default()
+            .to_string(),
+        reviewer_display: review_info
+            .and_then(|info| info.decided_by.as_deref())
+            .map(display_operator_name)
+            .unwrap_or_default()
+            .to_string(),
+        reviewed_at: review_info
+            .and_then(|info| info.decided_at_ms)
+            .map(|ts| format_local_datetime(ts, runtime.tz_offset_minutes))
+            .unwrap_or_default(),
+        queue_time: if matches!(
+            stage,
+            UserNotificationStage::QueueEntered | UserNotificationStage::ReviewQueued
+        ) {
+            format_local_datetime(event_timestamp_ms, runtime.tz_offset_minutes)
+        } else {
+            String::new()
+        },
+        queue_timestamp_ms: if matches!(
+            stage,
+            UserNotificationStage::QueueEntered | UserNotificationStage::ReviewQueued
+        ) {
+            event_timestamp_ms.to_string()
+        } else {
+            String::new()
+        },
+        scheduled_for,
+        scheduled_timestamp_ms: scheduled_timestamp_ms
+            .map(|ts| ts.to_string())
+            .unwrap_or_default(),
+        source_webhook: route_meta.source_webhook,
+        source_webhook_tag: route_meta.source_webhook_tag,
+        raw_tag_list: route_meta.raw_tags.join(", "),
+        tag_list: route_meta.mapped_tags.join(", "),
+        tag_count: route_meta.mapped_tags.len().to_string(),
+        mapped_tags: route_meta.mapped_tags,
+    }
+}
+
+fn collect_post_route_meta(
+    state: &NapCatState,
+    settings: &UserNotificationSettings,
+    post_id: PostId,
+) -> PostRouteMeta {
+    let mut source_webhook = String::new();
+    let mut raw_tags = Vec::new();
+    if let Some(ingress_ids) = state.post_ingress.get(&post_id) {
+        for ingress_id in ingress_ids {
+            let Some(summary) = state.ingress_summary.get(ingress_id) else {
+                continue;
+            };
+            let Some(route_meta) = summary.route_meta.as_ref() else {
+                continue;
+            };
+            if source_webhook.is_empty() {
+                if let Some(webhook) = route_meta
+                    .source_webhook
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    source_webhook = webhook.to_string();
+                }
+            }
+            for tag in &route_meta.tags {
+                push_unique_string(&mut raw_tags, tag.trim());
+            }
+        }
+    }
+    let source_webhook_tag = settings
+        .webhook_tag_map
+        .get(source_webhook.as_str())
+        .map(|value| map_tag_value(settings, value))
+        .unwrap_or_default();
+    if !source_webhook_tag.is_empty() {
+        push_unique_string(&mut raw_tags, source_webhook_tag.as_str());
+    }
+    let mapped_tags = raw_tags
+        .iter()
+        .map(|tag| map_tag_value(settings, tag))
+        .filter(|tag| !tag.is_empty())
+        .fold(Vec::new(), |mut acc, tag| {
+            push_unique_string(&mut acc, tag.as_str());
+            acc
+        });
+    PostRouteMeta {
+        source_webhook,
+        source_webhook_tag,
+        raw_tags,
+        mapped_tags,
+    }
+}
+
+fn map_tag_value(settings: &UserNotificationSettings, raw: &str) -> String {
+    let source = raw.trim().to_string();
+    if source.is_empty() {
+        return String::new();
+    }
+    let normalized = source
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+        .to_string();
+    let try_group = |group_name: &str| {
+        settings
+            .tag_value_maps
+            .iter()
+            .find(|group| group.tag.trim() == group_name)
+            .and_then(|group| {
+                group
+                    .mappings
+                    .iter()
+                    .find(|item| item.source.trim() == source || item.source.trim() == normalized)
+                    .map(|item| {
+                        let target = item.target.trim().to_string();
+                        if target.is_empty() {
+                            source.clone()
+                        } else {
+                            target
+                        }
+                    })
+            })
+    };
+
+    try_group(&normalized)
+        .or_else(|| try_group(&source))
+        .or_else(|| {
+            settings.tag_value_maps.iter().find_map(|group| {
+                group
+                    .mappings
+                    .iter()
+                    .find(|item| item.source.trim() == source)
+                    .map(|item| {
+                        let target = item.target.trim().to_string();
+                        if target.is_empty() {
+                            source.clone()
+                        } else {
+                            target
+                        }
+                    })
+            })
+        })
+        .unwrap_or(source)
+}
+
+fn push_unique_string(values: &mut Vec<String>, raw: &str) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || values.iter().any(|value| value == trimmed) {
+        return;
+    }
+    values.push(trimmed.to_string());
+}
+
+fn render_user_notification_template(
+    template: &str,
+    context: &UserNotificationTemplateContext,
+    settings: &UserNotificationSettings,
+) -> String {
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] == b'<' {
+            if let Some(close_rel) = template[idx + 1..].find('>') {
+                let close = idx + 1 + close_rel;
+                let key = template[idx + 1..close].trim();
+                if let Some(value) = user_notification_variable_value(context, key) {
+                    out.push_str(&map_tag_value_for_group(settings, key, value));
+                    idx = close + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = template[idx..].chars().next().unwrap();
+        out.push(ch);
+        idx += ch.len_utf8();
+    }
+    out
+}
+
+fn map_tag_value_for_group(
+    settings: &UserNotificationSettings,
+    group_name: &str,
+    raw: &str,
+) -> String {
+    let source = raw.trim().to_string();
+    if source.is_empty() {
+        return String::new();
+    }
+    let normalized_group = group_name
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim();
+    let normalized_source = source
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+        .to_string();
+    settings
+        .tag_value_maps
+        .iter()
+        .find(|group| group.tag.trim() == normalized_group)
+        .and_then(|group| {
+            group
+                .mappings
+                .iter()
+                .find(|item| {
+                    item.source.trim() == source
+                        || item.source.trim() == normalized_source
+                        || item.source.trim() == normalized_group
+                })
+                .map(|item| {
+                    let target = item.target.trim().to_string();
+                    if target.is_empty() {
+                        source.clone()
+                    } else {
+                        target
+                    }
+                })
+        })
+        .unwrap_or(source)
+}
+
+fn user_notification_variable_value<'a>(
+    context: &'a UserNotificationTemplateContext,
+    key: &str,
+) -> Option<&'a str> {
+    match key {
+        "stage" => Some(context.stage.as_str()),
+        "code" => Some(context.code.as_str()),
+        "external_code" => Some(context.external_code.as_str()),
+        "internal_code" => Some(context.internal_code.as_str()),
+        "post_id" => Some(context.post_id.as_str()),
+        "review_id" => Some(context.review_id.as_str()),
+        "group_id" => Some(context.group_id.as_str()),
+        "sender_id" => Some(context.sender_id.as_str()),
+        "account_id" => Some(context.account_id.as_str()),
+        "send_time" => Some(context.send_time.as_str()),
+        "send_timestamp_ms" => Some(context.send_timestamp_ms.as_str()),
+        "reviewer" => Some(context.reviewer.as_str()),
+        "reviewer_display" => Some(context.reviewer_display.as_str()),
+        "reviewed_at" => Some(context.reviewed_at.as_str()),
+        "queue_time" => Some(context.queue_time.as_str()),
+        "queue_timestamp_ms" => Some(context.queue_timestamp_ms.as_str()),
+        "scheduled_for" => Some(context.scheduled_for.as_str()),
+        "scheduled_timestamp_ms" => Some(context.scheduled_timestamp_ms.as_str()),
+        "source_webhook" => Some(context.source_webhook.as_str()),
+        "source_webhook_tag" => Some(context.source_webhook_tag.as_str()),
+        "raw_tag_list" => Some(context.raw_tag_list.as_str()),
+        "tag_list" => Some(context.tag_list.as_str()),
+        "tag_count" => Some(context.tag_count.as_str()),
+        _ => None,
+    }
+}
+
+fn split_rendered_tag_values(rendered: &str) -> Vec<String> {
+    rendered
+        .split(|ch| matches!(ch, ',' | '，' | ';' | '；' | '|' | '\n' | '\r'))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect()
+}
+
+fn build_user_notification_message(
+    settings: &UserNotificationSettings,
+    stage: UserNotificationStage,
+    context: &UserNotificationTemplateContext,
+) -> Vec<Value> {
+    let template = settings.stage(stage);
+    if !template.enabled {
+        return Vec::new();
+    }
+
+    let mut tags = Vec::new();
+    if template.include_post_tags {
+        for tag in &context.mapped_tags {
+            push_unique_string(&mut tags, tag);
+        }
+    }
+    for configured_tag in &template.tags {
+        let rendered = render_user_notification_template(configured_tag, context, settings);
+        for tag in split_rendered_tag_values(&rendered) {
+            let mapped = map_tag_value(settings, &tag);
+            push_unique_string(&mut tags, &mapped);
+        }
+    }
+
+    let tag_prefix = tags
+        .iter()
+        .map(|tag| format!("[{}]", tag))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rendered_text =
+        render_user_notification_template(&template.text_template, context, settings);
+    let trimmed_text = rendered_text.trim();
+
+    let mut message = Vec::new();
+    let text = match (tag_prefix.is_empty(), trimmed_text.is_empty()) {
+        (false, false) => format!("{}\n{}", tag_prefix, trimmed_text),
+        (false, true) => tag_prefix,
+        (true, false) => trimmed_text.to_string(),
+        (true, true) => String::new(),
+    };
+    if !text.is_empty() {
+        message.extend(message_segments_from_text(&text));
+    }
+    for image in &template.images {
+        let rendered = render_user_notification_template(image, context, settings);
+        let trimmed = rendered.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        message.push(serde_json::json!({
+            "type": "image",
+            "data": { "file": trimmed }
+        }));
+    }
+    message
+}
+
+#[derive(Debug, Clone)]
+struct AgentCommandTemplateContext {
+    command_name: String,
+    command_args: String,
+    command_text: String,
+    raw_message: String,
+    message_text: String,
+    sender_id: String,
+    sender_name: String,
+    group_id: String,
+    account_id: String,
+    received_at: String,
+    received_timestamp_ms: String,
+    submission_session_active: bool,
+    submission_session_message_count: usize,
+    previous_post_id: String,
+    previous_post_code: String,
+    previous_post_external_code: String,
+    previous_post_internal_code: String,
+    previous_post_info: String,
+    previous_post_created_at: String,
+    previous_post_created_timestamp_ms: String,
+}
+
+fn find_latest_sender_post(state: &NapCatState, group_id: &str, sender_id: &str) -> Option<PostId> {
+    state
+        .post_created_at_ms
+        .iter()
+        .filter_map(|(post_id, created_at_ms)| {
+            let post_group = state.post_group.get(post_id)?;
+            if post_group != group_id {
+                return None;
+            }
+            let submitter = resolve_post_submitter(state, *post_id)?;
+            if submitter != sender_id {
+                return None;
+            }
+            Some((*created_at_ms, post_id.0, *post_id))
+        })
+        .max_by_key(|(created_at_ms, post_key, _)| (*created_at_ms, *post_key))
+        .map(|(_, _, post_id)| post_id)
+}
+
+fn build_agent_post_summary(state: &NapCatState, post_id: PostId) -> String {
+    let mut lines = Vec::new();
+    if let Some(ingress_ids) = state.post_ingress.get(&post_id) {
+        for ingress_id in ingress_ids {
+            let Some(summary) = state.ingress_summary.get(ingress_id) else {
+                continue;
+            };
+            if let Some(line) = sanitize_summary_line(&summary.text) {
+                lines.push(line);
+            }
+            for attachment in &summary.attachments {
+                if attachment.kind != MediaKind::Image {
+                    lines.push(attachment_placeholder(attachment.kind).to_string());
+                }
+            }
+        }
+    }
+    if lines.is_empty() {
+        post_label(state, post_id)
+    } else {
+        lines.join(" | ")
+    }
+}
+
+async fn build_agent_command_context(
+    state: &Arc<Mutex<NapCatState>>,
+    runtime: &NapCatRuntimeConfig,
+    command_name: &str,
+    command_args: &str,
+    raw_message: &str,
+    message_text: &str,
+    user_id: &str,
+    sender_name: Option<&str>,
+    account_id: &str,
+    timestamp_ms: i64,
+) -> AgentCommandTemplateContext {
+    let (
+        submission_session_active,
+        submission_session_message_count,
+        previous_post_id,
+        previous_post_code,
+        previous_post_external_code,
+        previous_post_internal_code,
+        previous_post_info,
+        previous_post_created_at,
+        previous_post_created_timestamp_ms,
+    ) = {
+        let guard = state.lock().await;
+        let (submission_session_active, submission_session_message_count) =
+            match guard.submission_sessions.get(user_id) {
+                Some(session) => (true, session.messages.len()),
+                None => (false, 0usize),
+            };
+        let previous_post = find_latest_sender_post(&guard, &runtime.group_id, user_id);
+        let previous_post_id = previous_post
+            .map(|post_id| post_id.0.to_string())
+            .unwrap_or_default();
+        let previous_post_code = previous_post
+            .and_then(|post_id| post_code_text(&guard, post_id))
+            .unwrap_or_default();
+        let previous_post_external_code = previous_post
+            .and_then(|post_id| guard.post_external_code.get(&post_id).copied())
+            .map(|code| code.to_string())
+            .unwrap_or_default();
+        let previous_post_internal_code = previous_post
+            .and_then(|post_id| guard.post_review_code.get(&post_id).copied())
+            .map(|code| code.to_string())
+            .unwrap_or_default();
+        let previous_post_info = previous_post
+            .map(|post_id| build_agent_post_summary(&guard, post_id))
+            .unwrap_or_default();
+        let previous_post_created_timestamp_ms = previous_post
+            .and_then(|post_id| guard.post_created_at_ms.get(&post_id).copied())
+            .unwrap_or_default();
+        let previous_post_created_at = if previous_post_created_timestamp_ms > 0 {
+            format_local_datetime(
+                previous_post_created_timestamp_ms,
+                runtime.tz_offset_minutes,
+            )
+        } else {
+            String::new()
+        };
+        (
+            submission_session_active,
+            submission_session_message_count,
+            previous_post_id,
+            previous_post_code,
+            previous_post_external_code,
+            previous_post_internal_code,
+            previous_post_info,
+            previous_post_created_at,
+            if previous_post_created_timestamp_ms > 0 {
+                previous_post_created_timestamp_ms.to_string()
+            } else {
+                String::new()
+            },
+        )
+    };
+    AgentCommandTemplateContext {
+        command_name: command_name.to_string(),
+        command_args: command_args.trim().to_string(),
+        command_text: raw_message.trim().to_string(),
+        raw_message: raw_message.to_string(),
+        message_text: message_text.to_string(),
+        sender_id: user_id.to_string(),
+        sender_name: sender_name.unwrap_or("").trim().to_string(),
+        group_id: runtime.group_id.clone(),
+        account_id: account_id.trim().to_string(),
+        received_at: format_local_datetime(timestamp_ms, runtime.tz_offset_minutes),
+        received_timestamp_ms: timestamp_ms.to_string(),
+        submission_session_active,
+        submission_session_message_count,
+        previous_post_id,
+        previous_post_code,
+        previous_post_external_code,
+        previous_post_internal_code,
+        previous_post_info,
+        previous_post_created_at,
+        previous_post_created_timestamp_ms,
+    }
+}
+
+fn render_agent_command_template(template: &str, context: &AgentCommandTemplateContext) -> String {
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] == b'<' {
+            if let Some(close_rel) = template[idx + 1..].find('>') {
+                let close = idx + 1 + close_rel;
+                let key = template[idx + 1..close].trim();
+                if let Some(value) = agent_command_variable_value(context, key) {
+                    out.push_str(&value);
+                    idx = close + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = template[idx..].chars().next().unwrap();
+        out.push(ch);
+        idx += ch.len_utf8();
+    }
+    out
+}
+
+fn agent_command_variable_value(
+    context: &AgentCommandTemplateContext,
+    key: &str,
+) -> Option<String> {
+    match key {
+        "command_name" => Some(context.command_name.clone()),
+        "command_args" => Some(context.command_args.clone()),
+        "command_text" => Some(context.command_text.clone()),
+        "raw_message" => Some(context.raw_message.clone()),
+        "message_text" => Some(context.message_text.clone()),
+        "sender_id" => Some(context.sender_id.clone()),
+        "sender_name" => Some(context.sender_name.clone()),
+        "group_id" => Some(context.group_id.clone()),
+        "account_id" => Some(context.account_id.clone()),
+        "received_at" => Some(context.received_at.clone()),
+        "received_timestamp_ms" => Some(context.received_timestamp_ms.clone()),
+        "submission_session_active" => Some(context.submission_session_active.to_string()),
+        "submission_session_message_count" => {
+            Some(context.submission_session_message_count.to_string())
+        }
+        "previous_post_id" => Some(context.previous_post_id.clone()),
+        "previous_post_code" => Some(context.previous_post_code.clone()),
+        "previous_post_external_code" => Some(context.previous_post_external_code.clone()),
+        "previous_post_internal_code" => Some(context.previous_post_internal_code.clone()),
+        "previous_post_info" => Some(context.previous_post_info.clone()),
+        "previous_post_created_at" => Some(context.previous_post_created_at.clone()),
+        "previous_post_created_timestamp_ms" => {
+            Some(context.previous_post_created_timestamp_ms.clone())
+        }
+        _ => None,
+    }
+}
+
+fn build_agent_command_message(
+    settings: &UserNotificationSettings,
+    text_template: &str,
+    tags: &[String],
+    images: &[String],
+    context: &AgentCommandTemplateContext,
+) -> Vec<Value> {
+    let rendered_tags = render_agent_command_tags(settings, tags, context);
+    let tag_prefix = rendered_tags
+        .iter()
+        .map(|tag| format!("[{}]", tag))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rendered_text = render_agent_command_template(text_template, context);
+    let trimmed_text = rendered_text.trim();
+    let mut message = Vec::new();
+    let text = match (tag_prefix.is_empty(), trimmed_text.is_empty()) {
+        (false, false) => format!("{}\n{}", tag_prefix, trimmed_text),
+        (false, true) => tag_prefix,
+        (true, false) => trimmed_text.to_string(),
+        (true, true) => String::new(),
+    };
+    if !text.is_empty() {
+        message.extend(message_segments_from_text(&text));
+    }
+    for image in images {
+        let rendered = render_agent_command_template(image, context);
+        let trimmed = rendered.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        message.push(serde_json::json!({
+            "type": "image",
+            "data": { "file": trimmed }
+        }));
+    }
+    message
+}
+
+fn render_agent_command_tags(
+    settings: &UserNotificationSettings,
+    tags: &[String],
+    context: &AgentCommandTemplateContext,
+) -> Vec<String> {
+    let mut rendered_tags = Vec::new();
+    for tag in tags {
+        let rendered = render_agent_command_template(tag, context);
+        for raw_tag in split_rendered_tag_values(&rendered) {
+            let mapped = map_tag_value(settings, &raw_tag);
+            push_unique_string(&mut rendered_tags, &mapped);
+        }
+    }
+    rendered_tags
+}
+
+fn render_agent_command_images(
+    images: &[String],
+    context: &AgentCommandTemplateContext,
+) -> Vec<String> {
+    images
+        .iter()
+        .map(|image| render_agent_command_template(image, context))
+        .map(|image| image.trim().to_string())
+        .filter(|image| !image.is_empty())
+        .collect()
+}
+
+fn parse_agent_command_review_code(value: &str) -> Result<ReviewCode, String> {
+    let trimmed = value.trim().trim_start_matches('#').trim();
+    if trimmed.is_empty() {
+        return Err("审核编号不能为空".to_string());
+    }
+    trimmed
+        .parse::<ReviewCode>()
+        .map_err(|_| format!("无效的审核编号: {}", trimmed))
+}
+
+fn parse_agent_command_external_code(value: &str) -> Result<ExternalCode, String> {
+    let trimmed = value.trim().trim_start_matches('#').trim();
+    if trimmed.is_empty() {
+        return Err("外部编号不能为空".to_string());
+    }
+    trimmed
+        .parse::<ExternalCode>()
+        .map_err(|_| format!("无效的外部编号: {}", trimmed))
+}
+
+fn resolve_agent_review_id_by_code(
+    state: &NapCatState,
+    group_id: &str,
+    review_code: ReviewCode,
+) -> Result<ReviewId, String> {
+    let Some(review_id) = state.review_by_code.get(&review_code).copied() else {
+        return Err(format!("找不到审核编号 #{}", review_code));
+    };
+    let Some(info) = state.review_info.get(&review_id) else {
+        return Err(format!("找不到审核编号 #{}", review_code));
+    };
+    if !info.group_id.is_empty() && info.group_id != group_id {
+        return Err(format!("审核编号 #{} 不属于当前分组", review_code));
+    }
+    Ok(review_id)
+}
+
+fn resolve_agent_post_id_by_code(
+    state: &NapCatState,
+    group_id: &str,
+    value: &str,
+) -> Result<PostId, String> {
+    let trimmed = value.trim().trim_start_matches('#').trim();
+    if trimmed.is_empty() {
+        return Err("投稿编号不能为空".to_string());
+    }
+    if let Ok(review_code) = trimmed.parse::<ReviewCode>() {
+        if let Some(review_id) = state.review_by_code.get(&review_code).copied() {
+            let Some(info) = state.review_info.get(&review_id) else {
+                return Err(format!("找不到编号 #{} 对应的稿件", review_code));
+            };
+            if !info.group_id.is_empty() && info.group_id != group_id {
+                return Err(format!("编号 #{} 不属于当前分组", review_code));
+            }
+            return Ok(info.post_id);
+        }
+    }
+    let external_code = trimmed
+        .parse::<ExternalCode>()
+        .map_err(|_| format!("无效的投稿编号: {}", trimmed))?;
+    let Some((post_id, post_group)) =
+        state.post_external_code.iter().find_map(|(post_id, code)| {
+            (*code == external_code).then(|| (*post_id, state.post_group.get(post_id).cloned()))
+        })
+    else {
+        return Err(format!("找不到编号 #{} 对应的稿件", external_code));
+    };
+    if let Some(post_group) = post_group {
+        if !post_group.is_empty() && post_group != group_id {
+            return Err(format!("编号 #{} 不属于当前分组", external_code));
+        }
+    }
+    Ok(post_id)
+}
+
+fn build_agent_review_info_text(
+    state: &NapCatState,
+    group_id: &str,
+    review_code: ReviewCode,
+    tz_offset_minutes: i32,
+) -> Result<String, String> {
+    let review_id = resolve_agent_review_id_by_code(state, group_id, review_code)?;
+    let Some(info) = state.review_info.get(&review_id) else {
+        return Err(format!("找不到审核编号 #{}", review_code));
+    };
+    let post_id = info.post_id;
+    let display_code = post_code_text(state, post_id).unwrap_or_else(|| review_code.to_string());
+    let external_code = state
+        .post_external_code
+        .get(&post_id)
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "未分配".to_string());
+    let sender_id = resolve_post_submitter(state, post_id).unwrap_or_else(|| "未知".to_string());
+    let group = state
+        .post_group
+        .get(&post_id)
+        .cloned()
+        .unwrap_or_else(|| group_id.to_string());
+    let created_at = state
+        .post_created_at_ms
+        .get(&post_id)
+        .copied()
+        .map(|ts| format_local_datetime(ts, tz_offset_minutes))
+        .unwrap_or_else(|| "未知".to_string());
+    let decision = match info.decision {
+        Some(ReviewDecision::Approved) => "已通过",
+        Some(ReviewDecision::Rejected) => "已拒稿",
+        Some(ReviewDecision::Deferred) => "已延后",
+        Some(ReviewDecision::Skipped) => "已跳过",
+        Some(ReviewDecision::Deleted) => "已删除",
+        None => "待审核",
+    };
+    let reviewer = info
+        .decided_by
+        .as_deref()
+        .map(display_operator_name)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("-");
+    let reviewed_at = info
+        .decided_at_ms
+        .map(|ts| format_local_datetime(ts, tz_offset_minutes))
+        .unwrap_or_else(|| "-".to_string());
+    let summary = build_agent_post_summary(state, post_id);
+    Ok([
+        format!("稿件信息 #{}", display_code),
+        format!("内部编号: #{}", review_code),
+        format!("外部编号: {}", external_code),
+        format!("post_id: {}", post_id.0),
+        format!("review_id: {}", review_id.0),
+        format!("分组: {}", group),
+        format!("投稿人: {}", sender_id),
+        format!("创建时间: {}", created_at),
+        format!("审核状态: {}", decision),
+        format!("审核人: {}", reviewer),
+        format!("审核时间: {}", reviewed_at),
+        format!("摘要: {}", summary),
+    ]
+    .join("\n"))
+}
+
+fn build_submission_session_ingress(
+    runtime: &NapCatRuntimeConfig,
+    state: &mut NapCatState,
+    account_id: &str,
+    user_id: &str,
+    timestamp_ms: i64,
+) -> Result<Command, String> {
+    let Some(session) = state.submission_sessions.remove(user_id) else {
+        return Err("当前用户没有进行中的投稿会话".to_string());
+    };
+    if !session.confirming {
+        state
+            .submission_sessions
+            .insert(user_id.to_string(), session);
+        return Err("请先结束投稿，再执行提交。".to_string());
+    }
+    if session.messages.is_empty() {
+        return Err("当前投稿会话没有可提交的内容".to_string());
+    }
+    let first_msg = session
+        .messages
+        .first()
+        .ok_or_else(|| "当前投稿会话没有可提交的内容".to_string())?;
+    let first_msg_id = value_opt_to_string(first_msg.message.get("message_id"))
+        .unwrap_or_else(|| format!("submission-{}", session.started_at_ms));
+    let sender_name = extract_sender_name(&first_msg.message).or_else(|| Some(user_id.to_string()));
+    let chat_id = format!("{}_submission_{}", user_id, session.started_at_ms);
+    let mut combined_text = String::new();
+    let mut combined_attachments = Vec::new();
+    let mut combined_summary = String::new();
+    for buffered in &session.messages {
+        let ExtractedMessage {
+            text,
+            summary_text,
+            attachments,
+        } = extract_message_lite(buffered.message.get("message"));
+        if !text.trim().is_empty() {
+            if !combined_text.is_empty() {
+                combined_text.push_str("\n\n");
+            }
+            combined_text.push_str(text.trim());
+        }
+        if !summary_text.trim().is_empty() {
+            if !combined_summary.is_empty() {
+                combined_summary.push_str("\n\n");
+            }
+            combined_summary.push_str(summary_text.trim());
+        }
+        combined_attachments.extend(attachments);
+    }
+    if combined_summary.is_empty() {
+        combined_summary = format!("[{} 条投稿消息]", session.messages.len());
+    }
+    let ingress_id = derive_ingress_id(&[
+        account_id.as_bytes(),
+        chat_id.as_bytes(),
+        user_id.as_bytes(),
+        first_msg_id.as_bytes(),
+    ]);
+    state.pending_summary.insert(ingress_id, combined_summary);
+    let received_at_ms = if session.started_at_ms > 0 {
+        session.started_at_ms
+    } else {
+        timestamp_ms
+    };
+    Ok(Command::Ingress(IngressCommand {
+        profile_id: account_id.to_string(),
+        chat_id,
+        user_id: user_id.to_string(),
+        sender_name,
+        group_id: if session.group_id.trim().is_empty() {
+            runtime.group_id.clone()
+        } else {
+            session.group_id
+        },
+        platform_msg_id: first_msg_id,
+        message: IngressMessage {
+            text: combined_text,
+            attachments: combined_attachments,
+        },
+        route_meta: None,
+        received_at_ms,
+        close_immediately: true,
+    }))
+}
+
+fn build_agent_review_action(
+    action: &AgentCommandReviewAction,
+    context: &AgentCommandTemplateContext,
+) -> Result<ReviewAction, String> {
+    Ok(match action {
+        AgentCommandReviewAction::Approve => ReviewAction::Approve,
+        AgentCommandReviewAction::Reject => ReviewAction::Reject,
+        AgentCommandReviewAction::Delete => ReviewAction::Delete,
+        AgentCommandReviewAction::Defer { delay_ms } => ReviewAction::Defer {
+            delay_ms: render_agent_command_template(delay_ms, context)
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| format!("无效的延后毫秒数: {}", delay_ms.trim()))?,
+        },
+        AgentCommandReviewAction::Skip => ReviewAction::Skip,
+        AgentCommandReviewAction::Immediate => ReviewAction::Immediate,
+        AgentCommandReviewAction::Refresh => ReviewAction::Refresh,
+        AgentCommandReviewAction::Rerender => ReviewAction::Rerender,
+        AgentCommandReviewAction::SelectAllMessages => ReviewAction::SelectAllMessages,
+        AgentCommandReviewAction::ToggleAnonymous => ReviewAction::ToggleAnonymous,
+        AgentCommandReviewAction::ExpandAudit => ReviewAction::ExpandAudit,
+        AgentCommandReviewAction::Show => ReviewAction::Show,
+        AgentCommandReviewAction::Comment { text_template } => ReviewAction::Comment {
+            text: render_agent_command_template(text_template, context)
+                .trim()
+                .to_string(),
+        },
+        AgentCommandReviewAction::Reply { text_template } => ReviewAction::Reply {
+            text: render_agent_command_template(text_template, context)
+                .trim()
+                .to_string(),
+        },
+        AgentCommandReviewAction::Blacklist { reason_template } => {
+            let rendered = render_agent_command_template(reason_template, context);
+            ReviewAction::Blacklist {
+                reason: (!rendered.trim().is_empty()).then(|| rendered.trim().to_string()),
+            }
+        }
+        AgentCommandReviewAction::QuickReply { key_template } => ReviewAction::QuickReply {
+            key: render_agent_command_template(key_template, context)
+                .trim()
+                .to_string(),
+        },
+        AgentCommandReviewAction::Merge { target_review_code } => ReviewAction::Merge {
+            review_code: parse_agent_command_review_code(
+                render_agent_command_template(target_review_code, context).trim(),
+            )?,
+        },
+    })
+}
+
+fn build_agent_global_action(
+    action: &AgentCommandGlobalAction,
+    context: &AgentCommandTemplateContext,
+) -> Result<GlobalAction, String> {
+    Ok(match action {
+        AgentCommandGlobalAction::Help => GlobalAction::Help,
+        AgentCommandGlobalAction::Recall { review_code } => GlobalAction::Recall {
+            review_code: parse_agent_command_review_code(
+                render_agent_command_template(review_code, context).trim(),
+            )?,
+        },
+        AgentCommandGlobalAction::Withdraw { review_code } => GlobalAction::Withdraw {
+            review_code: parse_agent_command_review_code(
+                render_agent_command_template(review_code, context).trim(),
+            )?,
+        },
+        AgentCommandGlobalAction::Info { review_code } => GlobalAction::Info {
+            review_code: parse_agent_command_review_code(
+                render_agent_command_template(review_code, context).trim(),
+            )?,
+        },
+        AgentCommandGlobalAction::ManualRelogin => GlobalAction::ManualRelogin,
+        AgentCommandGlobalAction::AutoRelogin => GlobalAction::AutoRelogin,
+        AgentCommandGlobalAction::PendingList => GlobalAction::PendingList,
+        AgentCommandGlobalAction::PendingClear => GlobalAction::PendingClear,
+        AgentCommandGlobalAction::SendQueueClear => GlobalAction::SendQueueClear,
+        AgentCommandGlobalAction::SendQueueFlush => GlobalAction::SendQueueFlush,
+        AgentCommandGlobalAction::SendInFlightClear => GlobalAction::SendInFlightClear,
+        AgentCommandGlobalAction::BlacklistList => GlobalAction::BlacklistList,
+        AgentCommandGlobalAction::BlacklistAdd {
+            sender_id,
+            reason_template,
+        } => {
+            let rendered_reason = render_agent_command_template(reason_template, context);
+            GlobalAction::BlacklistAdd {
+                sender_id: render_agent_command_template(sender_id, context)
+                    .trim()
+                    .to_string(),
+                reason: (!rendered_reason.trim().is_empty())
+                    .then(|| rendered_reason.trim().to_string()),
+            }
+        }
+        AgentCommandGlobalAction::BlacklistRemove { sender_id } => GlobalAction::BlacklistRemove {
+            sender_id: render_agent_command_template(sender_id, context)
+                .trim()
+                .to_string(),
+        },
+        AgentCommandGlobalAction::SetExternalNumber { value_template } => {
+            GlobalAction::SetExternalNumber {
+                value: parse_agent_command_external_code(
+                    render_agent_command_template(value_template, context).trim(),
+                )?,
+            }
+        }
+        AgentCommandGlobalAction::QuickReplyList => GlobalAction::QuickReplyList,
+        AgentCommandGlobalAction::QuickReplyAdd {
+            key_template,
+            text_template,
+        } => GlobalAction::QuickReplyAdd {
+            key: render_agent_command_template(key_template, context)
+                .trim()
+                .to_string(),
+            text: render_agent_command_template(text_template, context)
+                .trim()
+                .to_string(),
+        },
+        AgentCommandGlobalAction::QuickReplyDelete { key_template } => {
+            GlobalAction::QuickReplyDelete {
+                key: render_agent_command_template(key_template, context)
+                    .trim()
+                    .to_string(),
+            }
+        }
+        AgentCommandGlobalAction::ShortcutList => GlobalAction::ShortcutList,
+        AgentCommandGlobalAction::ShortcutAdd {
+            scope,
+            key_template,
+            definition_template,
+        } => GlobalAction::ShortcutAdd {
+            scope: match scope {
+                AgentCommandShortcutScope::Review => ShortcutScope::Review,
+                AgentCommandShortcutScope::Global => ShortcutScope::Global,
+            },
+            key: render_agent_command_template(key_template, context)
+                .trim()
+                .to_string(),
+            definition: render_agent_command_template(definition_template, context)
+                .trim()
+                .to_string(),
+        },
+        AgentCommandGlobalAction::ShortcutDelete {
+            scope,
+            key_template,
+        } => GlobalAction::ShortcutDelete {
+            scope: match scope {
+                AgentCommandShortcutScope::Review => ShortcutScope::Review,
+                AgentCommandShortcutScope::Global => ShortcutScope::Global,
+            },
+            key: render_agent_command_template(key_template, context)
+                .trim()
+                .to_string(),
+        },
+        AgentCommandGlobalAction::SelfCheck => GlobalAction::SelfCheck,
+        AgentCommandGlobalAction::SystemRepair => GlobalAction::SystemRepair,
+    })
+}
+
+async fn execute_agent_insert_queued_post(
+    runtime: &NapCatRuntimeConfig,
+    state: &Arc<Mutex<NapCatState>>,
+    cmd_tx: &mpsc::Sender<Command>,
+    moving_post_code: &str,
+    anchor_post_code: &str,
+    position: AgentCommandQueueInsertPosition,
+) -> Result<(), String> {
+    let events = {
+        let guard = state.lock().await;
+        let moving_post_id =
+            resolve_agent_post_id_by_code(&guard, &runtime.group_id, moving_post_code)?;
+        let anchor_post_id =
+            resolve_agent_post_id_by_code(&guard, &runtime.group_id, anchor_post_code)?;
+        if moving_post_id == anchor_post_id {
+            return Err("不能把稿件插入到它自己前后".to_string());
+        }
+        let Some(moving_plan) = guard.send_plans.get(&moving_post_id).cloned() else {
+            return Err(format!(
+                "稿件 #{} 当前不在发送队列中",
+                moving_post_code.trim()
+            ));
+        };
+        let Some(anchor_plan) = guard.send_plans.get(&anchor_post_id).cloned() else {
+            return Err(format!(
+                "稿件 #{} 当前不在发送队列中",
+                anchor_post_code.trim()
+            ));
+        };
+        if moving_plan.group_id != runtime.group_id || anchor_plan.group_id != runtime.group_id {
+            return Err("只能调整当前分组的发送队列".to_string());
+        }
+        let mut queue = guard
+            .send_plans
+            .iter()
+            .filter_map(|(post_id, plan)| {
+                (plan.group_id == runtime.group_id).then_some((*post_id, plan.clone()))
+            })
+            .collect::<Vec<_>>();
+        queue.sort_by(|a, b| {
+            (a.1.not_before_ms, a.1.priority, a.1.seq, a.0.0).cmp(&(
+                b.1.not_before_ms,
+                b.1.priority,
+                b.1.seq,
+                b.0.0,
+            ))
+        });
+        let moving_entry = queue
+            .iter()
+            .find(|(post_id, _)| *post_id == moving_post_id)
+            .cloned()
+            .ok_or_else(|| format!("稿件 #{} 当前不在发送队列中", moving_post_code.trim()))?;
+        queue.retain(|(post_id, _)| *post_id != moving_post_id);
+        let Some(anchor_index) = queue
+            .iter()
+            .position(|(post_id, _)| *post_id == anchor_post_id)
+        else {
+            return Err(format!(
+                "稿件 #{} 当前不在发送队列中",
+                anchor_post_code.trim()
+            ));
+        };
+        let insert_index = match position {
+            AgentCommandQueueInsertPosition::Before => anchor_index,
+            AgentCommandQueueInsertPosition::After => anchor_index.saturating_add(1),
+        };
+        let mut updated_plan = moving_entry.1.clone();
+        updated_plan.group_id = anchor_plan.group_id.clone();
+        updated_plan.not_before_ms = anchor_plan.not_before_ms;
+        updated_plan.priority = anchor_plan.priority;
+        queue.insert(
+            insert_index.min(queue.len()),
+            (moving_entry.0, updated_plan),
+        );
+        let mut next_seq = queue.iter().map(|(_, plan)| plan.seq).min().unwrap_or(1);
+        queue
+            .into_iter()
+            .map(|(post_id, plan)| {
+                let event = Event::Schedule(ScheduleEvent::SendPlanRescheduled {
+                    post_id,
+                    group_id: plan.group_id,
+                    not_before_ms: plan.not_before_ms,
+                    priority: plan.priority,
+                    seq: next_seq,
+                });
+                next_seq = next_seq.saturating_add(1);
+                event
+            })
+            .collect::<Vec<_>>()
+    };
+    for event in events {
+        cmd_tx
+            .send(Command::DriverEvent(event))
+            .await
+            .map_err(|err| format!("发送队列调整事件失败: {}", err))?;
+    }
+    Ok(())
+}
+
+async fn execute_agent_review_action(
+    runtime: &NapCatRuntimeConfig,
+    state: &Arc<Mutex<NapCatState>>,
+    cmd_tx: &mpsc::Sender<Command>,
+    review_code_text: &str,
+    action: &AgentCommandReviewAction,
+    context: &AgentCommandTemplateContext,
+    operator_id: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let review_code = parse_agent_command_review_code(review_code_text)?;
+    let review_action = build_agent_review_action(action, context)?;
+    let command = {
+        let guard = state.lock().await;
+        let review_id = resolve_agent_review_id_by_code(&guard, &runtime.group_id, review_code)?;
+        if guard.processed_reviews.contains(&review_id) {
+            return Err(format!("审核编号 #{} 已处理，不能重复执行", review_code));
+        }
+        Command::ReviewAction(ReviewActionCommand {
+            review_id: Some(review_id),
+            review_code: None,
+            audit_msg_id: None,
+            action: review_action,
+            operator_id: operator_id.to_string(),
+            now_ms,
+            tz_offset_minutes: runtime.tz_offset_minutes,
+        })
+    };
+    cmd_tx
+        .send(command)
+        .await
+        .map_err(|err| format!("发送审核指令失败: {}", err))
+}
+
+async fn execute_agent_global_action(
+    runtime: &NapCatRuntimeConfig,
+    state: &Arc<Mutex<NapCatState>>,
+    cmd_tx: &mpsc::Sender<Command>,
+    out_tx: &mpsc::Sender<String>,
+    user_id: &str,
+    action: &AgentCommandGlobalAction,
+    context: &AgentCommandTemplateContext,
+    operator_id: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let global_action = build_agent_global_action(action, context)?;
+    match &global_action {
+        GlobalAction::Help => {
+            send_private_text(out_tx, user_id, HELP_TEXT).await;
+            return Ok(());
+        }
+        GlobalAction::PendingList => {
+            let text = {
+                let guard = state.lock().await;
+                build_pending_list_text(&guard, &runtime.group_id)
+            };
+            send_private_text(out_tx, user_id, &text).await;
+            return Ok(());
+        }
+        GlobalAction::BlacklistList => {
+            let text = {
+                let guard = state.lock().await;
+                build_blacklist_list_text(&guard, &runtime.group_id)
+            };
+            send_private_text(out_tx, user_id, &text).await;
+            return Ok(());
+        }
+        GlobalAction::QuickReplyList => {
+            let text = build_quick_reply_list_text(runtime);
+            send_private_text(out_tx, user_id, &text).await;
+            return Ok(());
+        }
+        GlobalAction::ShortcutList => {
+            let text = build_shortcut_list_text(runtime);
+            send_private_text(out_tx, user_id, &text).await;
+            return Ok(());
+        }
+        GlobalAction::SelfCheck => {
+            let text = {
+                let guard = state.lock().await;
+                build_selfcheck_report(runtime, &guard)
+            };
+            send_private_text(out_tx, user_id, &text).await;
+            return Ok(());
+        }
+        GlobalAction::Info { review_code } => {
+            let text = {
+                let guard = state.lock().await;
+                build_agent_review_info_text(
+                    &guard,
+                    &runtime.group_id,
+                    *review_code,
+                    runtime.tz_offset_minutes,
+                )?
+            };
+            send_private_text(out_tx, user_id, &text).await;
+            return Ok(());
+        }
+        GlobalAction::ManualRelogin => {
+            send_private_text(
+                out_tx,
+                user_id,
+                "当前版本暂未把“手动重新登录”接入 agent 积木执行链，请在原审核面板或运维流程中执行。",
+            )
+            .await;
+            return Ok(());
+        }
+        GlobalAction::AutoRelogin => {
+            send_private_text(
+                out_tx,
+                user_id,
+                "当前版本暂未把“自动重新登录”接入 agent 积木执行链，请在原审核面板或运维流程中执行。",
+            )
+            .await;
+            return Ok(());
+        }
+        GlobalAction::SystemRepair => {
+            send_private_text(
+                out_tx,
+                user_id,
+                "当前版本暂未把“系统修复”接入 agent 积木执行链，请在原审核面板或运维流程中执行。",
+            )
+            .await;
+            return Ok(());
+        }
+        _ => {}
+    }
+    {
+        let mut guard = state.lock().await;
+        if let Err(msg) = validate_global_action(&guard, &runtime.group_id, &global_action) {
+            return Err(msg.to_string());
+        }
+        if let GlobalAction::Recall { review_code } = &global_action {
+            if let Some(review_id) = guard.review_by_code.get(review_code).copied() {
+                guard.processed_reviews.remove(&review_id);
+            }
+        }
+    }
+    cmd_tx
+        .send(Command::GlobalAction(GlobalActionCommand {
+            group_id: runtime.group_id.clone(),
+            action: global_action,
+            operator_id: operator_id.to_string(),
+            now_ms,
+            tz_offset_minutes: runtime.tz_offset_minutes,
+        }))
+        .await
+        .map_err(|err| format!("发送全局指令失败: {}", err))
+}
+
+fn parse_private_agent_command_line(raw_trimmed: &str) -> Option<(String, String)> {
+    let body = raw_trimmed.trim().strip_prefix('#')?;
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let mut iter = body.splitn(2, char::is_whitespace);
+    let name = iter.next()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let args = iter.next().unwrap_or("").trim().to_string();
+    Some((name.to_string(), args))
+}
+
+fn agent_command_client() -> &'static Client {
+    AGENT_WEBHOOK_CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    })
+}
+
+async fn execute_private_agent_command(
+    runtime: &NapCatRuntimeConfig,
+    state: &Arc<Mutex<NapCatState>>,
+    cmd_tx: &mpsc::Sender<Command>,
+    out_tx: &mpsc::Sender<String>,
+    user_id: &str,
+    sender_name: Option<&str>,
+    account_id: &str,
+    raw_message: &str,
+    message_text: &str,
+    command_name: &str,
+    command_args: &str,
+    timestamp_ms: i64,
+) -> Result<(), String> {
+    let command = {
+        let guard = runtime
+            .agent_commands
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        guard.get(command_name).cloned()
+    }
+    .ok_or_else(|| format!("agent command not found: {}", command_name))?;
+    if !command.enabled {
+        return Ok(());
+    }
+    let settings = runtime
+        .user_notifications
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    for block in command.blocks {
+        let context = build_agent_command_context(
+            state,
+            runtime,
+            command_name,
+            command_args,
+            raw_message,
+            message_text,
+            user_id,
+            sender_name,
+            account_id,
+            timestamp_ms,
+        )
+        .await;
+        match block {
+            AgentCommandBlock::ReplyPrivateMessage {
+                text_template,
+                tags,
+                images,
+            } => {
+                let message = build_agent_command_message(
+                    &settings,
+                    &text_template,
+                    &tags,
+                    &images,
+                    &context,
+                );
+                if !message.is_empty() {
+                    send_private_segments(out_tx, user_id, message).await;
+                }
+            }
+            AgentCommandBlock::StartSubmissionSession => {
+                let mut guard = state.lock().await;
+                guard.submission_sessions.insert(
+                    user_id.to_string(),
+                    SubmissionSession {
+                        messages: Vec::new(),
+                        started_at_ms: timestamp_ms,
+                        group_id: runtime.group_id.clone(),
+                        confirming: false,
+                    },
+                );
+            }
+            AgentCommandBlock::FinishSubmissionSession => {
+                let mut guard = state.lock().await;
+                if let Some(session) = guard.submission_sessions.get_mut(user_id) {
+                    session.confirming = true;
+                }
+            }
+            AgentCommandBlock::ResumeSubmissionSession => {
+                let mut guard = state.lock().await;
+                if let Some(session) = guard.submission_sessions.get_mut(user_id) {
+                    session.confirming = false;
+                }
+            }
+            AgentCommandBlock::SubmitSubmissionSession => {
+                let mut guard = state.lock().await;
+                let command = build_submission_session_ingress(
+                    runtime,
+                    &mut guard,
+                    account_id,
+                    user_id,
+                    timestamp_ms,
+                )?;
+                drop(guard);
+                cmd_tx
+                    .send(command)
+                    .await
+                    .map_err(|err| format!("提交投稿会话失败: {}", err))?;
+                send_private_text(out_tx, user_id, "投稿会话已提交，系统正在继续处理。").await;
+            }
+            AgentCommandBlock::CancelSubmissionSession => {
+                let mut guard = state.lock().await;
+                guard.submission_sessions.remove(user_id);
+            }
+            AgentCommandBlock::InsertQueuedPost {
+                moving_post_code,
+                anchor_post_code,
+                position,
+            } => {
+                execute_agent_insert_queued_post(
+                    runtime,
+                    state,
+                    cmd_tx,
+                    &moving_post_code,
+                    &anchor_post_code,
+                    position,
+                )
+                .await?;
+            }
+            AgentCommandBlock::ExecuteReviewAction {
+                review_code,
+                action,
+            } => {
+                execute_agent_review_action(
+                    runtime,
+                    state,
+                    cmd_tx,
+                    &review_code,
+                    &action,
+                    &context,
+                    user_id,
+                    timestamp_ms,
+                )
+                .await?;
+            }
+            AgentCommandBlock::ExecuteGlobalAction { action } => {
+                execute_agent_global_action(
+                    runtime,
+                    state,
+                    cmd_tx,
+                    out_tx,
+                    user_id,
+                    &action,
+                    &context,
+                    user_id,
+                    timestamp_ms,
+                )
+                .await?;
+            }
+            AgentCommandBlock::SendWebhook {
+                url,
+                source_webhook,
+                text_template,
+                tags,
+                images,
+            } => {
+                let rendered_url = render_agent_command_template(&url, &context);
+                let target_url = rendered_url.trim();
+                if target_url.is_empty() {
+                    return Err("webhook 地址为空".to_string());
+                }
+                let rendered_source_webhook =
+                    render_agent_command_template(&source_webhook, &context);
+                let rendered_tags = render_agent_command_tags(&settings, &tags, &context);
+                let rendered_images = render_agent_command_images(&images, &context);
+                let rendered_text = render_agent_command_template(&text_template, &context);
+                let payload = serde_json::json!({
+                    "command_name": context.command_name,
+                    "command_args": context.command_args,
+                    "command_text": context.command_text,
+                    "raw_message": context.raw_message,
+                    "message_text": context.message_text,
+                    "sender_id": context.sender_id,
+                    "sender_name": context.sender_name,
+                    "group_id": context.group_id,
+                    "account_id": context.account_id,
+                    "received_at": context.received_at,
+                    "received_timestamp_ms": context.received_timestamp_ms,
+                    "submission_session_active": context.submission_session_active,
+                    "submission_session_message_count": context.submission_session_message_count,
+                    "source_webhook": rendered_source_webhook.trim(),
+                    "tags": rendered_tags,
+                    "text": rendered_text.trim(),
+                    "images": rendered_images,
+                });
+                let response = agent_command_client()
+                    .post(target_url)
+                    .json(&payload)
+                    .send()
+                    .await
+                    .map_err(|err| format!("webhook 请求失败: {}", err))?;
+                response
+                    .error_for_status()
+                    .map_err(|err| format!("webhook 响应失败: {}", err))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn display_operator_name(raw: &str) -> &str {
+    raw.strip_prefix("webview:")
+        .or_else(|| raw.strip_prefix("api:"))
+        .or_else(|| raw.strip_prefix("tui:"))
+        .unwrap_or(raw)
+}
+
+fn format_local_datetime(ms: i64, tz_offset_minutes: i32) -> String {
+    let offset_ms = i64::from(tz_offset_minutes).saturating_mul(60_000);
+    let local = ms.saturating_add(offset_ms);
+    let day = local.div_euclid(86_400_000);
+    let time_ms = local.rem_euclid(86_400_000);
+    let hour = time_ms.div_euclid(3_600_000);
+    let minute = time_ms.rem_euclid(3_600_000).div_euclid(60_000);
+    let second = time_ms.rem_euclid(60_000).div_euclid(1_000);
+    format!(
+        "{} {:02}:{:02}:{:02}",
+        civil_from_days(day),
+        hour,
+        minute,
+        second
+    )
+}
+
+fn civil_from_days(days_since_epoch: i64) -> String {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 fn resolve_post_submitter(state: &NapCatState, post_id: PostId) -> Option<String> {
     let ingress_ids = state.post_ingress.get(&post_id)?;
     resolve_post_submitter_with_ingress(state, ingress_ids)
@@ -4703,19 +6966,6 @@ fn resolve_review_submitter(state: &NapCatState, review_id: ReviewId) -> Option<
         .cloned()
         .or_else(|| resolve_post_submitter(state, info.post_id))?;
     Some((info.group_id.clone(), user_id))
-}
-
-fn format_review_submitter_notice(kind: ReviewSubmitterNoticeKind, reason: Option<&str>) -> String {
-    let reason = reason
-        .map(str::trim)
-        .filter(|reason| !reason.is_empty())
-        .unwrap_or("无");
-    match kind {
-        ReviewSubmitterNoticeKind::Rejected => {
-            format!("你的投稿已被拒，请修改后再发送。理由：{}", reason)
-        }
-        ReviewSubmitterNoticeKind::Deleted => String::new(),
-    }
 }
 
 fn format_list(items: &[String]) -> String {
@@ -4753,11 +7003,14 @@ fn build_audit_message(
     post_id: PostId,
     ingress_ids: &[IngressId],
     ingress_map: &HashMap<IngressId, IngressSummary>,
-    preview_images: Vec<String>,
+    preview_image: Option<String>,
     blob_paths: &HashMap<BlobId, String>,
     is_safe: bool,
 ) -> AuditMessage {
-    let mut images = preview_images;
+    let mut images = Vec::new();
+    if let Some(preview) = preview_image {
+        images.push(preview);
+    }
     if ingress_ids.is_empty() {
         return AuditMessage {
             text: format!("#{} post {}", review_code, post_id.0),
@@ -4988,39 +7241,12 @@ fn image_source_from_attachment(
     }
 }
 
-fn rendered_png_blob_ids(state: &NapCatState, post_id: PostId) -> Vec<BlobId> {
-    state
-        .post_render_blobs
-        .get(&post_id)
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn rendered_png_previews(
-    post_id: PostId,
-    blob_ids: &[BlobId],
-    blob_paths: &HashMap<BlobId, String>,
-) -> Vec<String> {
-    let mut ids = blob_ids.to_vec();
-    if ids.is_empty() {
-        ids.push(rendered_png_blob_id(post_id));
-    }
-    ids.into_iter()
-        .filter_map(|blob_id| rendered_png_preview_for_blob(blob_id, blob_paths))
-        .collect()
-}
-
-fn rendered_png_preview_for_blob(
-    blob_id: BlobId,
-    blob_paths: &HashMap<BlobId, String>,
-) -> Option<String> {
+fn rendered_png_preview(post_id: PostId) -> Option<String> {
+    let blob_id = rendered_png_blob_id(post_id);
     if let Some(bytes) = blob_cache::get_bytes(blob_id) {
         return Some(format!("base64://{}", STANDARD.encode(bytes.as_ref())));
     }
-    if let Some(path) = blob_paths.get(&blob_id) {
-        return Some(file_uri_from_path(Path::new(path)));
-    }
-    let path = rendered_png_path_for_blob(blob_id);
+    let path = rendered_png_path(post_id);
     let meta = fs::metadata(&path).ok()?;
     if meta.len() == 0 {
         return None;
@@ -5032,7 +7258,8 @@ fn rendered_png_blob_id(post_id: PostId) -> BlobId {
     derive_blob_id(&[&post_id.to_be_bytes(), b"png"])
 }
 
-fn rendered_png_path_for_blob(blob_id: BlobId) -> PathBuf {
+fn rendered_png_path(post_id: PostId) -> PathBuf {
+    let blob_id = rendered_png_blob_id(post_id);
     let filename = format!("{}.png", id128_hex(blob_id.0));
     blob_root().join("png").join(filename)
 }
@@ -5074,7 +7301,7 @@ const HELP_TEXT: &str = r#"全局指令:
 用法：调出 <review_code>
 
 撤回:
-将暂存区中的稿件撤回到待处理；已发送稿件会从对应空间动态移除图片并追加删除标记
+将暂存区中的稿件撤回到待处理，并重排后续待发送稿件的外部编号
 用法：撤回 <review_code>
 
 信息:
@@ -5233,11 +7460,23 @@ async fn send_group_text(out_tx: &mpsc::Sender<String>, group_id: &str, text: &s
 }
 
 async fn send_private_text(out_tx: &mpsc::Sender<String>, user_id: &str, text: &str) {
+    send_private_segments(
+        out_tx,
+        user_id,
+        vec![serde_json::json!({
+            "type": "text",
+            "data": { "text": text }
+        })],
+    )
+    .await;
+}
+
+async fn send_private_segments(out_tx: &mpsc::Sender<String>, user_id: &str, message: Vec<Value>) {
     let payload = serde_json::json!({
         "action": "send_private_msg",
         "params": {
             "user_id": json_id(user_id),
-            "message": [{"type": "text", "data": {"text": text}}]
+            "message": message
         }
     });
     let _ = out_tx.send(payload.to_string()).await;
@@ -5329,9 +7568,14 @@ mod tests {
             friend_request_window_sec: 0,
             friend_add_message: None,
             max_queue: 1,
+            max_images_per_post: 0,
+            user_notifications: Arc::new(
+                std::sync::Mutex::new(UserNotificationSettings::default()),
+            ),
             quick_replies: Arc::new(std::sync::Mutex::new(HashMap::new())),
             review_shortcuts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             global_shortcuts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            agent_commands: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -5372,23 +7616,14 @@ mod tests {
             parse_cmd("123 删", false),
             Some(AuditCommand::Review {
                 review_code: Some(123),
-                action: ParsedReviewAction::Builtin(ReviewAction::Delete { reason: None }),
+                action: ParsedReviewAction::Builtin(ReviewAction::Delete),
             })
         );
         assert_eq!(
             parse_cmd("123 拒", false),
             Some(AuditCommand::Review {
                 review_code: Some(123),
-                action: ParsedReviewAction::Builtin(ReviewAction::Reject { reason: None }),
-            })
-        );
-        assert_eq!(
-            parse_cmd("123 拒 广告", false),
-            Some(AuditCommand::Review {
-                review_code: Some(123),
-                action: ParsedReviewAction::Builtin(ReviewAction::Reject {
-                    reason: Some("广告".to_string())
-                }),
+                action: ParsedReviewAction::Builtin(ReviewAction::Reject),
             })
         );
         assert_eq!(
@@ -5673,126 +7908,6 @@ mod tests {
     }
 
     #[test]
-    fn reply_preview_from_get_msg_response_uses_sender_card_first() {
-        let response = serde_json::json!({
-            "status": "ok",
-            "retcode": 0,
-            "data": {
-                "sender": {
-                    "nickname": "Nick",
-                    "card": "Group Card"
-                },
-                "message": "quoted"
-            }
-        });
-
-        let preview = reply_preview_from_get_msg_response(Some("42".to_string()), &response);
-
-        assert_eq!(preview.id.as_deref(), Some("42"));
-        assert_eq!(preview.meta.as_deref(), Some("Group Card"));
-        assert_eq!(preview.body, "quoted");
-    }
-
-    #[test]
-    fn reply_preview_from_get_msg_response_uses_attachment_placeholder_body() {
-        let response = serde_json::json!({
-            "data": {
-                "sender": {
-                    "nickname": "Nick"
-                },
-                "message": [
-                    {"type": "image", "data": {"file": "https://example.test/a.png", "sub_type": 0}}
-                ]
-            }
-        });
-
-        let preview = reply_preview_from_get_msg_response(Some("42".to_string()), &response);
-
-        assert_eq!(preview.meta.as_deref(), Some("Nick"));
-        assert_eq!(preview.body, "[图片]");
-    }
-
-    #[test]
-    fn collect_reply_ids_trims_and_skips_empty_ids() {
-        let message = serde_json::json!([
-            {"type": "reply", "data": {"id": " 42 "}},
-            {"type": "reply", "data": {"id": " "}},
-            {"type": "text", "data": {"text": "body"}}
-        ]);
-
-        assert_eq!(collect_reply_ids(Some(&message)), vec!["42".to_string()]);
-    }
-
-    #[test]
-    fn reply_previews_from_state_resolves_platform_message_id() {
-        let ingress_id = IngressId::from_u128(7);
-        let mut state = NapCatState::default();
-        state
-            .ingress_by_platform_msg_id
-            .insert("42".to_string(), ingress_id);
-        state.ingress_summary.insert(
-            ingress_id,
-            IngressSummary {
-                user_id: "100".to_string(),
-                sender_name: Some("Alice".to_string()),
-                text: "quoted text".to_string(),
-                attachments: Vec::new(),
-            },
-        );
-        let message = serde_json::json!([
-            {"type": "reply", "data": {"id": "42"}},
-            {"type": "text", "data": {"text": "body"}}
-        ]);
-
-        let previews = reply_previews_from_state(Some(&message), &state);
-
-        let preview = previews.get("42").expect("reply preview");
-        assert_eq!(preview.meta.as_deref(), Some("Alice"));
-        assert_eq!(preview.body, "quoted text");
-    }
-
-    #[test]
-    fn reply_previews_from_buffered_messages_resolves_session_message() {
-        let messages = vec![BufferedMessage {
-            message: serde_json::json!({
-                "message_id": 42,
-                "sender": {
-                    "nickname": "Alice"
-                },
-                "message": [
-                    {"type": "text", "data": {"text": "quoted text"}}
-                ]
-            }),
-        }];
-
-        let previews = reply_previews_from_buffered_messages(&messages);
-
-        let preview = previews.get("42").expect("reply preview");
-        assert_eq!(preview.meta.as_deref(), Some("Alice"));
-        assert_eq!(preview.body, "quoted text");
-    }
-
-    #[test]
-    fn rendered_png_previews_keep_all_rendered_pages() {
-        let post_id = PostId::from_u128(42);
-        let page_one = rendered_png_blob_id(post_id);
-        let page_two = BlobId::from_u128(43);
-        let mut blob_paths = HashMap::new();
-        blob_paths.insert(page_one, "/tmp/page-one.png".to_string());
-        blob_paths.insert(page_two, "/tmp/page-two.png".to_string());
-
-        let previews = rendered_png_previews(post_id, &[page_one, page_two], &blob_paths);
-
-        assert_eq!(
-            previews,
-            vec![
-                "file:///tmp/page-one.png".to_string(),
-                "file:///tmp/page-two.png".to_string(),
-            ]
-        );
-    }
-
-    #[test]
     fn file_segment_kind_treats_image_files_as_images() {
         let image_file = serde_json::json!({
             "file": "/tmp/photo.png",
@@ -5844,8 +7959,82 @@ mod tests {
                 seq: 12,
             },
         );
-        let batch = collect_batch_post_ids_for_notify(&state, "g", leader, SendPriority::Normal, 3);
+        let batch =
+            collect_batch_post_ids_for_notify(&state, "g", leader, SendPriority::Normal, 0, 3, 0);
         assert_eq!(batch, vec![leader, second, third]);
+    }
+
+    #[test]
+    fn collect_batch_post_ids_for_notify_respects_image_limit() {
+        let leader = PostId::from_u128(21);
+        let second = PostId::from_u128(22);
+        let third = PostId::from_u128(23);
+        let leader_ingress = IngressId::from_u128(121);
+        let second_ingress = IngressId::from_u128(122);
+        let third_ingress = IngressId::from_u128(123);
+        let mut state = NapCatState::default();
+        state.send_plans.insert(
+            leader,
+            SendPlanInfo {
+                group_id: "g".to_string(),
+                not_before_ms: 0,
+                priority: SendPriority::Normal,
+                seq: 1,
+            },
+        );
+        state.send_plans.insert(
+            second,
+            SendPlanInfo {
+                group_id: "g".to_string(),
+                not_before_ms: 0,
+                priority: SendPriority::Normal,
+                seq: 2,
+            },
+        );
+        state.send_plans.insert(
+            third,
+            SendPlanInfo {
+                group_id: "g".to_string(),
+                not_before_ms: 0,
+                priority: SendPriority::Normal,
+                seq: 3,
+            },
+        );
+        state.post_ingress.insert(leader, vec![leader_ingress]);
+        state.post_ingress.insert(second, vec![second_ingress]);
+        state.post_ingress.insert(third, vec![third_ingress]);
+        state
+            .ingress_summary
+            .insert(leader_ingress, make_ingress_summary_with_images("u1", 3));
+        state
+            .ingress_summary
+            .insert(second_ingress, make_ingress_summary_with_images("u2", 3));
+        state
+            .ingress_summary
+            .insert(third_ingress, make_ingress_summary_with_images("u3", 5));
+
+        let batch =
+            collect_batch_post_ids_for_notify(&state, "g", leader, SendPriority::Normal, 0, 3, 6);
+        assert_eq!(batch, vec![leader, second]);
+    }
+
+    fn make_ingress_summary_with_images(user_id: &str, image_count: usize) -> IngressSummary {
+        IngressSummary {
+            user_id: user_id.to_string(),
+            sender_name: Some(user_id.to_string()),
+            text: String::new(),
+            attachments: (0..image_count)
+                .map(|idx| IngressAttachment {
+                    kind: MediaKind::Image,
+                    name: None,
+                    reference: MediaReference::RemoteUrl {
+                        url: format!("file:///tmp/{}_{}.png", user_id, idx),
+                    },
+                    size_bytes: None,
+                })
+                .collect(),
+            route_meta: None,
+        }
     }
 
     #[test]
@@ -5874,12 +8063,15 @@ mod tests {
                 review_code: 42,
                 post_id,
                 group_id: "group-a".to_string(),
+                decision: None,
+                decided_by: None,
+                decided_at_ms: None,
             },
         );
 
         assert_eq!(
             validate_withdraw_action(&state, "group-a", 42),
-            Err("该稿件不在暂存区且没有可撤回的空间动态")
+            Err("该稿件不在暂存区")
         );
 
         state.send_plans.insert(
@@ -5898,110 +8090,5 @@ mod tests {
 
         state.post_external_code.insert(post_id, 1001);
         assert_eq!(validate_withdraw_action(&state, "group-a", 42), Ok(()));
-    }
-
-    #[test]
-    fn validate_withdraw_accepts_published_post_with_external_code() {
-        let review_id = ReviewId::from_u128(10);
-        let post_id = PostId::from_u128(20);
-        let mut state = NapCatState::default();
-        state.review_by_code.insert(42, review_id);
-        state.review_info.insert(
-            review_id,
-            ReviewInfo {
-                review_code: 42,
-                post_id,
-                group_id: "group-a".to_string(),
-            },
-        );
-        state.post_external_code.insert(post_id, 1001);
-
-        register_qzone_publication(
-            &mut state,
-            "group-a",
-            &"account-a".to_string(),
-            &"tid-a".to_string(),
-            &[QzonePublicationItem {
-                post_id,
-                external_code: 1001,
-                image_offset: 0,
-                image_count: 1,
-            }],
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-        );
-
-        assert_eq!(validate_withdraw_action(&state, "group-a", 42), Ok(()));
-    }
-
-    #[test]
-    fn validate_withdraw_rejects_published_post_without_external_code() {
-        let review_id = ReviewId::from_u128(10);
-        let post_id = PostId::from_u128(20);
-        let mut state = NapCatState::default();
-        state.review_by_code.insert(42, review_id);
-        state.review_info.insert(
-            review_id,
-            ReviewInfo {
-                review_code: 42,
-                post_id,
-                group_id: "group-a".to_string(),
-            },
-        );
-        register_qzone_publication(
-            &mut state,
-            "group-a",
-            &"account-a".to_string(),
-            &"tid-a".to_string(),
-            &[QzonePublicationItem {
-                post_id,
-                external_code: 1001,
-                image_offset: 0,
-                image_count: 1,
-            }],
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-        );
-
-        assert_eq!(
-            validate_withdraw_action(&state, "group-a", 42),
-            Err("该稿件缺少外部编号")
-        );
-    }
-
-    #[test]
-    fn validate_withdraw_rejects_published_post_already_withdrawing() {
-        let review_id = ReviewId::from_u128(10);
-        let post_id = PostId::from_u128(20);
-        let mut state = NapCatState::default();
-        state.review_by_code.insert(42, review_id);
-        state.review_info.insert(
-            review_id,
-            ReviewInfo {
-                review_code: 42,
-                post_id,
-                group_id: "group-a".to_string(),
-            },
-        );
-        state.post_external_code.insert(post_id, 1001);
-        register_qzone_publication(
-            &mut state,
-            "group-a",
-            &"account-a".to_string(),
-            &"tid-a".to_string(),
-            &[QzonePublicationItem {
-                post_id,
-                external_code: 1001,
-                image_offset: 0,
-                image_count: 1,
-            }],
-            &BTreeSet::new(),
-            &BTreeSet::from([post_id]),
-        );
-
-        assert_eq!(
-            validate_withdraw_action(&state, "group-a", 42),
-            Err("该稿件已撤回或正在撤回")
-        );
     }
 }

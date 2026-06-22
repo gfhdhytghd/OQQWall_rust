@@ -13,16 +13,328 @@ export type Stage =
   | 'sent'
   | 'rejected'
   | 'deleted'
-  | 'withdrawn'
   | 'skipped'
   | 'manual'
   | 'failed'
+  | 'withdrawn'
 
 export interface MeResponse {
   username: string
   role: Role
   groups: string[]
   expires_at: number
+}
+
+export interface UserNotificationVariableInfo {
+  key: string
+  label: string
+  description: string
+  example: string
+}
+
+export interface UserNotificationTemplate {
+  enabled: boolean
+  include_post_tags: boolean
+  text_template: string
+  tags: string[]
+  images: string[]
+}
+
+export interface MappingEntry {
+  key: string
+  value: string
+}
+
+export interface TagValueMappingGroup {
+  tag: string
+  mappings: TagValueMappingEntry[]
+}
+
+export interface TagValueMappingEntry {
+  source: string
+  target: string
+}
+
+export type AgentCommandQueueInsertPosition = 'before' | 'after'
+
+export type AgentCommandShortcutScope = 'review' | 'global'
+
+export type AgentCommandReviewAction =
+  | {
+      action: 'approve'
+    }
+  | {
+      action: 'reject'
+    }
+  | {
+      action: 'delete'
+    }
+  | {
+      action: 'defer'
+      delay_ms: string
+    }
+  | {
+      action: 'skip'
+    }
+  | {
+      action: 'immediate'
+    }
+  | {
+      action: 'refresh'
+    }
+  | {
+      action: 'rerender'
+    }
+  | {
+      action: 'select_all_messages'
+    }
+  | {
+      action: 'toggle_anonymous'
+    }
+  | {
+      action: 'expand_audit'
+    }
+  | {
+      action: 'show'
+    }
+  | {
+      action: 'comment'
+      text_template: string
+    }
+  | {
+      action: 'reply'
+      text_template: string
+    }
+  | {
+      action: 'blacklist'
+      reason_template: string
+    }
+  | {
+      action: 'quick_reply'
+      key_template: string
+    }
+  | {
+      action: 'merge'
+      target_review_code: string
+    }
+
+export type AgentCommandGlobalAction =
+  | {
+      action: 'help'
+    }
+  | {
+      action: 'recall'
+      review_code: string
+    }
+  | {
+      action: 'withdraw'
+      review_code: string
+    }
+  | {
+      action: 'info'
+      review_code: string
+    }
+  | {
+      action: 'manual_relogin'
+    }
+  | {
+      action: 'auto_relogin'
+    }
+  | {
+      action: 'pending_list'
+    }
+  | {
+      action: 'pending_clear'
+    }
+  | {
+      action: 'send_queue_clear'
+    }
+  | {
+      action: 'send_queue_flush'
+    }
+  | {
+      action: 'send_in_flight_clear'
+    }
+  | {
+      action: 'blacklist_list'
+    }
+  | {
+      action: 'blacklist_add'
+      sender_id: string
+      reason_template: string
+    }
+  | {
+      action: 'blacklist_remove'
+      sender_id: string
+    }
+  | {
+      action: 'set_external_number'
+      value_template: string
+    }
+  | {
+      action: 'quick_reply_list'
+    }
+  | {
+      action: 'quick_reply_add'
+      key_template: string
+      text_template: string
+    }
+  | {
+      action: 'quick_reply_delete'
+      key_template: string
+    }
+  | {
+      action: 'shortcut_list'
+    }
+  | {
+      action: 'shortcut_add'
+      scope: AgentCommandShortcutScope
+      key_template: string
+      definition_template: string
+    }
+  | {
+      action: 'shortcut_delete'
+      scope: AgentCommandShortcutScope
+      key_template: string
+    }
+  | {
+      action: 'self_check'
+    }
+  | {
+      action: 'system_repair'
+    }
+
+export type AgentCommandBlock =
+  | {
+      kind: 'reply_private_message'
+      text_template: string
+      tags: string[]
+      images: string[]
+    }
+  | {
+      kind: 'start_submission_session'
+    }
+  | {
+      kind: 'finish_submission_session'
+    }
+  | {
+      kind: 'resume_submission_session'
+    }
+  | {
+      kind: 'submit_submission_session'
+    }
+  | {
+      kind: 'cancel_submission_session'
+    }
+  | {
+      kind: 'insert_queued_post'
+      moving_post_code: string
+      anchor_post_code: string
+      position: AgentCommandQueueInsertPosition
+    }
+  | {
+      kind: 'execute_review_action'
+      review_code: string
+      action: AgentCommandReviewAction
+    }
+  | {
+      kind: 'execute_global_action'
+      action: AgentCommandGlobalAction
+    }
+  | {
+      kind: 'send_webhook'
+      url: string
+      source_webhook: string
+      text_template: string
+      tags: string[]
+      images: string[]
+    }
+
+export interface AppConfigAgentCommand {
+  name: string
+  enabled: boolean
+  description: string
+  blocks: AgentCommandBlock[]
+}
+
+export interface ConfigAdminEntry {
+  id: string
+  username: string
+  password: string
+  password_set: boolean
+}
+
+export interface AppConfigCommonSettings {
+  web_api_enabled: boolean
+  web_api_port: number
+  web_api_root_token: string
+  webview_enabled: boolean
+  webview_host: string
+  webview_port: number
+  webview_session_ttl_sec: number
+  telemetry_enabled: boolean
+  telemetry_local_dir: string
+  telemetry_upload_enabled: boolean
+  telemetry_upload_interval_sec: number
+  telemetry_upload_batch_size: number
+  telemetry_max_append_messages: number
+  process_waittime_sec: number
+  min_interval_ms: number
+  max_image_number_one_post: number
+  send_timeout_ms: number
+  send_max_attempts: number
+  tz_offset_minutes: number
+  max_cache_mb: number
+  napcat_base_url: string
+  napcat_access_token: string
+  at_unprived_sender: boolean
+  friend_request_window_sec: number
+  friend_add_message: string
+}
+
+export interface AppConfigGroupSettings {
+  group_id: string
+  audit_group_id: string
+  accounts: string[]
+  napcat_base_url: string
+  napcat_access_token: string
+  process_waittime_sec: number
+  min_interval_ms: number
+  max_post_stack: number
+  max_image_number_one_post: number
+  send_timeout_ms: number
+  send_max_attempts: number
+  send_schedule: string[]
+  individual_image_in_posts: boolean
+  watermark_text: string
+  friend_add_message: string
+  friend_request_window_sec: number
+  quick_replies: MappingEntry[]
+  review_shortcuts: MappingEntry[]
+  global_shortcuts: MappingEntry[]
+  agent_commands: AppConfigAgentCommand[]
+  webview_admins: ConfigAdminEntry[]
+}
+
+export interface AppConfigSettingsResponse {
+  config_path: string
+  common: AppConfigCommonSettings
+  global_admins: ConfigAdminEntry[]
+  groups: AppConfigGroupSettings[]
+  agent_command_variables: UserNotificationVariableInfo[]
+}
+
+export interface UserNotificationSettingsResponse {
+  group_id: string
+  available_groups: string[]
+  queue_entered: UserNotificationTemplate
+  review_queued: UserNotificationTemplate
+  send_succeeded: UserNotificationTemplate
+  rejected: UserNotificationTemplate
+  webhook_tag_map: MappingEntry[]
+  tag_value_map: MappingEntry[]
+  tag_value_maps: TagValueMappingGroup[]
+  variables: UserNotificationVariableInfo[]
 }
 
 export interface PostItem {
@@ -33,7 +345,6 @@ export interface PostItem {
   external_code: number | null
   internal_code: number | null
   sender_id: string | null
-  sender_name?: string | null
   created_at_ms: number
   last_error: string | null
   preview_text?: string
@@ -54,7 +365,6 @@ export interface StatsResponse {
     submitted: number
     approved: number
     rejected: number
-    deleted: number
   }>
   hourly_distribution: Array<{
     hour: number
@@ -63,128 +373,10 @@ export interface StatsResponse {
   avg_review_time_ms: number | null
 }
 
-export interface GroupHealthItem {
-  group_id: string
-  total_count: number
-  pending_count: number
-  actionable_count: number
-  error_count: number
-  failed_count: number
-  sent_count: number
-  today_count: number
-  avg_review_time_ms: number | null
-  last_created_at_ms: number | null
-}
-
-export interface GroupHealthResponse {
-  items: GroupHealthItem[]
-}
-
-export interface FailureSummary {
-  total_count: number
-  stage_failed_count: number
-  post_error_count: number
-  render_error_count: number
-  review_publish_error_count: number
-}
-
-export interface FailureItem {
-  post_id: string
-  review_id: string | null
-  review_code: number | null
-  group_id: string
-  stage: Stage
-  source: string
-  error: string
-  created_at_ms: number
-  sender_id: string | null
-  preview_text: string | null
-}
-
-export interface FailureListResponse {
-  summary: FailureSummary
-  items: FailureItem[]
-}
-
-export interface BlacklistItem {
-  group_id: string
-  sender_id: string
-  reason: string | null
-}
-
-export interface BlacklistListResponse {
-  items: BlacklistItem[]
-  total: number
-}
-
-export interface PostTimelineItem {
-  label: string
-  status: string
-  at_ms: number | null
-  detail: string | null
-}
-
 export interface ListPostsResponse {
   items: PostItem[]
   next_cursor: number | null
   total: number
-}
-
-export interface PostCollectionResponse {
-  items: PostItem[]
-  total: number
-}
-
-export interface SimilarPostItem {
-  post: PostItem
-  similarity_reason: string
-}
-
-export interface SimilarPostResponse {
-  items: SimilarPostItem[]
-  total: number
-}
-
-export interface AuditListItem {
-  audit_id: string
-  operator: string
-  action: string
-  target_type: string
-  target_id: string
-  group_id: string | null
-  summary: string
-  subject_code: string | null
-  subject_sender: string | null
-  subject_preview: string | null
-  status: string
-  created_at_ms: number
-}
-
-export interface AuditListResponse {
-  items: AuditListItem[]
-}
-
-export interface SavedFilterQuery {
-  stage?: string | null
-  keyword?: string | null
-  group_id?: string | null
-  sort_by?: string | null
-  sort_order?: string | null
-  only_error: boolean
-  only_actionable: boolean
-  page_size?: number | null
-}
-
-export interface SavedFilterPreset {
-  preset_id: string
-  name: string
-  query: SavedFilterQuery
-  created_at_ms: number
-  updated_at_ms: number
-}
-
-export interface SavedFilterListResponse {
-  items: SavedFilterPreset[]
 }
 
 export interface ListReviewIdsResponse {
@@ -196,7 +388,6 @@ export interface PostDetail {
   post_id: string
   review_id: string | null
   review_code: number | null
-  decision_reason: string | null
   group_id: string
   stage: Stage
   external_code: number | null
@@ -217,8 +408,6 @@ export interface PostDetail {
   >
   render_png_blob_id: string | null
   last_error: string | null
-  timeline: PostTimelineItem[]
-  sender_name: string | null
 }
 
 export interface ApiErrorBody {
@@ -240,10 +429,10 @@ export const STAGE_LABELS: Record<string, string> = {
   sent: '已发送',
   rejected: '已拒绝',
   deleted: '已删除',
-  withdrawn: '已撤回',
   skipped: '已跳过',
   manual: '人工处理',
   failed: '失败',
+  withdrawn: '已撤回',
 }
 
 export const ACTION_LABELS: Record<string, string> = {

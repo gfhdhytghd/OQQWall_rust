@@ -2549,8 +2549,6 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 [[package]]
 name = "skia-bindings"
 version = "0.91.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2dd9bbd87993cbe4c0caa5fa6ca69c7d2ed38dcf5cd967b200392840c3bc666"
 dependencies = [
  "bindgen",
  "cc",

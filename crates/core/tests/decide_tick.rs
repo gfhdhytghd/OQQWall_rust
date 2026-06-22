@@ -51,6 +51,7 @@ fn tick_closes_session_and_creates_draft() {
             }],
         },
         received_at_ms: 1_000,
+        route_meta: None,
         close_immediately: false,
     };
 
@@ -119,6 +120,7 @@ fn tick_closes_explicit_immediate_session_without_waiting() {
             attachments: Vec::new(),
         },
         received_at_ms: 1_000,
+        route_meta: None,
         close_immediately: true,
     };
 

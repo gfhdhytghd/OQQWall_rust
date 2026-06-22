@@ -1513,11 +1513,7 @@ fn draft_preview_text(draft: &Draft) -> String {
     for block in &draft.blocks {
         let text = match block {
             DraftBlock::Paragraph { text } => text.as_str(),
-            DraftBlock::Reply { preview, text } => text
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(preview.body.as_str()),
+            DraftBlock::Reply { preview } => preview.body.as_str(),
             DraftBlock::Poke => "[戳一戳]",
             DraftBlock::JsonCard { .. } => "[卡片]",
             DraftBlock::Forward { .. } => "[合并转发聊天记录]",
@@ -1869,7 +1865,7 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                     "review={} decision={:?} reason_len={}",
                     short_id(*review_id),
                     decision,
-                    reason.as_deref().unwrap_or("").len()
+                    reason.as_ref().map(|value| value.len()).unwrap_or(0)
                 ),
             ),
             ReviewEvent::ReviewCommentAdded { review_id, text } => (
@@ -1886,7 +1882,7 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                     "review={} kind={:?} reason_len={}",
                     short_id(*review_id),
                     kind,
-                    reason.as_deref().unwrap_or("").len()
+                    reason.as_ref().map(|value| value.len()).unwrap_or(0)
                 ),
             ),
             ReviewEvent::ReviewReplyRequested { review_id, text } => (
@@ -2120,6 +2116,7 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                 format!("post={} reason_len={}", short_id(*post_id), reason.len()),
             ),
             SendEvent::QzonePostPublished {
+                group_id,
                 account_id,
                 remote_id,
                 items,
@@ -2127,7 +2124,8 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
             } => (
                 "Send.QzonePostPublished",
                 format!(
-                    "account={} remote={} items={}",
+                    "group={} account={} remote={} items={}",
+                    group_id,
                     account_id,
                     remote_id,
                     items.len()
@@ -2138,45 +2136,52 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                 account_id,
                 remote_id,
                 withdrawn_post_ids,
+                requested_at_ms,
                 ..
             } => (
                 "Send.QzonePostWithdrawRequested",
                 format!(
-                    "post={} account={} remote={} withdrawn={}",
+                    "post={} account={} remote={} withdrawn={} requested_at={}",
                     short_id(*post_id),
                     account_id,
                     remote_id,
-                    withdrawn_post_ids.len()
+                    withdrawn_post_ids.len(),
+                    requested_at_ms
                 ),
             ),
             SendEvent::QzonePostWithdrawSucceeded {
                 post_id,
                 account_id,
                 remote_id,
+                withdrawn_post_ids,
+                withdrawn_at_ms,
                 ..
             } => (
                 "Send.QzonePostWithdrawSucceeded",
                 format!(
-                    "post={} account={} remote={}",
+                    "post={} account={} remote={} withdrawn={} at={}",
                     short_id(*post_id),
                     account_id,
-                    remote_id
+                    remote_id,
+                    withdrawn_post_ids.len(),
+                    withdrawn_at_ms
                 ),
             ),
             SendEvent::QzonePostWithdrawFailed {
                 post_id,
                 account_id,
                 remote_id,
+                withdrawn_post_ids,
                 error,
-                ..
             } => (
                 "Send.QzonePostWithdrawFailed",
                 format!(
-                    "post={} account={} remote={} error_len={}",
+                    "post={} account={} remote={} withdrawn={} err={}",
                     short_id(*post_id),
                     account_id,
                     remote_id,
-                    error.len()
+                    withdrawn_post_ids.len(),
+                    compact_text(error, 48)
                 ),
             ),
         },

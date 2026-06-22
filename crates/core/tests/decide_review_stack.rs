@@ -57,6 +57,7 @@ fn seed_post(
             platform_msg_id: format!("msg-{}", ingress_id.0),
             received_at_ms: 0,
             message,
+            route_meta: None,
         }),
         next_id,
     );

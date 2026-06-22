@@ -233,12 +233,8 @@ pub fn parse_builtin_review_action(
         "等" => ReviewAction::Defer {
             delay_ms: REVIEW_DEFER_MS,
         },
-        "删" => ReviewAction::Delete {
-            reason: optional_reason(rest),
-        },
-        "拒" => ReviewAction::Reject {
-            reason: optional_reason(rest),
-        },
+        "删" => ReviewAction::Delete,
+        "拒" => ReviewAction::Reject,
         "立即" => ReviewAction::Immediate,
         "刷新" => ReviewAction::Refresh,
         "重渲染" => ReviewAction::Rerender,
@@ -275,15 +271,6 @@ pub fn parse_builtin_review_action(
         }
     };
     Some(action)
-}
-
-fn optional_reason(text: &str) -> Option<String> {
-    let text = text.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
-    }
 }
 
 pub fn parse_builtin_global_action(command: &str, rest: &str) -> Option<GlobalAction> {
