@@ -7,6 +7,10 @@ on:
         description: "要发布的版本号，例如 v0.3.1；留空则只构建产物"
         required: false
         type: string
+      release_notes:
+        description: "可选的更新日志 / Release note；留空则自动生成"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -19,11 +23,13 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       release_tag: ${{ steps.release.outputs.release_tag }}
+      release_notes: ${{ steps.release.outputs.release_notes }}
     steps:
       - name: 校验版本号
         id: release
         env:
           RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
+          RELEASE_NOTES: ${{ github.event.inputs.release_notes || '' }}
         run: |
           release_tag=""
           if [[ -n "$RELEASE_TAG" ]]; then
@@ -34,6 +40,11 @@ jobs:
             fi
           fi
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          {
+            echo "release_notes<<__OQQWALL_NOTES__"
+            printf '%s\n' "$RELEASE_NOTES"
+            echo "__OQQWALL_NOTES__"
+          } >> "$GITHUB_OUTPUT"
 
   linux-build:
     needs: prepare-release
@@ -177,6 +188,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.prepare-release.outputs.release_tag }}
+          RELEASE_NOTES: ${{ needs.prepare-release.outputs.release_notes }}
         run: |
           set -euo pipefail
           assets=(
@@ -188,9 +200,19 @@ jobs:
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
           else
-            gh release create "$RELEASE_TAG" \
-              --title "$RELEASE_TAG" \
-              --generate-notes \
-              --target "${GITHUB_SHA}" \
+            release_args=(
+              "$RELEASE_TAG"
+              --title "$RELEASE_TAG"
+              --target "${GITHUB_SHA}"
+            )
+
+            if [[ -n "$RELEASE_NOTES" ]]; then
+              release_args+=(--notes "$RELEASE_NOTES")
+            else
+              release_args+=(--generate-notes)
+            fi
+
+            gh release create \
+              "${release_args[@]}" \
               "${assets[@]}"
           fi
