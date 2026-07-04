@@ -3,8 +3,6 @@ import { Button, Input } from '@heroui/react'
 import * as Blockly from 'scratch-blocks'
 import * as ZhHans from 'blockly/msg/zh-hans'
 import {
-  ArrowDown,
-  ArrowUp,
   Maximize2,
   MessageSquare,
   Minimize2,
@@ -65,55 +63,55 @@ const scratchTheme = Blockly.Theme.defineTheme('oqqwall_scratch', {
   startHats: true,
   blockStyles: {
     event_blocks: {
-      colourPrimary: '#171717',
-      colourSecondary: '#0a0a0a',
-      colourTertiary: '#0a0a0a',
+      colourPrimary: '#ffbf00',
+      colourSecondary: '#e6ac00',
+      colourTertiary: '#cc9900',
     },
     message_blocks: {
-      colourPrimary: '#404040',
-      colourSecondary: '#262626',
-      colourTertiary: '#171717',
+      colourPrimary: '#4c97ff',
+      colourSecondary: '#3373cc',
+      colourTertiary: '#2f6bb7',
     },
     session_blocks: {
-      colourPrimary: '#525252',
-      colourSecondary: '#404040',
-      colourTertiary: '#262626',
+      colourPrimary: '#ff8c1a',
+      colourSecondary: '#db6e00',
+      colourTertiary: '#bf6000',
     },
     review_blocks: {
-      colourPrimary: '#737373',
-      colourSecondary: '#525252',
-      colourTertiary: '#404040',
+      colourPrimary: '#59c059',
+      colourSecondary: '#389438',
+      colourTertiary: '#2f7e2f',
     },
     system_blocks: {
-      colourPrimary: '#262626',
-      colourSecondary: '#171717',
-      colourTertiary: '#0a0a0a',
+      colourPrimary: '#9966ff',
+      colourSecondary: '#774dcb',
+      colourTertiary: '#5f3aa3',
     },
     variable_blocks: {
-      colourPrimary: '#5f5f5f',
-      colourSecondary: '#404040',
-      colourTertiary: '#262626',
+      colourPrimary: '#ff6680',
+      colourSecondary: '#d84f66',
+      colourTertiary: '#b54155',
     },
   },
   categoryStyles: {
-    event_category: { colour: '#171717' },
-    message_category: { colour: '#404040' },
-    session_category: { colour: '#525252' },
-    review_category: { colour: '#737373' },
-    system_category: { colour: '#262626' },
-    variable_category: { colour: '#5f5f5f' },
+    event_category: { colour: '#ffbf00' },
+    message_category: { colour: '#4c97ff' },
+    session_category: { colour: '#ff8c1a' },
+    review_category: { colour: '#59c059' },
+    system_category: { colour: '#9966ff' },
+    variable_category: { colour: '#ff6680' },
   },
   componentStyles: {
-    workspaceBackgroundColour: '#f5f5f5',
-    toolboxBackgroundColour: '#fafafa',
-    toolboxForegroundColour: '#0a0a0a',
+    workspaceBackgroundColour: '#f7f9fb',
+    toolboxBackgroundColour: '#ffffff',
+    toolboxForegroundColour: '#161616',
     flyoutBackgroundColour: '#ffffff',
-    flyoutForegroundColour: '#0a0a0a',
+    flyoutForegroundColour: '#161616',
     flyoutOpacity: 1,
-    scrollbarColour: '#737373',
-    insertionMarkerColour: '#171717',
-    selectedGlowColour: '#171717',
-    selectedGlowOpacity: 0.22,
+    scrollbarColour: '#8d98a8',
+    insertionMarkerColour: '#0f62fe',
+    selectedGlowColour: '#0f62fe',
+    selectedGlowOpacity: 0.32,
   },
   fontStyle: {
     family:
@@ -168,15 +166,25 @@ export function AgentCommandWorkbench({
     setSelectedCommandIndex(Math.min(commandIndex, Math.max(0, nextCommands.length - 1)))
   }
 
-  function moveCommand(commandIndex: number, direction: -1 | 1) {
-    const nextCommands = moveArrayItem(commands, commandIndex, direction)
-    updateCommands(nextCommands)
-    setSelectedCommandIndex(commandIndex + direction)
-  }
-
   const selectedCommandKey = selectedCommand
     ? `command-${selectedCommandIndex}-${commands.length}`
     : 'empty'
+  const sortedCommandTabs = commands
+    .map((command, commandIndex) => ({ command, commandIndex }))
+    .sort((left, right) =>
+      normalizedAgentCommandName(left.command.name).localeCompare(
+        normalizedAgentCommandName(right.command.name),
+        'zh-Hans-CN'
+      )
+    )
+  const selectedCommandHasDuplicateName =
+    selectedCommand &&
+    commands.some(
+      (command, commandIndex) =>
+        commandIndex !== selectedCommandIndex &&
+        normalizedAgentCommandName(command.name) ===
+          normalizedAgentCommandName(selectedCommand.name)
+    )
 
   return (
     <div className="settings-panel scratch-workbench">
@@ -184,7 +192,7 @@ export function AgentCommandWorkbench({
         <div>
           <span className="field-label">Scratch Agent 指令</span>
           <p className="field-hint">
-            每个触发词对应一个 Blockly 工作区，保存时仍写回原来的 agent_commands 结构。
+            每个触发词对应一个 Blockly 工作区，保存后立即生效。
           </p>
         </div>
         <div className="scratch-workbench-actions">
@@ -211,7 +219,7 @@ export function AgentCommandWorkbench({
         >
           {isCommandRailCollapsed ? null : (
             <aside className="scratch-command-rail" aria-label="Agent 指令列表">
-              {commands.map((command, commandIndex) => (
+              {sortedCommandTabs.map(({ command, commandIndex }) => (
                 <button
                   key={`${command.name}-${commandIndex}`}
                   type="button"
@@ -221,7 +229,10 @@ export function AgentCommandWorkbench({
                   onClick={() => setSelectedCommandIndex(commandIndex)}
                 >
                   <strong>#{command.name || `command_${commandIndex + 1}`}</strong>
-                  <span>{command.description || (command.enabled ? '已启用' : '已关闭')}</span>
+                  <span>
+                    {command.description ||
+                      (command.enabled ? (command.admin_only ? '仅管理员' : '已启用') : '已关闭')}
+                  </span>
                 </button>
               ))}
             </aside>
@@ -243,6 +254,9 @@ export function AgentCommandWorkbench({
                       }))
                     }
                   />
+                  {selectedCommandHasDuplicateName ? (
+                    <span className="field-error">触发词与其他 Agent 指令重复。</span>
+                  ) : null}
                 </div>
                 <div className="field-stack scratch-command-description-field">
                   <span className="field-label">说明</span>
@@ -276,27 +290,25 @@ export function AgentCommandWorkbench({
                     <span>{selectedCommand.enabled ? '启用' : '禁用'}</span>
                   </button>
                 </div>
+                <div className="field-stack scratch-command-enable-field">
+                  <button
+                    type="button"
+                    className={`scratch-command-enable-toggle${
+                      selectedCommand.admin_only ? ' is-enabled' : ''
+                    }`}
+                    aria-pressed={selectedCommand.admin_only}
+                    aria-label={selectedCommand.admin_only ? '取消仅管理员' : '设为仅管理员'}
+                    onClick={() =>
+                      updateCommand(selectedCommandIndex, (command) => ({
+                        ...command,
+                        admin_only: !command.admin_only,
+                      }))
+                    }
+                  >
+                    <span>仅管理员</span>
+                  </button>
+                </div>
                 <div className="scratch-command-actions">
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    isIconOnly
-                    aria-label="上移指令"
-                    isDisabled={selectedCommandIndex === 0}
-                    onClick={() => moveCommand(selectedCommandIndex, -1)}
-                  >
-                    <ArrowUp size={16} />
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    isIconOnly
-                    aria-label="下移指令"
-                    isDisabled={selectedCommandIndex >= commands.length - 1}
-                    onClick={() => moveCommand(selectedCommandIndex, 1)}
-                  >
-                    <ArrowDown size={16} />
-                  </Button>
                   <Button
                     size="sm"
                     variant="tertiary"
@@ -341,6 +353,7 @@ function ScratchBlocklyEditor({
   const onChangeRef = useRef(onChange)
   const initialBlocksRef = useRef(blocks)
   const [isFullscreen, setFullscreen] = useState(false)
+  const [hasDetachedBlocks, setHasDetachedBlocks] = useState(false)
   const toolbox = useMemo(() => buildToolbox(variables), [variables])
 
   useEffect(() => {
@@ -364,7 +377,7 @@ function ScratchBlocklyEditor({
       grid: {
         spacing: 32,
         length: 3,
-        colour: '#e5e5e5',
+        colour: '#d0d7de',
         snap: true,
       },
       move: {
@@ -384,10 +397,14 @@ function ScratchBlocklyEditor({
     workspaceRef.current = workspace
 
     loadAgentBlocksIntoWorkspace(workspace, initialBlocksRef.current)
+    setHasDetachedBlocks(workspaceHasDetachedAgentBlocks(workspace))
 
     const listener = (event: Blockly.Events.Abstract) => {
       if (event.isUiEvent) return
-      onChangeRef.current(workspaceToAgentBlocks(workspace))
+      const nextBlocks = workspaceToAgentBlocks(workspace)
+      initialBlocksRef.current = nextBlocks
+      setHasDetachedBlocks(workspaceHasDetachedAgentBlocks(workspace))
+      onChangeRef.current(nextBlocks)
     }
     workspace.addChangeListener(listener)
 
@@ -475,47 +492,54 @@ function ScratchBlocklyEditor({
   }
 
   return (
-    <div className={`scratch-blockly-frame${isFullscreen ? ' is-fullscreen' : ''}`}>
-      <div ref={containerRef} className="scratch-blockly-workspace" />
-      <div className="scratch-blockly-frame-actions">
-        <button
-          type="button"
-          className="scratch-blockly-button"
-          aria-label={isFullscreen ? '退出页面内全屏' : '页面内全屏'}
-          title={isFullscreen ? '退出页面内全屏' : '页面内全屏'}
-          onClick={() => setFullscreen((value) => !value)}
-        >
-          {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
-        </button>
-      </div>
-      <div className="scratch-blockly-zoom-controls" aria-label="缩放画布">
-        <button
-          type="button"
-          className="scratch-blockly-button"
-          aria-label="缩小"
-          title="缩小"
-          onClick={() => zoomWorkspace(-1)}
-        >
-          <Minus size={18} />
-        </button>
-        <button
-          type="button"
-          className="scratch-blockly-button"
-          aria-label="复位缩放"
-          title="复位缩放"
-          onClick={resetWorkspaceZoom}
-        >
-          <RotateCcw size={18} />
-        </button>
-        <button
-          type="button"
-          className="scratch-blockly-button"
-          aria-label="放大"
-          title="放大"
-          onClick={() => zoomWorkspace(1)}
-        >
-          <Plus size={18} />
-        </button>
+    <div className="scratch-blockly-shell">
+      {hasDetachedBlocks ? (
+        <p className="field-hint field-warning">
+          未连接到起始帽的积木不会被保存和执行。
+        </p>
+      ) : null}
+      <div className={`scratch-blockly-frame${isFullscreen ? ' is-fullscreen' : ''}`}>
+        <div ref={containerRef} className="scratch-blockly-workspace" />
+        <div className="scratch-blockly-frame-actions">
+          <button
+            type="button"
+            className="scratch-blockly-button"
+            aria-label={isFullscreen ? '退出页面内全屏' : '页面内全屏'}
+            title={isFullscreen ? '退出页面内全屏' : '页面内全屏'}
+            onClick={() => setFullscreen((value) => !value)}
+          >
+            {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+          </button>
+        </div>
+        <div className="scratch-blockly-zoom-controls" aria-label="缩放画布">
+          <button
+            type="button"
+            className="scratch-blockly-button"
+            aria-label="缩小"
+            title="缩小"
+            onClick={() => zoomWorkspace(-1)}
+          >
+            <Minus size={18} />
+          </button>
+          <button
+            type="button"
+            className="scratch-blockly-button"
+            aria-label="复位缩放"
+            title="复位缩放"
+            onClick={resetWorkspaceZoom}
+          >
+            <RotateCcw size={18} />
+          </button>
+          <button
+            type="button"
+            className="scratch-blockly-button"
+            aria-label="放大"
+            title="放大"
+            onClick={() => zoomWorkspace(1)}
+          >
+            <Plus size={18} />
+          </button>
+        </div>
       </div>
     </div>
   )
@@ -702,6 +726,7 @@ function registerAgentCommandBlocks() {
       previousStatement: null,
       nextStatement: null,
       style: 'session_blocks',
+      tooltip: '开始一个投稿会话；会话进行中同样可触发 Agent 指令。',
     },
     {
       type: 'oqqwall_finish_submission_session',
@@ -709,6 +734,7 @@ function registerAgentCommandBlocks() {
       previousStatement: null,
       nextStatement: null,
       style: 'session_blocks',
+      tooltip: '把投稿会话切到等待确认状态；会话进行中同样可触发 Agent 指令。',
     },
     {
       type: 'oqqwall_resume_submission_session',
@@ -716,6 +742,7 @@ function registerAgentCommandBlocks() {
       previousStatement: null,
       nextStatement: null,
       style: 'session_blocks',
+      tooltip: '把等待确认的投稿会话切回继续编辑；会话进行中同样可触发 Agent 指令。',
     },
     {
       type: 'oqqwall_submit_submission_session',
@@ -723,6 +750,7 @@ function registerAgentCommandBlocks() {
       previousStatement: null,
       nextStatement: null,
       style: 'session_blocks',
+      tooltip: '提交等待确认的投稿会话；会话进行中同样可触发 Agent 指令。',
     },
     {
       type: 'oqqwall_cancel_submission_session',
@@ -730,6 +758,7 @@ function registerAgentCommandBlocks() {
       previousStatement: null,
       nextStatement: null,
       style: 'session_blocks',
+      tooltip: '取消当前投稿会话；会话进行中同样可触发 Agent 指令。',
     },
     {
       type: INSERT_QUEUE_BLOCK_TYPE,
@@ -992,11 +1021,13 @@ function workspaceToAgentBlocks(workspace: Blockly.WorkspaceSvg): AgentCommandBl
     appendBlocklyStack(blocks, root.getNextBlock())
   }
 
-  topBlocks
-    .filter((block) => block.type !== ROOT_BLOCK_TYPE && isAgentStatementBlock(block))
-    .forEach((block) => appendBlocklyStack(blocks, block))
-
   return blocks
+}
+
+function workspaceHasDetachedAgentBlocks(workspace: Blockly.WorkspaceSvg) {
+  return workspace
+    .getTopBlocks(false)
+    .some((block) => block.type !== ROOT_BLOCK_TYPE && isAgentStatementBlock(block))
 }
 
 function appendBlocklyStack(out: AgentCommandBlock[], firstBlock: Blockly.Block | null) {
@@ -1208,6 +1239,7 @@ function buildDefaultAgentCommand(name: string): AppConfigAgentCommand {
   return {
     name,
     enabled: true,
+    admin_only: false,
     description: '',
     blocks: [buildDefaultAgentCommandBlock('reply_private_message')],
   }
@@ -1333,13 +1365,8 @@ function buildNextAgentCommandName(commands: AppConfigAgentCommand[]) {
   return `command_${index}`
 }
 
-function moveArrayItem<T>(items: T[], index: number, direction: -1 | 1) {
-  const targetIndex = index + direction
-  if (targetIndex < 0 || targetIndex >= items.length) return items
-  const next = [...items]
-  const [item] = next.splice(index, 1)
-  next.splice(targetIndex, 0, item)
-  return next
+function normalizedAgentCommandName(name: string) {
+  return name.trim().replace(/^#+/, '').trim()
 }
 
 function readReviewActionKey(value: string): AgentReviewActionKey {

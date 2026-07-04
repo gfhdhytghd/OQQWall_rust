@@ -167,7 +167,7 @@ export const AGENT_REVIEW_ACTION_OPTIONS: Array<SelectOption<AgentReviewActionKe
   { value: 'delete', label: '删除稿件' },
   { value: 'defer', label: '暂缓处理' },
   { value: 'skip', label: '跳过' },
-  { value: 'immediate', label: '立即发送' },
+  { value: 'immediate', label: '立即' },
   { value: 'refresh', label: '刷新' },
   { value: 'rerender', label: '重渲染' },
   { value: 'select_all_messages', label: '选择全部消息' },

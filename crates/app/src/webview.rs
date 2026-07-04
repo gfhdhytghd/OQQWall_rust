@@ -19,15 +19,15 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{
     AppConfig, WebviewAdminAccount, WebviewRole, load_config_root_for_edit,
-    load_group_user_notification_settings, resolve_config_path, save_config_root_for_edit,
-    save_group_user_notification_settings,
+    load_group_user_notification_settings, parse_agent_commands, resolve_config_path,
+    save_config_root_for_edit, save_group_user_notification_settings,
 };
 use crate::engine::EngineHandle;
 use oqqwall_rust_drivers::napcat::{
     AgentCommandBlock, AgentCommandConfig, TagValueMappingGroup, UserNotificationSettings,
-    UserNotificationTemplate, normalize_agent_command_config,
-    update_group_user_notification_settings, validate_agent_command_config,
-    validate_agent_command_name,
+    UserNotificationTemplate, normalize_agent_command_config, update_group_agent_command_admins,
+    update_group_agent_commands, update_group_user_notification_settings,
+    validate_agent_command_config, validate_agent_command_name,
 };
 
 include!(concat!(env!("OUT_DIR"), "/webview_assets.rs"));
@@ -365,6 +365,8 @@ struct AppConfigAgentCommandPayload {
     name: String,
     enabled: bool,
     #[serde(default)]
+    admin_only: bool,
+    #[serde(default)]
     description: String,
     #[serde(default)]
     blocks: Vec<AgentCommandBlock>,
@@ -439,6 +441,8 @@ struct AppConfigGroupPayload {
     global_shortcuts: Vec<MappingEntryPayload>,
     #[serde(default)]
     agent_commands: Vec<AppConfigAgentCommandPayload>,
+    #[serde(default)]
+    agent_command_admins: Vec<String>,
     #[serde(default)]
     webview_admins: Vec<ConfigAdminPayload>,
 }
@@ -1149,11 +1153,45 @@ async fn webview_update_app_config_settings(
         Ok(root) => root,
         Err(err) => return error_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", &err),
     };
+    refresh_runtime_agent_commands(&saved_root);
     (
         StatusCode::OK,
         Json(build_app_config_settings_response(&saved_root)),
     )
         .into_response()
+}
+
+fn refresh_runtime_agent_commands(root: &Value) {
+    for (group_id, group_obj) in collect_config_group_objects(root) {
+        let commands = match parse_agent_commands(group_obj.get("agent_commands")) {
+            Ok(commands) => commands,
+            Err(err) => {
+                debug_log!(
+                    "skip runtime agent_commands refresh: group_id={} err={}",
+                    group_id,
+                    err
+                );
+                continue;
+            }
+        };
+        if let Err(err) = update_group_agent_commands(&group_id, commands) {
+            debug_log!(
+                "runtime agent_commands refresh failed: group_id={} err={}",
+                group_id,
+                err
+            );
+        }
+        if let Err(err) = update_group_agent_command_admins(
+            &group_id,
+            cfg_string_list(group_obj.get("agent_command_admins")),
+        ) {
+            debug_log!(
+                "runtime agent_command_admins refresh failed: group_id={} err={}",
+                group_id,
+                err
+            );
+        }
+    }
 }
 
 async fn webview_get_user_notification_settings(
@@ -1407,6 +1445,7 @@ fn build_app_config_settings_response(root: &Value) -> AppConfigSettingsResponse
                 group_obj.get("global_shortcuts"),
             )),
             agent_commands: payload_agent_commands(group_obj.get("agent_commands")),
+            agent_command_admins: cfg_string_list(group_obj.get("agent_command_admins")),
             webview_admins: build_config_admin_payloads(
                 group_obj.get("webview_admins"),
                 &format!("group:{}", group_id),
@@ -1639,6 +1678,11 @@ fn apply_group_config_payload(
     set_mapping_entries_field(obj, "review_shortcuts", &payload.review_shortcuts);
     set_mapping_entries_field(obj, "global_shortcuts", &payload.global_shortcuts);
     set_agent_commands_field(obj, "agent_commands", &payload.agent_commands)?;
+    set_string_list_field(
+        obj,
+        "agent_command_admins",
+        &normalize_string_values(&payload.agent_command_admins),
+    );
     write_config_admin_list(
         obj,
         "webview_admins",
@@ -1757,6 +1801,7 @@ fn set_agent_commands_field(
         .map(|entry| {
             let config = AgentCommandConfig {
                 enabled: entry.enabled,
+                admin_only: entry.admin_only,
                 description: entry.description,
                 blocks: entry.blocks,
             };
@@ -2012,6 +2057,7 @@ fn payload_agent_commands(value: Option<&Value>) -> Vec<AppConfigAgentCommandPay
             Some(AppConfigAgentCommandPayload {
                 name: name.trim().to_string(),
                 enabled: normalized.enabled,
+                admin_only: normalized.admin_only,
                 description: normalized.description,
                 blocks: normalized.blocks,
             })
@@ -2149,6 +2195,7 @@ fn normalize_agent_command_payloads(
         }
         let config = normalize_agent_command_config(&AgentCommandConfig {
             enabled: entry.enabled,
+            admin_only: entry.admin_only,
             description: entry.description.clone(),
             blocks: entry.blocks.clone(),
         });
@@ -2156,6 +2203,7 @@ fn normalize_agent_command_payloads(
         normalized.push(AppConfigAgentCommandPayload {
             name: normalized_name,
             enabled: config.enabled,
+            admin_only: config.admin_only,
             description: config.description,
             blocks: config.blocks,
         });

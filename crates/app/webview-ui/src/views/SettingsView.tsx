@@ -785,6 +785,29 @@ function AppConfigSettingsView({
     }))
   }
 
+  function updateAgentCommandAdmin(index: number, value: string) {
+    updateSelectedGroup((group) => ({
+      ...group,
+      agent_command_admins: group.agent_command_admins.map((item, itemIndex) =>
+        itemIndex === index ? value : item
+      ),
+    }))
+  }
+
+  function addAgentCommandAdmin() {
+    updateSelectedGroup((group) => ({
+      ...group,
+      agent_command_admins: [...group.agent_command_admins, ''],
+    }))
+  }
+
+  function removeAgentCommandAdmin(index: number) {
+    updateSelectedGroup((group) => ({
+      ...group,
+      agent_command_admins: group.agent_command_admins.filter((_, itemIndex) => itemIndex !== index),
+    }))
+  }
+
   function updateGroupMapping(
     field: 'quick_replies' | 'review_shortcuts' | 'global_shortcuts',
     index: number,
@@ -1564,6 +1587,29 @@ function RuntimeConfigWorkbench({
     }))
   }
 
+  function updateAgentCommandAdmin(index: number, value: string) {
+    updateSelectedGroup((group) => ({
+      ...group,
+      agent_command_admins: group.agent_command_admins.map((item, itemIndex) =>
+        itemIndex === index ? value : item
+      ),
+    }))
+  }
+
+  function addAgentCommandAdmin() {
+    updateSelectedGroup((group) => ({
+      ...group,
+      agent_command_admins: [...group.agent_command_admins, ''],
+    }))
+  }
+
+  function removeAgentCommandAdmin(index: number) {
+    updateSelectedGroup((group) => ({
+      ...group,
+      agent_command_admins: group.agent_command_admins.filter((_, itemIndex) => itemIndex !== index),
+    }))
+  }
+
   function updateGroupMapping(
     field: 'quick_replies' | 'review_shortcuts' | 'global_shortcuts',
     index: number,
@@ -2318,6 +2364,16 @@ function RuntimeConfigWorkbench({
                 <Card.Title>分组 WebUI 管理员</Card.Title>
               </Card.Header>
               <Card.Content>
+                <StringListEditor
+                  label="Agent 指令管理员 QQ"
+                  hint="开启“仅管理员”的 Agent 指令只允许这些 QQ 号触发。"
+                  addLabel="新增 QQ"
+                  placeholder="QQ 号"
+                  values={activeGroup.agent_command_admins}
+                  onAdd={addAgentCommandAdmin}
+                  onChange={updateAgentCommandAdmin}
+                  onRemove={removeAgentCommandAdmin}
+                />
                 <ConfigAdminListEditor
                   entries={activeGroup.webview_admins}
                   emptyText="当前分组还没有专属 WebUI 管理员。"
@@ -2511,6 +2567,7 @@ function buildDefaultConfigGroup(
     review_shortcuts: [],
     global_shortcuts: [],
     agent_commands: [],
+    agent_command_admins: [],
     webview_admins: [],
   }
 }

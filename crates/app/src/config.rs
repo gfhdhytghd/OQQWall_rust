@@ -58,6 +58,7 @@ pub struct AppGroupConfig {
     pub review_shortcuts: HashMap<String, String>,
     pub global_shortcuts: HashMap<String, String>,
     pub agent_commands: HashMap<String, AgentCommandConfig>,
+    pub agent_command_admins: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +292,13 @@ impl AppConfig {
                 .map_err(|err| format!("group {}: {}", group_id, err))?;
             let agent_commands = parse_agent_commands(group_value.get("agent_commands"))
                 .map_err(|err| format!("group {}: {}", group_id, err))?;
+            let agent_command_admins = parse_string_list(group_value.get("agent_command_admins"));
+            if let Some(invalid) = agent_command_admins.iter().find(|value| !is_numeric(value)) {
+                return Err(format!(
+                    "group {}: agent_command_admins contains non-numeric value {}",
+                    group_id, invalid
+                ));
+            }
             let _napcat_ws_log = base_url_for_log(&napcat.base_url);
             debug_log!(
                 "config group: group_id={} audit_group_id={:?} napcat_base_url={} napcat_token_present={}",
@@ -312,6 +320,7 @@ impl AppConfig {
                 review_shortcuts,
                 global_shortcuts,
                 agent_commands,
+                agent_command_admins,
             });
             for admin in parse_admin_entries(group_value.get("webview_admins")) {
                 let username = admin.username.trim().to_string();
@@ -346,6 +355,7 @@ impl AppConfig {
                 review_shortcuts: HashMap::new(),
                 global_shortcuts: HashMap::new(),
                 agent_commands: HashMap::new(),
+                agent_command_admins: Vec::new(),
             });
         }
         #[cfg(debug_assertions)]
@@ -1467,7 +1477,7 @@ fn parse_global_shortcuts(value: Option<&Value>) -> Result<HashMap<String, Strin
     parse_shortcut_map(value, validate_global_shortcut_definition, None)
 }
 
-fn parse_agent_commands(
+pub(crate) fn parse_agent_commands(
     value: Option<&Value>,
 ) -> Result<HashMap<String, AgentCommandConfig>, String> {
     let Some(value) = value else {

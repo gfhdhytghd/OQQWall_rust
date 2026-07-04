@@ -55,6 +55,7 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) -> Result
             review_shortcuts: Arc::new(Mutex::new(group.review_shortcuts.clone())),
             global_shortcuts: Arc::new(Mutex::new(group.global_shortcuts.clone())),
             agent_commands: Arc::new(Mutex::new(group.agent_commands.clone())),
+            agent_command_admins: Arc::new(Mutex::new(group.agent_command_admins.clone())),
         };
         let _ws_log = base_url_for_log(&runtime.napcat.base_url);
         debug_log!(

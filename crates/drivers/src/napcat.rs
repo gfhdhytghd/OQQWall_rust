@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -207,6 +207,8 @@ pub struct AgentCommandConfig {
     #[serde(default = "agent_command_enabled_default")]
     pub enabled: bool,
     #[serde(default)]
+    pub admin_only: bool,
+    #[serde(default)]
     pub description: String,
     #[serde(default)]
     pub blocks: Vec<AgentCommandBlock>,
@@ -216,6 +218,7 @@ impl Default for AgentCommandConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            admin_only: false,
             description: String::new(),
             blocks: Vec::new(),
         }
@@ -411,6 +414,7 @@ pub fn validate_agent_command_name(name: &str) -> Result<String, String> {
 pub fn normalize_agent_command_config(config: &AgentCommandConfig) -> AgentCommandConfig {
     AgentCommandConfig {
         enabled: config.enabled,
+        admin_only: config.admin_only,
         description: config.description.trim().to_string(),
         blocks: config
             .blocks
@@ -666,10 +670,41 @@ fn validate_agent_command_block(
                     index + 1
                 ))
             } else {
-                Ok(())
+                validate_agent_command_webhook_url_template(command_name, index, url)
             }
         }
     }
+}
+
+fn validate_agent_command_webhook_url_template(
+    command_name: &str,
+    index: usize,
+    url: &str,
+) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.contains('<') {
+        return Ok(());
+    }
+    validate_agent_command_webhook_url(trimmed).map_err(|err| {
+        format!(
+            "agent_commands['{}'] 的第 {} 个积木的 {}",
+            command_name,
+            index + 1,
+            err
+        )
+    })
+}
+
+fn validate_agent_command_webhook_url(url: &str) -> Result<(), String> {
+    let parsed = Url::parse(url).map_err(|_| "webhook 地址无效".to_string())?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err("webhook 地址无效".to_string());
+    }
+    if parsed.host_str().map(str::trim).unwrap_or("").is_empty() {
+        return Err("webhook 地址无效".to_string());
+    }
+    Ok(())
 }
 
 fn validate_agent_command_required_field(
@@ -816,6 +851,7 @@ pub struct NapCatRuntimeConfig {
     pub review_shortcuts: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pub global_shortcuts: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pub agent_commands: Arc<std::sync::Mutex<HashMap<String, AgentCommandConfig>>>,
+    pub agent_command_admins: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 const MAX_FORWARD_DEPTH: u32 = 4;
@@ -829,6 +865,12 @@ static WS_SESSIONS: OnceLock<std::sync::Mutex<HashMap<String, NapCatWsSession>>>
 static GROUP_ACCOUNTS: OnceLock<std::sync::Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
 static GROUP_USER_NOTIFICATION_SETTINGS: OnceLock<
     std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<UserNotificationSettings>>>>,
+> = OnceLock::new();
+static GROUP_AGENT_COMMANDS: OnceLock<
+    std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<HashMap<String, AgentCommandConfig>>>>>,
+> = OnceLock::new();
+static GROUP_AGENT_COMMAND_ADMINS: OnceLock<
+    std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<Vec<String>>>>>,
 > = OnceLock::new();
 static AGENT_WEBHOOK_CLIENT: OnceLock<Client> = OnceLock::new();
 static THANK_YOU_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
@@ -1330,6 +1372,8 @@ pub fn spawn_napcat_ws(
                 &runtime.group_id,
                 runtime.user_notifications.clone(),
             );
+            set_group_agent_commands(&runtime.group_id, runtime.agent_commands.clone());
+            set_group_agent_command_admins(&runtime.group_id, runtime.agent_command_admins.clone());
             if runtime.accounts.is_empty() {
                 let entry = RuntimeEntry {
                     runtime: runtime.clone(),
@@ -1650,6 +1694,17 @@ fn group_user_notification_settings()
     GROUP_USER_NOTIFICATION_SETTINGS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+fn group_agent_commands() -> &'static std::sync::Mutex<
+    HashMap<String, Arc<std::sync::Mutex<HashMap<String, AgentCommandConfig>>>>,
+> {
+    GROUP_AGENT_COMMANDS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn group_agent_command_admins()
+-> &'static std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<Vec<String>>>>> {
+    GROUP_AGENT_COMMAND_ADMINS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 fn register_ws_session(account_id: &str, session: NapCatWsSession) {
     let mut guard = match ws_sessions().lock() {
         Ok(guard) => guard,
@@ -1697,6 +1752,25 @@ fn set_group_user_notification_settings(
     guard.insert(group_id.to_string(), config);
 }
 
+fn set_group_agent_commands(
+    group_id: &str,
+    config: Arc<std::sync::Mutex<HashMap<String, AgentCommandConfig>>>,
+) {
+    let mut guard = match group_agent_commands().lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    };
+    guard.insert(group_id.to_string(), config);
+}
+
+fn set_group_agent_command_admins(group_id: &str, admins: Arc<std::sync::Mutex<Vec<String>>>) {
+    let mut guard = match group_agent_command_admins().lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    };
+    guard.insert(group_id.to_string(), admins);
+}
+
 pub fn update_group_user_notification_settings(
     group_id: &str,
     config: UserNotificationSettings,
@@ -1715,6 +1789,48 @@ pub fn update_group_user_notification_settings(
         .lock()
         .map_err(|_| format!("group {} user_notifications lock poisoned", group_id))?;
     *shared_guard = config;
+    Ok(())
+}
+
+pub fn update_group_agent_commands(
+    group_id: &str,
+    commands: HashMap<String, AgentCommandConfig>,
+) -> Result<(), String> {
+    let guard = match group_agent_commands().lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    };
+    let Some(shared) = guard.get(group_id).cloned() else {
+        return Err(format!(
+            "group {} agent_commands runtime not found",
+            group_id
+        ));
+    };
+    let mut shared_guard = shared
+        .lock()
+        .map_err(|_| format!("group {} agent_commands lock poisoned", group_id))?;
+    *shared_guard = commands;
+    Ok(())
+}
+
+pub fn update_group_agent_command_admins(
+    group_id: &str,
+    admins: Vec<String>,
+) -> Result<(), String> {
+    let guard = match group_agent_command_admins().lock() {
+        Ok(guard) => guard,
+        Err(err) => err.into_inner(),
+    };
+    let Some(shared) = guard.get(group_id).cloned() else {
+        return Err(format!(
+            "group {} agent_command_admins runtime not found",
+            group_id
+        ));
+    };
+    let mut shared_guard = shared
+        .lock()
+        .map_err(|_| format!("group {} agent_command_admins lock poisoned", group_id))?;
+    *shared_guard = admins;
     Ok(())
 }
 
@@ -3638,6 +3754,40 @@ async fn parse_inbound_event(
                     .await;
                     return None;
                 }
+                if let Some((command_name, command_args)) =
+                    parse_private_agent_command_line(raw_trimmed)
+                {
+                    match private_agent_command_match_with_state(
+                        runtime,
+                        &guard,
+                        &command_name,
+                        &user_id,
+                    ) {
+                        PrivateAgentCommandMatch::Execute => {
+                            drop(guard);
+                            spawn_private_agent_command(
+                                runtime.clone(),
+                                Arc::clone(state),
+                                cmd_tx.clone(),
+                                out_tx.clone(),
+                                user_id.clone(),
+                                sender_name.clone(),
+                                self_id.clone(),
+                                raw_trimmed.to_string(),
+                                raw_trimmed.to_string(),
+                                command_name,
+                                command_args,
+                                timestamp_ms,
+                            );
+                            return None;
+                        }
+                        PrivateAgentCommandMatch::IgnoredBlacklisted => {
+                            drop(guard);
+                            return None;
+                        }
+                        PrivateAgentCommandMatch::NoMatch => {}
+                    }
+                }
                 if guard
                     .submission_sessions
                     .get(&user_id)
@@ -3692,51 +3842,26 @@ async fn parse_inbound_event(
             attachments.len()
         );
         if let Some((command_name, command_args)) = parse_private_agent_command_line(raw_trimmed) {
-            let has_agent_command = {
-                let guard = runtime
-                    .agent_commands
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner());
-                guard
-                    .get(command_name.as_str())
-                    .map(|command| command.enabled)
-                    .unwrap_or(false)
-            };
-            if has_agent_command {
-                match execute_private_agent_command(
-                    runtime,
-                    state,
-                    cmd_tx,
-                    out_tx,
-                    &user_id,
-                    sender_name.as_deref(),
-                    &self_id,
-                    raw_trimmed,
-                    text.trim(),
-                    &command_name,
-                    &command_args,
-                    timestamp_ms,
-                )
-                .await
-                {
-                    Ok(()) => return None,
-                    Err(err) => {
-                        debug_log!(
-                            "agent command execution failed group_id={} user_id={} command={} err={}",
-                            runtime.group_id,
-                            user_id,
-                            command_name,
-                            err
-                        );
-                        send_private_text(
-                            out_tx,
-                            &user_id,
-                            &format!("指令 #{} 执行失败：{}", command_name, err),
-                        )
-                        .await;
-                        return None;
-                    }
+            match private_agent_command_match(runtime, state, &command_name, &user_id).await {
+                PrivateAgentCommandMatch::Execute => {
+                    spawn_private_agent_command(
+                        runtime.clone(),
+                        Arc::clone(state),
+                        cmd_tx.clone(),
+                        out_tx.clone(),
+                        user_id.clone(),
+                        sender_name.clone(),
+                        self_id.clone(),
+                        raw_trimmed.to_string(),
+                        text.trim().to_string(),
+                        command_name,
+                        command_args,
+                        timestamp_ms,
+                    );
+                    return None;
                 }
+                PrivateAgentCommandMatch::IgnoredBlacklisted => return None,
+                PrivateAgentCommandMatch::NoMatch => {}
             }
         }
         let ingress_id = derive_ingress_id(&[
@@ -6761,6 +6886,119 @@ fn parse_private_agent_command_line(raw_trimmed: &str) -> Option<(String, String
     Some((name.to_string(), args))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateAgentCommandMatch {
+    Execute,
+    IgnoredBlacklisted,
+    NoMatch,
+}
+
+fn is_blacklisted_agent_command_sender(
+    state: &NapCatState,
+    runtime: &NapCatRuntimeConfig,
+    user_id: &str,
+) -> bool {
+    state
+        .blacklist
+        .get(&runtime.group_id)
+        .map(|entries| entries.contains_key(user_id))
+        .unwrap_or(false)
+}
+
+fn is_agent_command_admin(runtime: &NapCatRuntimeConfig, user_id: &str) -> bool {
+    let guard = runtime
+        .agent_command_admins
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    guard.iter().any(|admin| admin.trim() == user_id)
+}
+
+fn private_agent_command_match_with_state(
+    runtime: &NapCatRuntimeConfig,
+    state: &NapCatState,
+    command_name: &str,
+    user_id: &str,
+) -> PrivateAgentCommandMatch {
+    let command = {
+        let guard = runtime
+            .agent_commands
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        guard.get(command_name).cloned()
+    };
+    let Some(command) = command else {
+        return PrivateAgentCommandMatch::NoMatch;
+    };
+    if !command.enabled {
+        return PrivateAgentCommandMatch::NoMatch;
+    }
+    if is_blacklisted_agent_command_sender(state, runtime, user_id) {
+        return PrivateAgentCommandMatch::IgnoredBlacklisted;
+    }
+    if command.admin_only && !is_agent_command_admin(runtime, user_id) {
+        return PrivateAgentCommandMatch::NoMatch;
+    }
+    PrivateAgentCommandMatch::Execute
+}
+
+async fn private_agent_command_match(
+    runtime: &NapCatRuntimeConfig,
+    state: &Arc<Mutex<NapCatState>>,
+    command_name: &str,
+    user_id: &str,
+) -> PrivateAgentCommandMatch {
+    let guard = state.lock().await;
+    private_agent_command_match_with_state(runtime, &guard, command_name, user_id)
+}
+
+fn spawn_private_agent_command(
+    runtime: NapCatRuntimeConfig,
+    state: Arc<Mutex<NapCatState>>,
+    cmd_tx: mpsc::Sender<Command>,
+    out_tx: mpsc::Sender<String>,
+    user_id: String,
+    sender_name: Option<String>,
+    account_id: String,
+    raw_message: String,
+    message_text: String,
+    command_name: String,
+    command_args: String,
+    timestamp_ms: i64,
+) {
+    tokio::spawn(async move {
+        let result = execute_private_agent_command(
+            &runtime,
+            &state,
+            &cmd_tx,
+            &out_tx,
+            &user_id,
+            sender_name.as_deref(),
+            &account_id,
+            &raw_message,
+            &message_text,
+            &command_name,
+            &command_args,
+            timestamp_ms,
+        )
+        .await;
+        if let Err(err) = result {
+            debug_log!(
+                "agent command execution failed group_id={} user_id={} command={} err={}",
+                runtime.group_id,
+                user_id,
+                command_name,
+                err
+            );
+            send_private_text(
+                &out_tx,
+                &user_id,
+                &format!("指令 #{} 执行失败：{}", command_name, err),
+            )
+            .await;
+        }
+    });
+}
+
 fn agent_command_client() -> &'static Client {
     AGENT_WEBHOOK_CLIENT.get_or_init(|| {
         Client::builder()
@@ -6793,6 +7031,15 @@ async fn execute_private_agent_command(
     }
     .ok_or_else(|| format!("agent command not found: {}", command_name))?;
     if !command.enabled {
+        return Ok(());
+    }
+    {
+        let guard = state.lock().await;
+        if is_blacklisted_agent_command_sender(&guard, runtime, user_id) {
+            return Ok(());
+        }
+    }
+    if command.admin_only && !is_agent_command_admin(runtime, user_id) {
         return Ok(());
     }
     let settings = runtime
@@ -6880,6 +7127,12 @@ async fn execute_private_agent_command(
                 anchor_post_code,
                 position,
             } => {
+                let moving_post_code = render_agent_command_template(&moving_post_code, &context)
+                    .trim()
+                    .to_string();
+                let anchor_post_code = render_agent_command_template(&anchor_post_code, &context)
+                    .trim()
+                    .to_string();
                 execute_agent_insert_queued_post(
                     runtime,
                     state,
@@ -6894,6 +7147,9 @@ async fn execute_private_agent_command(
                 review_code,
                 action,
             } => {
+                let review_code = render_agent_command_template(&review_code, &context)
+                    .trim()
+                    .to_string();
                 execute_agent_review_action(
                     runtime,
                     state,
@@ -6932,6 +7188,7 @@ async fn execute_private_agent_command(
                 if target_url.is_empty() {
                     return Err("webhook 地址为空".to_string());
                 }
+                validate_agent_command_webhook_url(target_url)?;
                 let rendered_source_webhook =
                     render_agent_command_template(&source_webhook, &context);
                 let rendered_tags = render_agent_command_tags(&settings, &tags, &context);
@@ -7703,11 +7960,37 @@ mod tests {
             review_shortcuts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             global_shortcuts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             agent_commands: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            agent_command_admins: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
     fn parse_cmd(text: &str, has_reply: bool) -> Option<AuditCommand> {
         parse_audit_command(text, has_reply, &test_runtime())
+    }
+
+    fn test_agent_context() -> AgentCommandTemplateContext {
+        AgentCommandTemplateContext {
+            command_name: "test".to_string(),
+            command_args: "args".to_string(),
+            command_text: "#test args".to_string(),
+            raw_message: "#test args".to_string(),
+            message_text: "#test args".to_string(),
+            sender_id: "20002".to_string(),
+            sender_name: "sender".to_string(),
+            group_id: "group-a".to_string(),
+            account_id: "10001".to_string(),
+            received_at: "1970-01-01 00:00:00".to_string(),
+            received_timestamp_ms: "0".to_string(),
+            submission_session_active: true,
+            submission_session_message_count: 1,
+            previous_post_id: "post-1".to_string(),
+            previous_post_code: "42".to_string(),
+            previous_post_external_code: "10042".to_string(),
+            previous_post_internal_code: "42".to_string(),
+            previous_post_info: "summary".to_string(),
+            previous_post_created_at: "1970-01-01 00:00:00".to_string(),
+            previous_post_created_timestamp_ms: "0".to_string(),
+        }
     }
 
     fn clear_group_accounts_for_test(group_id: &str) {
@@ -7716,6 +7999,79 @@ mod tests {
             Err(err) => err.into_inner(),
         };
         guard.remove(group_id);
+    }
+
+    #[test]
+    fn agent_command_code_templates_render_before_parse() {
+        let context = test_agent_context();
+        for template in [
+            "<previous_post_internal_code>",
+            " #<previous_post_internal_code> ",
+        ] {
+            let rendered = render_agent_command_template(template, &context);
+            assert_eq!(
+                parse_agent_command_review_code(rendered.trim()).expect("review code"),
+                42
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn private_agent_command_runs_during_confirming_submission_session() {
+        let mut runtime = test_runtime();
+        runtime.agent_commands = Arc::new(std::sync::Mutex::new(HashMap::from([(
+            "取消投稿".to_string(),
+            AgentCommandConfig {
+                enabled: true,
+                admin_only: false,
+                description: String::new(),
+                blocks: vec![AgentCommandBlock::CancelSubmissionSession],
+            },
+        )])));
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        {
+            let mut guard = state.lock().await;
+            guard.submission_sessions.insert(
+                "20002".to_string(),
+                SubmissionSession {
+                    messages: Vec::new(),
+                    started_at_ms: 1_000,
+                    group_id: runtime.group_id.clone(),
+                    confirming: true,
+                },
+            );
+        }
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (out_tx, _out_rx) = mpsc::channel(4);
+        let value = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": "10001",
+            "user_id": "20002",
+            "message_id": "m1",
+            "time": 1001,
+            "raw_message": "#取消投稿",
+            "message": [
+                {"type": "text", "data": {"text": "#取消投稿"}}
+            ]
+        });
+
+        let command =
+            parse_inbound_event(&runtime, &state, &cmd_tx, &out_tx, "10001", &value).await;
+        assert!(command.is_none());
+
+        let mut removed = false;
+        for _ in 0..10 {
+            {
+                let guard = state.lock().await;
+                if !guard.submission_sessions.contains_key("20002") {
+                    removed = true;
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(removed, "agent command should cancel the active session");
     }
 
     #[test]

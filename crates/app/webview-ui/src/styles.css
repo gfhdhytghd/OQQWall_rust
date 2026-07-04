@@ -1,61 +1,61 @@
 :root {
   color-scheme: light;
-  --color-canvas: #f5f5f5;
+  --color-canvas: #f4f4f4;
   --color-paper: #ffffff;
-  --color-surface-alt: #fafafa;
-  --color-ink: #0a0a0a;
-  --color-ink-soft: #171717;
-  --color-mid-gray: #737373;
-  --color-hairline: #e5e5e5;
-  --color-ember: #e7000b;
+  --color-surface-alt: #f7f9fb;
+  --color-ink: #161616;
+  --color-ink-soft: #525252;
+  --color-mid-gray: #525252;
+  --color-hairline: #d0d7de;
+  --color-ember: #b42318;
   --bg: var(--color-canvas);
   --surface: var(--color-paper);
-  --surface-soft: var(--color-canvas);
+  --surface-soft: var(--color-surface-alt);
   --surface-raised: var(--color-surface-alt);
   --line: var(--color-hairline);
-  --line-soft: #ededed;
-  --line-strong: #d4d4d4;
+  --line-soft: #e0e5eb;
+  --line-strong: #b8c2cc;
   --text: var(--color-ink);
   --text-soft: var(--color-ink-soft);
   --muted: var(--color-mid-gray);
-  --accent: var(--color-ink-soft);
-  --accent-foreground: var(--color-surface-alt);
-  --accent-hover: var(--color-ink);
-  --accent-soft: var(--color-canvas);
-  --accent-soft-foreground: var(--color-ink-soft);
-  --accent-soft-hover: #ededed;
-  --link: var(--color-ink);
+  --accent: #001d6c;
+  --accent-foreground: #ffffff;
+  --accent-hover: #0f62fe;
+  --accent-soft: #edf5ff;
+  --accent-soft-foreground: #001d6c;
+  --accent-soft-hover: #d0e2ff;
+  --link: #0f62fe;
   --background: var(--color-canvas);
   --foreground: var(--color-ink);
-  --default: var(--color-canvas);
-  --default-hover: #ededed;
+  --default: #f7f9fb;
+  --default-hover: #edf5ff;
   --default-foreground: var(--color-ink);
-  --field-background: var(--color-canvas);
+  --field-background: #f7f9fb;
   --field-foreground: var(--color-ink);
   --field-placeholder: var(--color-mid-gray);
   --field-border: transparent;
   --border: var(--color-hairline);
-  --focus: var(--color-ink);
+  --focus: #0f62fe;
   --danger: var(--color-ember);
-  --danger-hover: #c9000a;
-  --danger-foreground: var(--color-surface-alt);
-  --danger-soft: #fff5f5;
+  --danger-hover: #da1e28;
+  --danger-foreground: #ffffff;
+  --danger-soft: #fff0ee;
   --danger-soft-foreground: var(--color-ember);
-  --danger-soft-hover: #ffe8e8;
-  --success: var(--color-ink-soft);
-  --success-foreground: var(--color-surface-alt);
-  --success-soft: var(--color-canvas);
-  --success-soft-foreground: var(--color-ink-soft);
-  --warning: var(--color-ink-soft);
-  --warning-foreground: var(--color-surface-alt);
-  --warning-soft: var(--color-canvas);
-  --warning-soft-foreground: var(--color-ink-soft);
-  --warn: var(--color-ink-soft);
-  --warn-soft: var(--color-canvas);
+  --danger-soft-hover: #ffe5e1;
+  --success: #137a4f;
+  --success-foreground: #ffffff;
+  --success-soft: #e8f6ee;
+  --success-soft-foreground: #137a4f;
+  --warning: #9a6400;
+  --warning-foreground: #ffffff;
+  --warning-soft: #fff5dc;
+  --warning-soft-foreground: #9a6400;
+  --warn: #9a6400;
+  --warn-soft: #fff5dc;
   --bad: var(--color-ember);
-  --bad-soft: #fff5f5;
-  --good: var(--color-ink-soft);
-  --good-soft: var(--color-canvas);
+  --bad-soft: #fff0ee;
+  --good: #137a4f;
+  --good-soft: #e8f6ee;
   --shadow-soft:
     0 0 0 1px rgb(23 23 23 / 5%),
     0 1px 3px rgb(0 0 0 / 10%),
@@ -122,10 +122,10 @@ button:not(:disabled):active {
 }
 
 .button--primary {
-  --button-bg: var(--color-ink);
-  --button-bg-hover: var(--color-ink-soft);
-  --button-bg-pressed: var(--color-ink);
-  --button-fg: var(--color-surface-alt);
+  --button-bg: var(--accent);
+  --button-bg-hover: var(--accent-hover);
+  --button-bg-pressed: var(--accent-hover);
+  --button-fg: var(--accent-foreground);
 }
 
 .button--secondary,
@@ -133,7 +133,7 @@ button:not(:disabled):active {
   --button-bg: var(--surface-soft);
   --button-bg-hover: var(--surface-raised);
   --button-bg-pressed: var(--surface-raised);
-  --button-fg: var(--color-ink);
+  --button-fg: var(--accent-soft-foreground);
 }
 
 .button--outline {
@@ -141,7 +141,7 @@ button:not(:disabled):active {
   --button-bg: transparent;
   --button-bg-hover: var(--surface-soft);
   --button-bg-pressed: var(--surface-soft);
-  --button-fg: var(--color-ink);
+  --button-fg: var(--accent-soft-foreground);
 }
 
 .button--danger,
@@ -1254,6 +1254,16 @@ a {
   line-height: 1.5;
 }
 
+.field-error {
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.field-warning {
+  color: var(--warn);
+}
+
 .stage-chip {
   border: 1px solid var(--line) !important;
   border-radius: var(--radius-control) !important;
@@ -1443,6 +1453,11 @@ a {
   gap: 16px;
 }
 
+.scratch-blockly-shell {
+  display: grid;
+  gap: 8px;
+}
+
 .scratch-workbench-actions {
   display: flex;
   align-items: center;
@@ -1562,7 +1577,7 @@ a {
   align-items: center;
   justify-content: center;
   padding: 0 16px;
-  border: 1px solid var(--line-strong);
+  border: 1px solid #c5ccd8;
   border-radius: var(--radius-pill);
   background: var(--surface-soft);
   color: var(--muted);
@@ -1578,7 +1593,7 @@ a {
 .scratch-command-enable-toggle.is-enabled {
   border-color: var(--accent);
   background: var(--accent);
-  color: var(--surface);
+  color: #ffffff;
 }
 
 .scratch-command-actions {
@@ -1598,8 +1613,7 @@ a {
   border: 1px solid var(--line);
   border-radius: var(--radius-card);
   overflow: hidden;
-  background: var(--surface-raised);
-  box-shadow: var(--shadow-soft);
+  background: #f7f9fb;
 }
 
 .scratch-blockly-frame.is-fullscreen {
@@ -1642,14 +1656,14 @@ a {
   place-items: center;
   border: 1px solid var(--line);
   border-radius: var(--radius-control);
-  background: var(--surface);
+  background: #ffffff;
   color: var(--accent);
-  box-shadow: var(--shadow-soft);
+  box-shadow: 0 2px 8px rgb(22 22 22 / 12%);
   cursor: pointer;
 }
 
 .scratch-blockly-button:hover {
-  border-color: rgb(23 23 23 / 18%);
+  border-color: var(--accent-hover);
   background: var(--accent-soft);
 }
 
@@ -1669,7 +1683,7 @@ a {
 }
 
 .scratch-blockly-workspace .blocklyFlyoutBackground {
-  fill: var(--surface);
+  fill: #ffffff;
 }
 
 .blocklyDropDownDiv,

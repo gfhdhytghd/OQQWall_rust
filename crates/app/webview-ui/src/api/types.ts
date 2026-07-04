@@ -253,6 +253,7 @@ export type AgentCommandBlock =
 export interface AppConfigAgentCommand {
   name: string
   enabled: boolean
+  admin_only: boolean
   description: string
   blocks: AgentCommandBlock[]
 }
@@ -313,6 +314,7 @@ export interface AppConfigGroupSettings {
   review_shortcuts: MappingEntry[]
   global_shortcuts: MappingEntry[]
   agent_commands: AppConfigAgentCommand[]
+  agent_command_admins: string[]
   webview_admins: ConfigAdminEntry[]
 }
 
@@ -441,7 +443,7 @@ export const ACTION_LABELS: Record<string, string> = {
   delete: '删除',
   defer: '暂缓',
   skip: '跳过',
-  immediate: '立即发送',
+  immediate: '立即',
   refresh: '刷新',
   rerender: '重渲染',
   select_all: '全选',
