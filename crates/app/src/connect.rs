@@ -49,6 +49,7 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) -> Result
             friend_add_message: group.friend_add_message.clone(),
             max_queue: core_config.max_queue(&group.group_id),
             max_images_per_post: core_config.max_images_per_post(&group.group_id),
+            thank_you_filter: config.thank_you_filter.clone(),
             user_notifications: Arc::new(Mutex::new(group.user_notifications.clone())),
             quick_replies: Arc::new(Mutex::new(group.quick_replies.clone())),
             review_shortcuts: Arc::new(Mutex::new(group.review_shortcuts.clone())),

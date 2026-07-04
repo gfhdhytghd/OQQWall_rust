@@ -49,6 +49,7 @@ use crate::shortcut::{
     validate_global_shortcut_definition, validate_review_shortcut_definition,
     validate_shortcut_name,
 };
+use crate::thankyou_filter::{self, ThankYouFeedbackKind, ThankYouFilterRuntimeConfig};
 
 #[cfg(debug_assertions)]
 macro_rules! debug_log {
@@ -809,6 +810,7 @@ pub struct NapCatRuntimeConfig {
     pub friend_add_message: Option<String>,
     pub max_queue: usize,
     pub max_images_per_post: usize,
+    pub thank_you_filter: ThankYouFilterRuntimeConfig,
     pub user_notifications: Arc<std::sync::Mutex<UserNotificationSettings>>,
     pub quick_replies: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pub review_shortcuts: Arc<std::sync::Mutex<HashMap<String, String>>>,
@@ -829,6 +831,7 @@ static GROUP_USER_NOTIFICATION_SETTINGS: OnceLock<
     std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<UserNotificationSettings>>>>,
 > = OnceLock::new();
 static AGENT_WEBHOOK_CLIENT: OnceLock<Client> = OnceLock::new();
+static THANK_YOU_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct ReviewInfo {
@@ -943,6 +946,13 @@ struct SubmissionSession {
     confirming: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ThankYouFeedbackRecord {
+    sent_at_ms: i64,
+    kind: ThankYouFeedbackKind,
+    silenced_count: u8,
+}
+
 #[derive(Default)]
 struct NapCatState {
     review_info: HashMap<ReviewId, ReviewInfo>,
@@ -967,6 +977,7 @@ struct NapCatState {
     friend_req_cache: HashMap<String, i64>,
     friend_suppression: HashMap<String, Vec<SuppressionEntry>>,
     submission_sessions: HashMap<String, SubmissionSession>,
+    thank_you_feedback: HashMap<String, ThankYouFeedbackRecord>,
     blob_paths: HashMap<BlobId, String>,
     next_echo: u64,
 }
@@ -2182,6 +2193,15 @@ async fn build_action_from_event(
                     "message": message
                 }
             });
+            {
+                let mut guard = state.lock().await;
+                record_thank_you_feedback(
+                    &mut guard,
+                    &user_id,
+                    ThankYouFeedbackKind::Rejected,
+                    decided_at_ms,
+                );
+            }
             Some(payload.to_string())
         }
         Event::Review(ReviewEvent::ReviewReplyRequested { review_id, text }) => {
@@ -2207,6 +2227,15 @@ async fn build_action_from_event(
                     "message": message_segments_from_text(&text)
                 }
             });
+            {
+                let mut guard = state.lock().await;
+                record_thank_you_feedback(
+                    &mut guard,
+                    &user_id,
+                    ThankYouFeedbackKind::ManualReply,
+                    now_ms(),
+                );
+            }
             Some(payload.to_string())
         }
         Event::Review(ReviewEvent::ReviewQuickReplyRequested { review_id, key }) => {
@@ -2248,6 +2277,15 @@ async fn build_action_from_event(
                     "message": message_segments_from_text(&reply_text)
                 }
             });
+            {
+                let mut guard = state.lock().await;
+                record_thank_you_feedback(
+                    &mut guard,
+                    &user_id,
+                    ThankYouFeedbackKind::ManualReply,
+                    now_ms(),
+                );
+            }
             let audit_group = runtime
                 .audit_group_id
                 .as_deref()
@@ -2607,6 +2645,15 @@ async fn build_action_from_event(
                         "message": message
                     }
                 });
+                {
+                    let mut guard = state.lock().await;
+                    record_thank_you_feedback(
+                        &mut guard,
+                        &user_id,
+                        ThankYouFeedbackKind::SendSucceeded,
+                        finished_at_ms,
+                    );
+                }
                 let _ = out_tx.send(payload.to_string()).await;
             }
             None
@@ -3702,7 +3749,7 @@ async fn parse_inbound_event(
             Some(raw) if !raw.is_empty() => raw,
             _ => summary_text.as_str(),
         };
-        {
+        let thank_you_feedback = {
             let mut guard = state.lock().await;
             if should_suppress_private_message(
                 &mut guard.friend_suppression,
@@ -3713,6 +3760,32 @@ async fn parse_inbound_event(
                 debug_log!("napcat inbound private suppressed after friend request");
                 return None;
             }
+            current_thank_you_feedback(&guard, runtime, &user_id, timestamp_ms)
+        };
+        if let Some(feedback) = thank_you_feedback {
+            if let Some(matched) = thankyou_filter::evaluate_message(
+                &runtime.thank_you_filter,
+                feedback.kind,
+                value.get("message"),
+                raw_message,
+                thank_you_http_client(),
+            )
+            .await
+            {
+                let mut guard = state.lock().await;
+                if current_thank_you_feedback(&guard, runtime, &user_id, timestamp_ms).is_some() {
+                    mark_thank_you_silenced(&mut guard, &user_id);
+                    debug_log!(
+                        "napcat inbound private thank-you silenced: user_id={} rule={}",
+                        user_id,
+                        matched.rule
+                    );
+                    return None;
+                }
+            }
+        }
+        {
+            let mut guard = state.lock().await;
             guard.pending_summary.insert(ingress_id, summary_text);
         }
         return Some(Command::Ingress(IngressCommand {
@@ -7525,6 +7598,59 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn thank_you_http_client() -> &'static Client {
+    THANK_YOU_HTTP_CLIENT.get_or_init(|| {
+        Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    })
+}
+
+fn record_thank_you_feedback(
+    state: &mut NapCatState,
+    user_id: &str,
+    kind: ThankYouFeedbackKind,
+    sent_at_ms: i64,
+) {
+    state.thank_you_feedback.insert(
+        user_id.to_string(),
+        ThankYouFeedbackRecord {
+            sent_at_ms,
+            kind,
+            silenced_count: 0,
+        },
+    );
+}
+
+fn current_thank_you_feedback(
+    state: &NapCatState,
+    runtime: &NapCatRuntimeConfig,
+    user_id: &str,
+    now_ms: i64,
+) -> Option<ThankYouFeedbackRecord> {
+    if !runtime.thank_you_filter.enabled {
+        return None;
+    }
+    let record = state.thank_you_feedback.get(user_id)?;
+    if record.silenced_count > 0 || now_ms < record.sent_at_ms {
+        return None;
+    }
+    let age_ms = now_ms - record.sent_at_ms;
+    let window_ms =
+        i64::try_from(runtime.thank_you_filter.window_sec.saturating_mul(1000)).unwrap_or(i64::MAX);
+    if age_ms > window_ms {
+        return None;
+    }
+    Some(record.clone())
+}
+
+fn mark_thank_you_silenced(state: &mut NapCatState, user_id: &str) {
+    if let Some(record) = state.thank_you_feedback.get_mut(user_id) {
+        record.silenced_count = record.silenced_count.saturating_add(1);
+    }
+}
+
 fn next_echo(state: &mut NapCatState) -> String {
     state.next_echo = state.next_echo.saturating_add(1);
     format!("echo-{}", state.next_echo)
@@ -7569,6 +7695,7 @@ mod tests {
             friend_add_message: None,
             max_queue: 1,
             max_images_per_post: 0,
+            thank_you_filter: ThankYouFilterRuntimeConfig::disabled(),
             user_notifications: Arc::new(
                 std::sync::Mutex::new(UserNotificationSettings::default()),
             ),
@@ -7703,6 +7830,73 @@ mod tests {
                 }),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn private_thank_you_reply_is_silenced_once_per_feedback_window() {
+        let mut runtime = test_runtime();
+        runtime.thank_you_filter = ThankYouFilterRuntimeConfig::with_registry_json(
+            true,
+            1800,
+            16,
+            6,
+            r#"{"face_ids":[],"mfaces":[],"file_uniques":[],"images":[]}"#,
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        {
+            let mut guard = state.lock().await;
+            record_thank_you_feedback(
+                &mut guard,
+                "20002",
+                ThankYouFeedbackKind::SendSucceeded,
+                1_000_000,
+            );
+        }
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let (out_tx, _out_rx) = mpsc::channel(1);
+        let first = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": "10001",
+            "user_id": "20002",
+            "message_id": "m1",
+            "time": 1001,
+            "raw_message": "谢谢",
+            "message": [
+                {"type": "text", "data": {"text": "谢谢"}}
+            ]
+        });
+        let command =
+            parse_inbound_event(&runtime, &state, &cmd_tx, &out_tx, "10001", &first).await;
+        assert!(command.is_none());
+        {
+            let guard = state.lock().await;
+            assert_eq!(guard.pending_summary.len(), 0);
+            assert_eq!(
+                guard
+                    .thank_you_feedback
+                    .get("20002")
+                    .map(|record| record.silenced_count),
+                Some(1)
+            );
+        }
+
+        let second = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": "10001",
+            "user_id": "20002",
+            "message_id": "m2",
+            "time": 1002,
+            "raw_message": "谢谢",
+            "message": [
+                {"type": "text", "data": {"text": "谢谢"}}
+            ]
+        });
+        let command =
+            parse_inbound_event(&runtime, &state, &cmd_tx, &out_tx, "10001", &second).await;
+        assert!(matches!(command, Some(Command::Ingress(_))));
     }
 
     #[test]

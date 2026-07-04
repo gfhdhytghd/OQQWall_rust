@@ -14,6 +14,7 @@ use oqqwall_rust_drivers::shortcut::{
     is_builtin_review_command_name, validate_global_shortcut_definition,
     validate_review_shortcut_definition, validate_shortcut_name,
 };
+use oqqwall_rust_drivers::thankyou_filter::ThankYouFilterRuntimeConfig;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -101,6 +102,7 @@ pub struct AppConfig {
     pub webview_session_ttl_sec: i64,
     pub webview_admins: Vec<WebviewAdminAccount>,
     pub telemetry: TelemetryConfig,
+    pub thank_you_filter: ThankYouFilterRuntimeConfig,
     core_config: CoreConfig,
     #[cfg(debug_assertions)]
     pub dev_config: DevConfig,
@@ -226,8 +228,9 @@ impl AppConfig {
             upload_batch_size: telemetry_upload_batch_size,
             max_append_messages: telemetry_max_append_messages,
         };
+        let thank_you_filter = parse_thank_you_filter_config(common.get("thank_you_filter"))?;
         debug_log!(
-            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={} at_unprived_sender={} web_api_enabled={} web_api_port={} web_api_token_present={} webview_enabled={} webview_host={} webview_port={} webview_admins={} telemetry_enabled={} telemetry_upload_enabled={} telemetry_endpoint_present={}",
+            "config parsed: tz_offset_minutes={} default_process_waittime_ms={} max_cache_mb={} at_unprived_sender={} web_api_enabled={} web_api_port={} web_api_token_present={} webview_enabled={} webview_host={} webview_port={} webview_admins={} telemetry_enabled={} telemetry_upload_enabled={} telemetry_endpoint_present={} thank_you_filter_enabled={}",
             tz_offset_minutes,
             default_process_waittime_ms,
             max_cache_mb,
@@ -241,7 +244,8 @@ impl AppConfig {
             parse_admin_entries(root_obj.get("webview_global_admins")).len(),
             telemetry.enabled,
             telemetry.upload_enabled,
-            telemetry.upload_endpoint.is_some()
+            telemetry.upload_endpoint.is_some(),
+            thank_you_filter.enabled
         );
         let core_config = build_core_config(&common, &groups, default_process_waittime_ms);
         let fallback_napcat = parse_napcat_config_optional(&common);
@@ -384,6 +388,7 @@ impl AppConfig {
             webview_session_ttl_sec,
             webview_admins,
             telemetry,
+            thank_you_filter,
             core_config,
             #[cfg(debug_assertions)]
             dev_config,
@@ -585,6 +590,57 @@ fn parse_u64(value: Option<&Value>) -> Option<u64> {
 
 fn parse_duration_ms(value: Option<&Value>) -> Option<i64> {
     parse_i64(value)
+}
+
+fn parse_thank_you_filter_config(
+    value: Option<&Value>,
+) -> Result<ThankYouFilterRuntimeConfig, String> {
+    let Some(value) = value else {
+        return ThankYouFilterRuntimeConfig::builtin_enabled()
+            .map_err(|err| format!("thank_you_filter built-in registry invalid: {}", err));
+    };
+    let Value::Object(obj) = value else {
+        return Err("thank_you_filter must be an object".to_string());
+    };
+    let enabled = obj
+        .get("enabled")
+        .map(|raw| {
+            parse_bool(Some(raw))
+                .ok_or_else(|| "thank_you_filter.enabled must be a boolean".to_string())
+        })
+        .transpose()?
+        .unwrap_or(true);
+    let window_sec = parse_u64(obj.get("window_sec"))
+        .unwrap_or(30 * 60)
+        .clamp(60, 86_400);
+    let max_text_chars = parse_usize(obj.get("max_text_chars"))
+        .unwrap_or(16)
+        .clamp(2, 80);
+    let phash_distance = parse_u32(obj.get("phash_distance"))
+        .unwrap_or(6)
+        .clamp(0, 32);
+    let registry_path = nonempty(
+        parse_string(obj.get("seed_registry")).or_else(|| parse_string(obj.get("registry_path"))),
+    );
+    if let Some(path) = registry_path {
+        let json = fs::read_to_string(&path)
+            .map_err(|err| format!("failed to read thank_you_filter registry {}: {}", path, err))?;
+        return ThankYouFilterRuntimeConfig::with_registry_json(
+            enabled,
+            window_sec,
+            max_text_chars,
+            phash_distance,
+            &json,
+        )
+        .map_err(|err| format!("thank_you_filter registry {} invalid: {}", path, err));
+    }
+    ThankYouFilterRuntimeConfig::with_builtin_registry(
+        enabled,
+        window_sec,
+        max_text_chars,
+        phash_distance,
+    )
+    .map_err(|err| format!("thank_you_filter built-in registry invalid: {}", err))
 }
 
 fn parse_send_success_reply_config(
@@ -1906,6 +1962,37 @@ mod tests {
             .expect("builtin token");
         assert!(token.starts_with("t_"));
         assert_eq!(token.len(), 34);
+    }
+
+    #[test]
+    fn thank_you_filter_defaults_to_enabled_and_parses_overrides() {
+        let root = json!({
+            "common": {
+                "napcat_base_url": "127.0.0.1:3001/oqqwall/ws"
+            }
+        });
+        let config = AppConfig::from_value(&root).expect("config");
+        assert!(config.thank_you_filter.enabled);
+        assert_eq!(config.thank_you_filter.window_sec, 1800);
+        assert_eq!(config.thank_you_filter.max_text_chars, 16);
+        assert_eq!(config.thank_you_filter.phash_distance, 6);
+
+        let root = json!({
+            "common": {
+                "napcat_base_url": "127.0.0.1:3001/oqqwall/ws",
+                "thank_you_filter": {
+                    "enabled": false,
+                    "window_sec": 30,
+                    "max_text_chars": 100,
+                    "phash_distance": 99
+                }
+            }
+        });
+        let config = AppConfig::from_value(&root).expect("config");
+        assert!(!config.thank_you_filter.enabled);
+        assert_eq!(config.thank_you_filter.window_sec, 60);
+        assert_eq!(config.thank_you_filter.max_text_chars, 80);
+        assert_eq!(config.thank_you_filter.phash_distance, 32);
     }
 
     #[test]
