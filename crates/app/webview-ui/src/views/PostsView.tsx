@@ -399,13 +399,16 @@ export function PostsView({
     <div className="workspace">
       <header className="page-head">
         <div>
-          <h1>稿件审核</h1>
-          <p>{lastUpdatedAt ? `刷新 ${formatDateTime(lastUpdatedAt)}` : '等待刷新'}</p>
+          <h1>{title}</h1>
+          <p>{description}</p>
+          <span className="page-meta">
+            {lastUpdatedAt ? `刷新 ${formatDateTime(lastUpdatedAt)}` : '等待刷新'}
+          </span>
         </div>
         <div className="head-actions">
           <div className="layout-note">
             <PanelRightOpen size={16} />
-            双栏审核
+            {mode === 'review' ? '双栏审核' : '记录浏览'}
           </div>
           <Switch isSelected={autoRefresh} onChange={setAutoRefresh} size="sm">
             自动刷新
@@ -549,8 +552,8 @@ export function PostsView({
           <section className="feed-panel">
             <header className="feed-head">
               <div>
-                <h2>稿件队列</h2>
-                <p>选择左侧稿件后在右侧处理详情</p>
+                <h2>{mode === 'sent' ? '发送记录' : '稿件队列'}</h2>
+                <p>{description}</p>
               </div>
               <ToggleButtonGroup
                 className="view-toggle"
@@ -605,7 +608,7 @@ export function PostsView({
                   />
                 )
               ) : (
-                <EmptyPanel icon={<Inbox size={28} />} text="没有符合条件的稿件" />
+                <EmptyPanel icon={<Inbox size={28} />} text={emptyText} />
               )}
             </div>
           </section>

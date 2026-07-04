@@ -378,7 +378,6 @@ export function MappingListEditor({
 }
 
 export function SettingsMenuCard<T extends string>({
-  title,
   options,
   activeKey,
   onSelect,
@@ -395,9 +394,6 @@ export function SettingsMenuCard<T extends string>({
 }) {
   return (
     <Card className="panel-card settings-nav-card">
-      <Card.Header>
-        <Card.Title>{title}</Card.Title>
-      </Card.Header>
       <Card.Content>
         <div className="settings-nav-list">
           {options.map((option) => (
@@ -500,16 +496,8 @@ export function Metric({
 }
 
 export function StageChip({ stage }: { stage: string }) {
-  const color =
-    stage === 'review_pending'
-      ? 'warning'
-      : stage === 'failed' || stage === 'rejected'
-        ? 'danger'
-        : stage === 'sent'
-          ? 'success'
-          : 'default'
   return (
-    <Chip color={color} variant="soft" size="sm">
+    <Chip className={`stage-chip stage-chip-${stage}`} variant="soft" size="sm">
       {STAGE_LABELS[stage] ?? stage}
     </Chip>
   )

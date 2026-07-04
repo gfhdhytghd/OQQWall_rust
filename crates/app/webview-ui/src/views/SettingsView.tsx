@@ -539,21 +539,45 @@ export function SettingsView({
   const options = [
     {
       value: 'config' as const,
-      label: 'Runtime Config',
-      description: 'Edit config.json and runtime settings in the GUI.',
+      label: '运行配置',
+      description: 'config.json 和运行时参数',
       icon: <LayoutGrid size={16} />,
     },
     {
       value: 'notifications' as const,
-      label: 'User Replies',
-      description: 'Configure queue, success, and rejection messages.',
+      label: '用户回链',
+      description: '入队、发稿成功和拒稿消息',
       icon: <Send size={16} />,
     },
   ]
 
   return (
     <div className="workspace settings-hub">
-      <SettingsMenuCard title="Settings" options={options} activeKey={tab} onSelect={setTab} />
+      <Card className="panel-card settings-tabs-card">
+        <Card.Content>
+          <div className="settings-tabs-head">
+            <h2>设置</h2>
+          </div>
+          <div className="settings-tab-list" role="tablist" aria-label="设置分类">
+            {options.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                role="tab"
+                aria-selected={tab === option.value}
+                className={`settings-tab-button ${tab === option.value ? 'is-active' : ''}`}
+                onClick={() => setTab(option.value)}
+              >
+                <span className="settings-stage-icon">{option.icon}</span>
+                <span className="settings-tab-text">
+                  <strong>{option.label}</strong>
+                  <span>{option.description}</span>
+                </span>
+              </button>
+            ))}
+          </div>
+        </Card.Content>
+      </Card>
       {tab === 'config' ? (
         <RuntimeConfigWorkbench notify={notify} />
       ) : (

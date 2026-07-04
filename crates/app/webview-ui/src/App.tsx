@@ -7,6 +7,7 @@ import {
   LayoutGrid,
   LogOut,
   Send,
+  Settings2,
   ShieldCheck,
 } from 'lucide-react'
 import { api } from './api/client'
@@ -21,6 +22,7 @@ function App() {
   const [me, setMe] = useState<MeResponse | null>(null)
   const [authChecked, setAuthChecked] = useState(false)
   const [view, setView] = useState<ViewKey>('review')
+  const navClass = (key: ViewKey) => `nav-button ${view === key ? 'is-active' : ''}`
 
   useEffect(() => {
     api<MeResponse>('/auth/me')
@@ -61,27 +63,30 @@ function App() {
           <Brand />
           <nav className="nav" aria-label="主导航">
             <Button
-              className="nav-button"
+              className={navClass('review')}
               variant={view === 'review' ? 'primary' : 'tertiary'}
               fullWidth
+              aria-current={view === 'review' ? 'page' : undefined}
               onClick={() => setView('review')}
             >
               <Eye size={18} />
               审核
             </Button>
             <Button
-              className="nav-button"
+              className={navClass('sent')}
               variant={view === 'sent' ? 'primary' : 'tertiary'}
               fullWidth
+              aria-current={view === 'sent' ? 'page' : undefined}
               onClick={() => setView('sent')}
             >
               <Send size={18} />
               已发送
             </Button>
             <Button
-              className="nav-button"
+              className={navClass('stats')}
               variant={view === 'stats' ? 'primary' : 'tertiary'}
               fullWidth
+              aria-current={view === 'stats' ? 'page' : undefined}
               onClick={() => setView('stats')}
             >
               <BarChart3 size={18} />
@@ -89,9 +94,10 @@ function App() {
             </Button>
             {me.role === 'global_admin' ? (
               <Button
-                className="nav-button"
+                className={navClass('agent')}
                 variant={view === 'agent' ? 'primary' : 'tertiary'}
                 fullWidth
+                aria-current={view === 'agent' ? 'page' : undefined}
                 onClick={() => setView('agent')}
               >
                 <FileText size={18} />
@@ -99,18 +105,20 @@ function App() {
               </Button>
             ) : null}
             <Button
-              className="nav-button"
+              className={navClass('settings')}
               variant={view === 'settings' ? 'primary' : 'tertiary'}
               fullWidth
+              aria-current={view === 'settings' ? 'page' : undefined}
               onClick={() => setView('settings')}
             >
-              <Send size={18} />
+              <Settings2 size={18} />
               设置
             </Button>
             <Button
-              className="nav-button"
+              className={navClass('tag-mapping')}
               variant={view === 'tag-mapping' ? 'primary' : 'tertiary'}
               fullWidth
+              aria-current={view === 'tag-mapping' ? 'page' : undefined}
               onClick={() => setView('tag-mapping')}
             >
               <LayoutGrid size={18} />
@@ -193,6 +201,7 @@ function HeroShell({ children }: { children: ReactNode }) {
 function Brand({ large = false }: { large?: boolean }) {
   return (
     <div className={large ? 'brand brand-large' : 'brand'}>
+      <span className="brand-mark" aria-hidden="true">O</span>
       <div>
         <strong>OQQWall</strong>
         <span>审核后台</span>
@@ -235,19 +244,25 @@ function LoginView({
         <Card.Content>
           <form className="login-form" onSubmit={submit}>
             <Brand large />
-            <Input
-              placeholder="用户名"
-              value={username}
-              onChange={(event) => setUsername(event.target.value)}
-              autoComplete="username"
-            />
-            <Input
-              placeholder="密码"
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              autoComplete="current-password"
-            />
+            <label className="field-stack">
+              <span className="field-label">用户名</span>
+              <Input
+                placeholder="请输入用户名"
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+                autoComplete="username"
+              />
+            </label>
+            <label className="field-stack">
+              <span className="field-label">密码</span>
+              <Input
+                placeholder="请输入密码"
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                autoComplete="current-password"
+              />
+            </label>
             <Button type="submit" fullWidth isDisabled={loading || !username || !password}>
               {loading ? <Spinner size="sm" /> : <ShieldCheck size={16} />}
               登录
