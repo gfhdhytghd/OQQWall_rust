@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use crate::ids::{AccountId, GroupId, TimestampMs};
 
-#[derive(Debug, Clone, Default)]
+pub const DEFAULT_EVICTION_RETENTION_MS: TimestampMs = 7 * 24 * 60 * 60 * 1000;
+
+#[derive(Debug, Clone)]
 pub struct CoreConfig {
     pub default_process_waittime_ms: TimestampMs,
     pub default_send_windows: Vec<TimeWindow>,
@@ -11,6 +13,7 @@ pub struct CoreConfig {
     pub default_max_images_per_post: usize,
     pub default_send_timeout_ms: TimestampMs,
     pub default_send_max_attempts: u32,
+    pub eviction_retention_ms: TimestampMs,
     pub groups: HashMap<GroupId, GroupConfig>,
 }
 
@@ -32,6 +35,22 @@ pub struct GroupConfig {
 pub struct TimeWindow {
     pub start_minute: u16,
     pub end_minute: u16,
+}
+
+impl Default for CoreConfig {
+    fn default() -> Self {
+        Self {
+            default_process_waittime_ms: 0,
+            default_send_windows: Vec::new(),
+            default_min_interval_ms: 0,
+            default_max_queue: 0,
+            default_max_images_per_post: 0,
+            default_send_timeout_ms: 0,
+            default_send_max_attempts: 0,
+            eviction_retention_ms: DEFAULT_EVICTION_RETENTION_MS,
+            groups: HashMap::new(),
+        }
+    }
 }
 
 impl CoreConfig {

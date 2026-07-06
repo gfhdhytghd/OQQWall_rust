@@ -1,11 +1,12 @@
 pub mod debug_log;
 pub mod journal;
+mod record;
 pub mod snapshot;
 
 use std::fmt;
 
 pub use journal::{JournalCorruption, JournalCursor, LocalJournal, ReplayOutcome};
-pub use snapshot::{Snapshot, SnapshotStore};
+pub use snapshot::{LoadedSnapshot, Snapshot, SnapshotStore};
 
 #[derive(Debug)]
 pub enum InfraError {

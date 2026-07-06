@@ -16,8 +16,8 @@ use crossterm::terminal::{
 use oqqwall_rust_core::draft::{Draft, DraftBlock, IngressMessage};
 use oqqwall_rust_core::event::{
     AccountEvent, BlobEvent, ConfigEvent, DraftEvent, Event, EventEnvelope, IngressEvent,
-    ManualEvent, MediaEvent, RenderEvent, ReviewEvent, ScheduleEvent, SendEvent, SessionEvent,
-    SystemEvent,
+    LifecycleEvent, ManualEvent, MediaEvent, RenderEvent, ReviewEvent, ScheduleEvent, SendEvent,
+    SessionEvent, SystemEvent,
 };
 use oqqwall_rust_core::ids::Id128;
 use oqqwall_rust_infra::{JournalCorruption, LocalJournal};
@@ -1704,6 +1704,19 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
                     ingress_ids.len()
                 ),
             ),
+            DraftEvent::DraftTransformsSet {
+                post_id,
+                transforms,
+                set_at_ms,
+            } => (
+                "Draft.DraftTransformsSet",
+                format!(
+                    "post={} transforms={} set_at={}",
+                    short_id(*post_id),
+                    transforms.len(),
+                    set_at_ms
+                ),
+            ),
         },
         Event::Media(media) => match media {
             MediaEvent::AvatarFetchRequested { user_id } => {
@@ -2234,6 +2247,23 @@ fn summary_parts(event: &Event) -> (&'static str, String) {
             ManualEvent::ManualInterventionResolved { post_id } => (
                 "Manual.InterventionResolved",
                 format!("post={}", short_id(*post_id)),
+            ),
+        },
+        Event::Lifecycle(lifecycle) => match lifecycle {
+            LifecycleEvent::PostEvicted {
+                post_id,
+                evicted_at_ms,
+                blob_ids,
+                ingress_ids,
+            } => (
+                "Lifecycle.PostEvicted",
+                format!(
+                    "post={} evicted_at={} blobs={} ingress={}",
+                    short_id(*post_id),
+                    evicted_at_ms,
+                    blob_ids.len(),
+                    ingress_ids.len()
+                ),
             ),
         },
     }

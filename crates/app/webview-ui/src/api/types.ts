@@ -59,6 +59,122 @@ export type AgentCommandQueueInsertPosition = 'before' | 'after'
 
 export type AgentCommandShortcutScope = 'review' | 'global'
 
+export type AgentCommandTrigger = 'private_command' | 'submission_received'
+
+export type MediaKind = 'Image' | 'Video' | 'File' | 'Audio' | 'Other' | 'Sticker'
+
+export type BlockKindFilter =
+  | 'paragraph'
+  | 'reply'
+  | 'poke'
+  | 'json_card'
+  | 'forward'
+  | {
+      attachment: {
+        media_kind: MediaKind | null
+      }
+    }
+
+export type TextMatcher =
+  | {
+      mode: 'contains'
+      needle: string
+    }
+  | {
+      mode: 'starts_with'
+      prefix: string
+    }
+  | {
+      mode: 'regex'
+      pattern: string
+    }
+
+export type IndexFilter =
+  | {
+      mode: 'nth'
+      n: number
+    }
+  | {
+      mode: 'range'
+      start: number
+      end: number
+    }
+  | {
+      mode: 'first'
+    }
+  | {
+      mode: 'last'
+    }
+
+export interface BlockSelector {
+  kinds?: BlockKindFilter[] | null
+  text?: TextMatcher | null
+  index?: IndexFilter | null
+}
+
+export type PositionSpec =
+  | {
+      pos: 'front'
+    }
+  | {
+      pos: 'back'
+    }
+  | {
+      pos: 'index'
+      n: number
+    }
+  | {
+      pos: 'before'
+      selector: BlockSelector
+    }
+  | {
+      pos: 'after'
+      selector: BlockSelector
+    }
+
+export type DraftTransform = {
+  kind: 'move_blocks'
+  selector: BlockSelector
+  position: PositionSpec
+}
+
+export type RuleCondition =
+  | {
+      kind: 'all'
+      conditions: RuleCondition[]
+    }
+  | {
+      kind: 'any'
+      conditions: RuleCondition[]
+    }
+  | {
+      kind: 'not'
+      condition: RuleCondition
+    }
+  | {
+      kind: 'has_block'
+      selector: BlockSelector
+    }
+  | {
+      kind: 'block_count_at_least'
+      selector: BlockSelector
+      n: number
+    }
+  | {
+      kind: 'block_count_equals'
+      selector: BlockSelector
+      n: number
+    }
+
+export type AgentCommandPostTarget =
+  | {
+      target: 'triggering_post'
+    }
+  | {
+      target: 'review_code'
+      template: string
+    }
+
 export type AgentCommandReviewAction =
   | {
       action: 'approve'
@@ -242,6 +358,17 @@ export type AgentCommandBlock =
       action: AgentCommandGlobalAction
     }
   | {
+      kind: 'if'
+      condition: RuleCondition
+      then_blocks: AgentCommandBlock[]
+      else_blocks: AgentCommandBlock[]
+    }
+  | {
+      kind: 'set_draft_transforms'
+      target: AgentCommandPostTarget
+      transforms: DraftTransform[]
+    }
+  | {
       kind: 'send_webhook'
       url: string
       source_webhook: string
@@ -254,6 +381,7 @@ export interface AppConfigAgentCommand {
   name: string
   enabled: boolean
   admin_only: boolean
+  trigger: AgentCommandTrigger
   description: string
   blocks: AgentCommandBlock[]
 }

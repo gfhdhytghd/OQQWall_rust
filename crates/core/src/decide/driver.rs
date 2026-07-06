@@ -1,13 +1,14 @@
+use crate::anonymous::detect_anonymous;
 use crate::config::CoreConfig;
-use crate::decide::builder::build_draft_from_messages;
+use crate::decide::builder::build_draft_for_post;
 use crate::event::{
     DraftEvent, Event, IngressEvent, ManualEvent, RenderEvent, ReviewDecision, ReviewEvent,
     ScheduleEvent, SendEvent, SendPriority,
 };
 use crate::ids::{PostId, ReviewCode, ReviewId, derive_review_id};
 use crate::safety::detect_safe;
+use crate::state::PostMeta;
 use crate::state::StateView;
-use crate::{anonymous::detect_anonymous, state::PostMeta};
 
 pub fn decide_driver_event(state: &StateView, event: &Event, config: &CoreConfig) -> Vec<Event> {
     // Driver events come from IO drivers. They must flow into the event stream
@@ -221,7 +222,8 @@ fn rebuild_draft_after_recall(
             messages.push(message.clone());
         }
     }
-    let draft = build_draft_from_messages(&messages);
+    let draft = build_draft_for_post(state, post_id, &ingress_ids)
+        .unwrap_or_else(|| crate::draft::Draft { blocks: Vec::new() });
     let is_anonymous = detect_anonymous(&messages);
     let is_safe = detect_safe(&messages);
 

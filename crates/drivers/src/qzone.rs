@@ -20,8 +20,8 @@ use image::{
 };
 use oqqwall_rust_core::draft::{Draft, DraftBlock, IngressMessage, MediaKind, MediaReference};
 use oqqwall_rust_core::event::{
-    BlobEvent, DraftEvent, Event, IngressEvent, MediaEvent, QzonePublicationItem, RenderEvent,
-    ReviewEvent, ScheduleEvent, SendEvent, SendPriority,
+    BlobEvent, DraftEvent, Event, IngressEvent, LifecycleEvent, MediaEvent, QzonePublicationItem,
+    RenderEvent, ReviewEvent, ScheduleEvent, SendEvent, SendPriority,
 };
 use oqqwall_rust_core::ids::{
     AccountId, BlobId, ExternalCode, IngressId, PostId, RemotePostId, ReviewCode, ReviewId,
@@ -282,6 +282,51 @@ fn build_state_from_view(view: &StateView) -> QzoneState {
     state
 }
 
+fn evict_qzone_post_cache(state: &mut QzoneState, post_id: PostId, ingress_ids: &[IngressId]) {
+    state.drafts.remove(&post_id);
+    state.attempts.remove(&post_id);
+    state.post_anonymous.remove(&post_id);
+    state.send_plans.remove(&post_id);
+    state.review_codes.remove(&post_id);
+    state.external_codes.remove(&post_id);
+    state.render_blobs.remove(&post_id);
+    let review_ids = state
+        .review_posts
+        .iter()
+        .filter_map(|(review_id, review_post_id)| {
+            (*review_post_id == post_id).then_some(*review_id)
+        })
+        .collect::<Vec<_>>();
+    for review_id in review_ids {
+        state.review_posts.remove(&review_id);
+    }
+
+    let removed_ingress = state
+        .post_ingress
+        .remove(&post_id)
+        .unwrap_or_else(|| ingress_ids.to_vec());
+    for ingress_id in removed_ingress {
+        let still_referenced = state
+            .post_ingress
+            .values()
+            .any(|ids| ids.contains(&ingress_id));
+        if !still_referenced {
+            state.ingress_messages.remove(&ingress_id);
+            state.ingress_authors.remove(&ingress_id);
+        }
+    }
+}
+
+fn delete_persisted_blob_file(path: &str) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            debug_log!("blob gc remove failed: path={} error={}", path, err);
+        }
+    }
+}
+
 struct CookieCache {
     account_id: String,
     cookies: HashMap<String, String>,
@@ -410,6 +455,16 @@ pub fn spawn_qzone_sender(
                     guard.post_ingress.insert(post_id, ingress_ids);
                     guard.post_anonymous.insert(post_id, is_anonymous);
                 }
+                Event::Lifecycle(LifecycleEvent::PostEvicted {
+                    post_id,
+                    blob_ids,
+                    ingress_ids,
+                    ..
+                }) => {
+                    let mut guard = state.lock().await;
+                    evict_qzone_post_cache(&mut guard, post_id, &ingress_ids);
+                    blob_cache::release_many(blob_ids);
+                }
                 Event::Review(ReviewEvent::ReviewItemCreated {
                     review_id,
                     post_id,
@@ -482,10 +537,20 @@ pub fn spawn_qzone_sender(
                     let mut guard = state.lock().await;
                     guard.blob_paths.insert(blob_id, path);
                 }
-                Event::Blob(BlobEvent::BlobReleased { blob_id })
-                | Event::Blob(BlobEvent::BlobGcRequested { blob_id }) => {
+                Event::Blob(BlobEvent::BlobReleased { blob_id }) => {
                     let mut guard = state.lock().await;
                     guard.blob_paths.remove(&blob_id);
+                    blob_cache::release(blob_id);
+                }
+                Event::Blob(BlobEvent::BlobGcRequested { blob_id }) => {
+                    let path = {
+                        let mut guard = state.lock().await;
+                        guard.blob_paths.remove(&blob_id)
+                    };
+                    blob_cache::release(blob_id);
+                    if let Some(path) = path {
+                        delete_persisted_blob_file(&path);
+                    }
                 }
                 Event::Render(RenderEvent::RenderRequested { post_id, .. }) => {
                     let mut guard = state.lock().await;

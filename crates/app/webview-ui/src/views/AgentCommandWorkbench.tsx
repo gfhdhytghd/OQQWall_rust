@@ -16,11 +16,21 @@ import {
 import {
   AgentCommandBlock,
   AgentCommandGlobalAction,
+  AgentCommandPostTarget,
   AgentCommandQueueInsertPosition,
   AgentCommandReviewAction,
   AgentCommandShortcutScope,
+  AgentCommandTrigger,
   AppConfigAgentCommand,
   AppConfigSettingsResponse,
+  BlockKindFilter,
+  BlockSelector,
+  DraftTransform,
+  IndexFilter,
+  MediaKind,
+  PositionSpec,
+  RuleCondition,
+  TextMatcher,
 } from '../api/types'
 import {
   AGENT_GLOBAL_ACTION_OPTIONS,
@@ -40,10 +50,87 @@ const SEND_WEBHOOK_BLOCK_TYPE = 'oqqwall_send_webhook'
 const INSERT_QUEUE_BLOCK_TYPE = 'oqqwall_insert_queued_post'
 const REVIEW_ACTION_BLOCK_TYPE = 'oqqwall_review_action'
 const GLOBAL_ACTION_BLOCK_TYPE = 'oqqwall_global_action'
+const IF_BLOCK_TYPE = 'oqqwall_if'
+const SET_DRAFT_TRANSFORMS_BLOCK_TYPE = 'oqqwall_set_draft_transforms'
+const MOVE_BLOCKS_BLOCK_TYPE = 'oqqwall_move_blocks'
+const SELECTOR_BLOCK_TYPE = 'oqqwall_block_selector'
+const POSITION_BLOCK_TYPE = 'oqqwall_position'
+const CONDITION_HAS_BLOCK_TYPE = 'oqqwall_condition_has_block'
+const CONDITION_COUNT_BLOCK_TYPE = 'oqqwall_condition_count'
+const CONDITION_COMPOSITE_BLOCK_TYPE = 'oqqwall_condition_composite'
+const CONDITION_NOT_BLOCK_TYPE = 'oqqwall_condition_not'
 const VARIABLE_TOKEN_BLOCK_TYPE = 'oqqwall_variable_token'
 const TEXT_LITERAL_BLOCK_TYPE = 'oqqwall_text_literal'
 const JOIN_TEXT_BLOCK_TYPE = 'oqqwall_join_text'
 const SCRATCH_BLOCKS_MEDIA_PATH = '/scratch-blocks-media/'
+
+const AGENT_COMMAND_TRIGGER_OPTIONS: Array<{ value: AgentCommandTrigger; label: string }> = [
+  { value: 'private_command', label: '私聊指令' },
+  { value: 'submission_received', label: '收到新投稿' },
+]
+
+const BLOCK_KIND_SELECTION_OPTIONS = [
+  { value: 'any', label: '任意块' },
+  { value: 'paragraph', label: '段落' },
+  { value: 'attachment_any', label: '附件' },
+  { value: 'attachment_image', label: '图片' },
+  { value: 'attachment_video', label: '视频' },
+  { value: 'attachment_file', label: '文件' },
+  { value: 'attachment_audio', label: '音频' },
+  { value: 'attachment_sticker', label: '表情' },
+  { value: 'reply', label: '回复引用' },
+  { value: 'poke', label: '戳一戳' },
+  { value: 'json_card', label: '卡片' },
+  { value: 'forward', label: '合并转发' },
+] as const
+
+type BlockKindSelection = (typeof BLOCK_KIND_SELECTION_OPTIONS)[number]['value']
+
+const TEXT_MATCHER_OPTIONS = [
+  { value: 'none', label: '不匹配文本' },
+  { value: 'contains', label: '包含' },
+  { value: 'starts_with', label: '开头是' },
+  { value: 'regex', label: '正则' },
+] as const
+
+type TextMatcherSelection = (typeof TEXT_MATCHER_OPTIONS)[number]['value']
+
+const INDEX_FILTER_OPTIONS = [
+  { value: 'all', label: '全部' },
+  { value: 'first', label: '第一个' },
+  { value: 'last', label: '最后一个' },
+  { value: 'nth', label: '第 N 个' },
+  { value: 'range', label: '范围' },
+] as const
+
+type IndexFilterSelection = (typeof INDEX_FILTER_OPTIONS)[number]['value']
+
+const POSITION_OPTIONS = [
+  { value: 'front', label: '最前' },
+  { value: 'back', label: '最后' },
+  { value: 'index', label: '第 N 位' },
+  { value: 'before', label: '选择器之前' },
+  { value: 'after', label: '选择器之后' },
+] as const
+
+type PositionSelection = (typeof POSITION_OPTIONS)[number]['value']
+
+const POST_TARGET_OPTIONS = [
+  { value: 'triggering_post', label: '当前触发稿件' },
+  { value: 'review_code', label: '编号模板' },
+] as const
+
+type PostTargetSelection = (typeof POST_TARGET_OPTIONS)[number]['value']
+
+const CONDITION_COMPOSITE_OPTIONS = [
+  { value: 'all', label: '且' },
+  { value: 'any', label: '或' },
+] as const
+
+const CONDITION_COUNT_OPTIONS = [
+  { value: 'at_least', label: '≥' },
+  { value: 'equals', label: '=' },
+] as const
 
 const SIMPLE_BLOCK_TYPES: Record<string, AgentCommandBlock['kind']> = {
   oqqwall_start_submission_session: 'start_submission_session',
@@ -87,6 +174,11 @@ const scratchTheme = Blockly.Theme.defineTheme('oqqwall_scratch', {
       colourSecondary: '#774dcb',
       colourTertiary: '#5f3aa3',
     },
+    rule_blocks: {
+      colourPrimary: '#0fbd8c',
+      colourSecondary: '#0b8f6a',
+      colourTertiary: '#087654',
+    },
     variable_blocks: {
       colourPrimary: '#ff6680',
       colourSecondary: '#d84f66',
@@ -99,6 +191,7 @@ const scratchTheme = Blockly.Theme.defineTheme('oqqwall_scratch', {
     session_category: { colour: '#ff8c1a' },
     review_category: { colour: '#59c059' },
     system_category: { colour: '#9966ff' },
+    rule_category: { colour: '#0fbd8c' },
     variable_category: { colour: '#ff6680' },
   },
   componentStyles: {
@@ -229,6 +322,7 @@ export function AgentCommandWorkbench({
                   onClick={() => setSelectedCommandIndex(commandIndex)}
                 >
                   <strong>#{command.name || `command_${commandIndex + 1}`}</strong>
+                  <em>{agentCommandTriggerLabel(readAgentCommandTrigger(command.trigger))}</em>
                   <span>
                     {command.description ||
                       (command.enabled ? (command.admin_only ? '仅管理员' : '已启用') : '已关闭')}
@@ -324,9 +418,10 @@ export function AgentCommandWorkbench({
               <ScratchBlocklyEditor
                 key={selectedCommandKey}
                 blocks={selectedCommand.blocks}
+                trigger={readAgentCommandTrigger(selectedCommand.trigger)}
                 variables={variables}
-                onChange={(blocks) =>
-                  updateCommand(selectedCommandIndex, (command) => ({ ...command, blocks }))
+                onChange={(blocks, trigger) =>
+                  updateCommand(selectedCommandIndex, (command) => ({ ...command, blocks, trigger }))
                 }
               />
             </section>
@@ -341,17 +436,20 @@ export function AgentCommandWorkbench({
 
 function ScratchBlocklyEditor({
   blocks,
+  trigger,
   variables,
   onChange,
 }: {
   blocks: AgentCommandBlock[]
+  trigger: AgentCommandTrigger
   variables: AgentCommandVariable[]
-  onChange: (blocks: AgentCommandBlock[]) => void
+  onChange: (blocks: AgentCommandBlock[], trigger: AgentCommandTrigger) => void
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const workspaceRef = useRef<Blockly.WorkspaceSvg | null>(null)
   const onChangeRef = useRef(onChange)
   const initialBlocksRef = useRef(blocks)
+  const initialTriggerRef = useRef(trigger)
   const [isFullscreen, setFullscreen] = useState(false)
   const [hasDetachedBlocks, setHasDetachedBlocks] = useState(false)
   const toolbox = useMemo(() => buildToolbox(variables), [variables])
@@ -396,15 +494,17 @@ function ScratchBlocklyEditor({
     } as Parameters<typeof Blockly.inject>[1] & { media: string })
     workspaceRef.current = workspace
 
-    loadAgentBlocksIntoWorkspace(workspace, initialBlocksRef.current)
+    loadAgentBlocksIntoWorkspace(workspace, initialBlocksRef.current, initialTriggerRef.current)
     setHasDetachedBlocks(workspaceHasDetachedAgentBlocks(workspace))
 
     const listener = (event: Blockly.Events.Abstract) => {
       if (event.isUiEvent) return
       const nextBlocks = workspaceToAgentBlocks(workspace)
+      const nextTrigger = workspaceToAgentCommandTrigger(workspace)
       initialBlocksRef.current = nextBlocks
+      initialTriggerRef.current = nextTrigger
       setHasDetachedBlocks(workspaceHasDetachedAgentBlocks(workspace))
-      onChangeRef.current(nextBlocks)
+      onChangeRef.current(nextBlocks, nextTrigger)
     }
     workspace.addChangeListener(listener)
 
@@ -683,7 +783,14 @@ function registerAgentCommandBlocks() {
     },
     {
       type: ROOT_BLOCK_TYPE,
-      message0: '当 Agent 指令被触发',
+      message0: '当 %1 触发',
+      args0: [
+        {
+          type: 'field_dropdown',
+          name: 'TRIGGER',
+          options: dropdownOptions(AGENT_COMMAND_TRIGGER_OPTIONS),
+        },
+      ],
       nextStatement: null,
       style: 'event_blocks',
       tooltip: '从这里开始串联这条 Agent 指令要执行的积木。',
@@ -827,6 +934,144 @@ function registerAgentCommandBlocks() {
       tooltip: '执行一个全局系统动作；不同动作会读取不同参数。',
     },
     {
+      type: IF_BLOCK_TYPE,
+      message0: '如果 %1',
+      args0: [conditionValueArg('CONDITION')],
+      message1: '那么 %1',
+      args1: [{ type: 'input_statement', name: 'THEN' }],
+      message2: '否则 %1',
+      args2: [{ type: 'input_statement', name: 'ELSE' }],
+      previousStatement: null,
+      nextStatement: null,
+      style: 'rule_blocks',
+      tooltip: '根据当前触发稿件的内容块条件执行不同积木。',
+    },
+    {
+      type: SET_DRAFT_TRANSFORMS_BLOCK_TYPE,
+      message0: '设置 %1 的稿件变换',
+      args0: [
+        {
+          type: 'field_dropdown',
+          name: 'TARGET',
+          options: dropdownOptions(POST_TARGET_OPTIONS),
+        },
+      ],
+      message1: '编号模板 %1',
+      args1: [textValueArg('REVIEW_CODE')],
+      message2: '变换 %1',
+      args2: [{ type: 'input_statement', name: 'TRANSFORMS', check: 'DraftTransform' }],
+      previousStatement: null,
+      nextStatement: null,
+      style: 'rule_blocks',
+      tooltip: '把一组内容块变换保存到指定待处理稿件，并触发重渲染。',
+    },
+    {
+      type: MOVE_BLOCKS_BLOCK_TYPE,
+      message0: '移动 %1 到 %2',
+      args0: [selectorValueArg('SELECTOR'), positionValueArg('POSITION')],
+      previousStatement: 'DraftTransform',
+      nextStatement: 'DraftTransform',
+      style: 'rule_blocks',
+      tooltip: '按选择器找出内容块，保持相对顺序移动到目标位置。',
+    },
+    {
+      type: CONDITION_HAS_BLOCK_TYPE,
+      message0: '含 %1 块',
+      args0: [selectorValueArg('SELECTOR')],
+      output: 'RuleCondition',
+      style: 'rule_blocks',
+      tooltip: '判断当前稿件是否含有命中选择器的内容块。',
+    },
+    {
+      type: CONDITION_COUNT_BLOCK_TYPE,
+      message0: '%1 块数 %2 %3',
+      args0: [
+        selectorValueArg('SELECTOR'),
+        {
+          type: 'field_dropdown',
+          name: 'OP',
+          options: dropdownOptions(CONDITION_COUNT_OPTIONS),
+        },
+        { type: 'field_input', name: 'N', text: '1' },
+      ],
+      output: 'RuleCondition',
+      style: 'rule_blocks',
+      tooltip: '判断命中选择器的块数量。',
+    },
+    {
+      type: CONDITION_COMPOSITE_BLOCK_TYPE,
+      message0: '%1 %2 %3',
+      args0: [
+        conditionValueArg('LEFT'),
+        {
+          type: 'field_dropdown',
+          name: 'OP',
+          options: dropdownOptions(CONDITION_COMPOSITE_OPTIONS),
+        },
+        conditionValueArg('RIGHT'),
+      ],
+      output: 'RuleCondition',
+      style: 'rule_blocks',
+      tooltip: '组合两个条件。',
+    },
+    {
+      type: CONDITION_NOT_BLOCK_TYPE,
+      message0: '非 %1',
+      args0: [conditionValueArg('CONDITION')],
+      output: 'RuleCondition',
+      style: 'rule_blocks',
+      tooltip: '反转一个条件。',
+    },
+    {
+      type: SELECTOR_BLOCK_TYPE,
+      message0: '选择 %1',
+      args0: [
+        {
+          type: 'field_dropdown',
+          name: 'KIND',
+          options: dropdownOptions(BLOCK_KIND_SELECTION_OPTIONS),
+        },
+      ],
+      message1: '文本 %1 %2',
+      args1: [
+        {
+          type: 'field_dropdown',
+          name: 'TEXT_MODE',
+          options: dropdownOptions(TEXT_MATCHER_OPTIONS),
+        },
+        { type: 'field_input', name: 'TEXT', text: '' },
+      ],
+      message2: '序号 %1 N %2 至 %3',
+      args2: [
+        {
+          type: 'field_dropdown',
+          name: 'INDEX_MODE',
+          options: dropdownOptions(INDEX_FILTER_OPTIONS),
+        },
+        { type: 'field_input', name: 'N', text: '0' },
+        { type: 'field_input', name: 'END', text: '0' },
+      ],
+      output: 'BlockSelector',
+      style: 'rule_blocks',
+      tooltip: '按块类型、段落文本和过滤后的序号选择内容块。',
+    },
+    {
+      type: POSITION_BLOCK_TYPE,
+      message0: '位置 %1 N %2 参照 %3',
+      args0: [
+        {
+          type: 'field_dropdown',
+          name: 'POS',
+          options: dropdownOptions(POSITION_OPTIONS),
+        },
+        { type: 'field_input', name: 'N', text: '0' },
+        selectorValueArg('SELECTOR'),
+      ],
+      output: 'PositionSpec',
+      style: 'rule_blocks',
+      tooltip: '指定移动后的插入位置；之前/之后需要参照选择器。',
+    },
+    {
       type: VARIABLE_TOKEN_BLOCK_TYPE,
       message0: '变量 %1',
       args0: [{ type: 'field_input', name: 'TOKEN', text: '<command_args>' }],
@@ -924,6 +1169,89 @@ function buildToolbox(variables: AgentCommandVariable[]) {
       },
       {
         kind: 'category',
+        name: '规则',
+        categorystyle: 'rule_category',
+        contents: [
+          {
+            kind: 'block',
+            type: IF_BLOCK_TYPE,
+            inputs: {
+              CONDITION: conditionInputShadow(),
+            },
+          },
+          {
+            kind: 'block',
+            type: SET_DRAFT_TRANSFORMS_BLOCK_TYPE,
+            fields: { TARGET: 'triggering_post' },
+            inputs: {
+              REVIEW_CODE: textInputShadow('<previous_post_internal_code>'),
+              TRANSFORMS: {
+                block: {
+                  type: MOVE_BLOCKS_BLOCK_TYPE,
+                  inputs: {
+                    SELECTOR: selectorInputShadow('paragraph'),
+                    POSITION: positionInputShadow('front'),
+                  },
+                },
+              },
+            },
+          },
+          {
+            kind: 'block',
+            type: MOVE_BLOCKS_BLOCK_TYPE,
+            inputs: {
+              SELECTOR: selectorInputShadow('paragraph'),
+              POSITION: positionInputShadow('front'),
+            },
+          },
+          {
+            kind: 'block',
+            type: CONDITION_COUNT_BLOCK_TYPE,
+            fields: { OP: 'equals', N: '1' },
+            inputs: {
+              SELECTOR: selectorInputShadow('paragraph'),
+            },
+          },
+          {
+            kind: 'block',
+            type: CONDITION_HAS_BLOCK_TYPE,
+            inputs: {
+              SELECTOR: selectorInputShadow('paragraph'),
+            },
+          },
+          {
+            kind: 'block',
+            type: CONDITION_COMPOSITE_BLOCK_TYPE,
+            fields: { OP: 'all' },
+            inputs: {
+              LEFT: conditionInputShadow(),
+              RIGHT: conditionInputShadow(),
+            },
+          },
+          {
+            kind: 'block',
+            type: CONDITION_NOT_BLOCK_TYPE,
+            inputs: {
+              CONDITION: conditionInputShadow(),
+            },
+          },
+          {
+            kind: 'block',
+            type: SELECTOR_BLOCK_TYPE,
+            fields: { KIND: 'paragraph', TEXT_MODE: 'none', INDEX_MODE: 'all' },
+          },
+          {
+            kind: 'block',
+            type: POSITION_BLOCK_TYPE,
+            fields: { POS: 'front' },
+            inputs: {
+              SELECTOR: selectorInputShadow('paragraph'),
+            },
+          },
+        ],
+      },
+      {
+        kind: 'category',
         name: '变量',
         categorystyle: 'variable_category',
         contents: variables.length
@@ -940,7 +1268,8 @@ function buildToolbox(variables: AgentCommandVariable[]) {
 
 function loadAgentBlocksIntoWorkspace(
   workspace: Blockly.WorkspaceSvg,
-  blocks: AgentCommandBlock[]
+  blocks: AgentCommandBlock[],
+  trigger: AgentCommandTrigger
 ) {
   Blockly.Events.disable()
   try {
@@ -949,16 +1278,11 @@ function loadAgentBlocksIntoWorkspace(
     root.setDeletable(false)
     root.setMovable(false)
     root.initSvg()
+    setBlocklyField(root, 'TRIGGER', trigger)
     root.render()
     root.moveBy(28, 28)
 
-    let previousBlock: Blockly.Block | null = root
-    blocks.forEach((agentBlock) => {
-      const block = createBlocklyBlock(workspace, agentBlock)
-      if (!block || !previousBlock?.nextConnection || !block.previousConnection) return
-      previousBlock.nextConnection.connect(block.previousConnection)
-      previousBlock = block
-    })
+    connectAgentBlockStack(workspace, root.nextConnection, blocks)
 
     workspace.render()
   } finally {
@@ -1004,6 +1328,19 @@ function createBlocklyBlock(
       setBlocklyTextInput(block, 'ARG_B', globalActionArgumentB(agentBlock.action))
       setBlocklyField(block, 'SCOPE', globalActionScope(agentBlock.action))
       break
+    case 'if':
+      setBlocklyConditionInput(block, 'CONDITION', agentBlock.condition)
+      connectAgentBlockStack(workspace, block.getInput('THEN')?.connection ?? null, agentBlock.then_blocks)
+      connectAgentBlockStack(workspace, block.getInput('ELSE')?.connection ?? null, agentBlock.else_blocks)
+      break
+    case 'set_draft_transforms':
+      setBlocklyPostTarget(block, agentBlock.target)
+      connectDraftTransformStack(
+        workspace,
+        block.getInput('TRANSFORMS')?.connection ?? null,
+        agentBlock.transforms
+      )
+      break
     default:
       break
   }
@@ -1012,16 +1349,130 @@ function createBlocklyBlock(
   return block
 }
 
+function createDraftTransformBlock(
+  workspace: Blockly.Workspace,
+  transform: DraftTransform
+): Blockly.Block | null {
+  if (transform.kind !== 'move_blocks') return null
+  const block = workspace.newBlock(MOVE_BLOCKS_BLOCK_TYPE) as Blockly.BlockSvg
+  block.initSvg()
+  setBlocklySelectorInput(block, 'SELECTOR', transform.selector)
+  setBlocklyPositionInput(block, 'POSITION', transform.position)
+  block.render()
+  return block
+}
+
+function createSelectorBlock(
+  workspace: Blockly.Workspace,
+  selector: BlockSelector
+): Blockly.Block {
+  const block = workspace.newBlock(SELECTOR_BLOCK_TYPE) as Blockly.BlockSvg
+  block.initSvg()
+  setBlocklyField(block, 'KIND', selectorKindSelection(selector))
+  const text = selector.text ?? null
+  setBlocklyField(block, 'TEXT_MODE', textMatcherSelection(text))
+  setBlocklyField(block, 'TEXT', textMatcherValue(text))
+  const index = selector.index ?? null
+  setBlocklyField(block, 'INDEX_MODE', indexFilterSelection(index))
+  setBlocklyField(block, 'N', indexFilterStart(index))
+  setBlocklyField(block, 'END', indexFilterEnd(index))
+  block.render()
+  return block
+}
+
+function createPositionBlock(
+  workspace: Blockly.Workspace,
+  position: PositionSpec
+): Blockly.Block {
+  const block = workspace.newBlock(POSITION_BLOCK_TYPE) as Blockly.BlockSvg
+  block.initSvg()
+  setBlocklyField(block, 'POS', position.pos)
+  setBlocklyField(block, 'N', position.pos === 'index' ? String(position.n) : '0')
+  if (position.pos === 'before' || position.pos === 'after') {
+    setBlocklySelectorInput(block, 'SELECTOR', position.selector)
+  } else {
+    setBlocklySelectorInput(block, 'SELECTOR', defaultBlockSelector('paragraph'))
+  }
+  block.render()
+  return block
+}
+
+function createConditionBlock(
+  workspace: Blockly.Workspace,
+  condition: RuleCondition
+): Blockly.Block {
+  let block: Blockly.BlockSvg
+  switch (condition.kind) {
+    case 'all':
+    case 'any': {
+      block = workspace.newBlock(CONDITION_COMPOSITE_BLOCK_TYPE) as Blockly.BlockSvg
+      block.initSvg()
+      setBlocklyField(block, 'OP', condition.kind)
+      const [left, right] = normalizeBinaryConditions(condition.kind, condition.conditions)
+      setBlocklyConditionInput(block, 'LEFT', left)
+      setBlocklyConditionInput(block, 'RIGHT', right)
+      break
+    }
+    case 'not':
+      block = workspace.newBlock(CONDITION_NOT_BLOCK_TYPE) as Blockly.BlockSvg
+      block.initSvg()
+      setBlocklyConditionInput(block, 'CONDITION', condition.condition)
+      break
+    case 'has_block':
+      block = workspace.newBlock(CONDITION_HAS_BLOCK_TYPE) as Blockly.BlockSvg
+      block.initSvg()
+      setBlocklySelectorInput(block, 'SELECTOR', condition.selector)
+      break
+    case 'block_count_at_least':
+    case 'block_count_equals':
+      block = workspace.newBlock(CONDITION_COUNT_BLOCK_TYPE) as Blockly.BlockSvg
+      block.initSvg()
+      setBlocklyField(block, 'OP', condition.kind === 'block_count_at_least' ? 'at_least' : 'equals')
+      setBlocklyField(block, 'N', String(condition.n))
+      setBlocklySelectorInput(block, 'SELECTOR', condition.selector)
+      break
+  }
+  block.render()
+  return block
+}
+
+function connectAgentBlockStack(
+  workspace: Blockly.WorkspaceSvg,
+  connection: Blockly.Connection | null,
+  blocks: AgentCommandBlock[]
+) {
+  let previousConnection = connection
+  blocks.forEach((agentBlock) => {
+    const block = createBlocklyBlock(workspace, agentBlock)
+    if (!block?.previousConnection || !previousConnection) return
+    previousConnection.connect(block.previousConnection)
+    previousConnection = block.nextConnection
+  })
+}
+
+function connectDraftTransformStack(
+  workspace: Blockly.WorkspaceSvg,
+  connection: Blockly.Connection | null,
+  transforms: DraftTransform[]
+) {
+  let previousConnection = connection
+  transforms.forEach((transform) => {
+    const block = createDraftTransformBlock(workspace, transform)
+    if (!block?.previousConnection || !previousConnection) return
+    previousConnection.connect(block.previousConnection)
+    previousConnection = block.nextConnection
+  })
+}
+
 function workspaceToAgentBlocks(workspace: Blockly.WorkspaceSvg): AgentCommandBlock[] {
   const topBlocks = workspace.getTopBlocks(true)
   const root = topBlocks.find((block) => block.type === ROOT_BLOCK_TYPE)
-  const blocks: AgentCommandBlock[] = []
+  return root ? readAgentBlockStack(root.getNextBlock()) : []
+}
 
-  if (root) {
-    appendBlocklyStack(blocks, root.getNextBlock())
-  }
-
-  return blocks
+function workspaceToAgentCommandTrigger(workspace: Blockly.WorkspaceSvg): AgentCommandTrigger {
+  const root = workspace.getTopBlocks(true).find((block) => block.type === ROOT_BLOCK_TYPE)
+  return root ? readAgentCommandTrigger(readBlocklyField(root, 'TRIGGER')) : 'private_command'
 }
 
 function workspaceHasDetachedAgentBlocks(workspace: Blockly.WorkspaceSvg) {
@@ -1030,13 +1481,26 @@ function workspaceHasDetachedAgentBlocks(workspace: Blockly.WorkspaceSvg) {
     .some((block) => block.type !== ROOT_BLOCK_TYPE && isAgentStatementBlock(block))
 }
 
-function appendBlocklyStack(out: AgentCommandBlock[], firstBlock: Blockly.Block | null) {
+function readAgentBlockStack(firstBlock: Blockly.Block | null): AgentCommandBlock[] {
+  const blocks: AgentCommandBlock[] = []
   let currentBlock = firstBlock
   while (currentBlock) {
     const agentBlock = blocklyBlockToAgentBlock(currentBlock)
-    if (agentBlock) out.push(agentBlock)
+    if (agentBlock) blocks.push(agentBlock)
     currentBlock = currentBlock.getNextBlock()
   }
+  return blocks
+}
+
+function readDraftTransformStack(firstBlock: Blockly.Block | null): DraftTransform[] {
+  const transforms: DraftTransform[] = []
+  let currentBlock = firstBlock
+  while (currentBlock) {
+    const transform = blocklyBlockToDraftTransform(currentBlock)
+    if (transform) transforms.push(transform)
+    currentBlock = currentBlock.getNextBlock()
+  }
+  return transforms
 }
 
 function blocklyBlockToAgentBlock(block: Blockly.Block): AgentCommandBlock | null {
@@ -1086,6 +1550,32 @@ function blocklyBlockToAgentBlock(block: Blockly.Block): AgentCommandBlock | nul
           readShortcutScope(readBlocklyField(block, 'SCOPE'))
         ),
       }
+    case IF_BLOCK_TYPE:
+      return {
+        kind: 'if',
+        condition: readRuleConditionInput(block, 'CONDITION'),
+        then_blocks: readAgentBlockStack(block.getInputTargetBlock('THEN')),
+        else_blocks: readAgentBlockStack(block.getInputTargetBlock('ELSE')),
+      }
+    case SET_DRAFT_TRANSFORMS_BLOCK_TYPE:
+      return {
+        kind: 'set_draft_transforms',
+        target: readAgentCommandPostTarget(block),
+        transforms: readDraftTransformStack(block.getInputTargetBlock('TRANSFORMS')),
+      }
+    default:
+      return null
+  }
+}
+
+function blocklyBlockToDraftTransform(block: Blockly.Block): DraftTransform | null {
+  switch (block.type) {
+    case MOVE_BLOCKS_BLOCK_TYPE:
+      return {
+        kind: 'move_blocks',
+        selector: readBlockSelectorInput(block, 'SELECTOR'),
+        position: readPositionSpecInput(block, 'POSITION'),
+      }
     default:
       return null
   }
@@ -1100,6 +1590,9 @@ function isAgentStatementBlock(block: Blockly.Block) {
       INSERT_QUEUE_BLOCK_TYPE,
       REVIEW_ACTION_BLOCK_TYPE,
       GLOBAL_ACTION_BLOCK_TYPE,
+      IF_BLOCK_TYPE,
+      SET_DRAFT_TRANSFORMS_BLOCK_TYPE,
+      MOVE_BLOCKS_BLOCK_TYPE,
     ].includes(block.type)
   )
 }
@@ -1116,6 +1609,10 @@ function blocklyTypeForAgentBlock(block: AgentCommandBlock) {
       return REVIEW_ACTION_BLOCK_TYPE
     case 'execute_global_action':
       return GLOBAL_ACTION_BLOCK_TYPE
+    case 'if':
+      return IF_BLOCK_TYPE
+    case 'set_draft_transforms':
+      return SET_DRAFT_TRANSFORMS_BLOCK_TYPE
     default:
       return BLOCK_TYPE_BY_SIMPLE_KIND[block.kind] ?? null
   }
@@ -1240,6 +1737,7 @@ function buildDefaultAgentCommand(name: string): AppConfigAgentCommand {
     name,
     enabled: true,
     admin_only: false,
+    trigger: 'private_command',
     description: '',
     blocks: [buildDefaultAgentCommandBlock('reply_private_message')],
   }
@@ -1345,6 +1843,19 @@ function buildDefaultAgentCommandBlock(
         kind,
         action: buildDefaultGlobalAction('help'),
       }
+    case 'if':
+      return {
+        kind,
+        condition: defaultRuleCondition(),
+        then_blocks: [],
+        else_blocks: [],
+      }
+    case 'set_draft_transforms':
+      return {
+        kind,
+        target: { target: 'triggering_post' },
+        transforms: [defaultDraftTransform()],
+      }
     case 'send_webhook':
       return {
         kind,
@@ -1389,12 +1900,318 @@ function readShortcutScope(value: string): AgentCommandShortcutScope {
   return value === 'global' ? 'global' : 'review'
 }
 
-function dropdownOptions<T extends string>(options: Array<{ value: T; label: string }>) {
+function readAgentCommandTrigger(value: string | undefined): AgentCommandTrigger {
+  return value === 'submission_received' ? 'submission_received' : 'private_command'
+}
+
+function agentCommandTriggerLabel(trigger: AgentCommandTrigger) {
+  return trigger === 'submission_received' ? '收到新投稿' : '私聊指令'
+}
+
+function readAgentCommandPostTarget(block: Blockly.Block): AgentCommandPostTarget {
+  const target = readBlocklyField(block, 'TARGET')
+  if (target === 'review_code') {
+    return {
+      target: 'review_code',
+      template: readBlocklyTextInput(block, 'REVIEW_CODE').trim(),
+    }
+  }
+  return { target: 'triggering_post' }
+}
+
+function setBlocklyPostTarget(block: Blockly.Block, target: AgentCommandPostTarget) {
+  if (target.target === 'review_code') {
+    setBlocklyField(block, 'TARGET', 'review_code')
+    setBlocklyTextInput(block, 'REVIEW_CODE', target.template)
+  } else {
+    setBlocklyField(block, 'TARGET', 'triggering_post')
+    setBlocklyTextInput(block, 'REVIEW_CODE', '')
+  }
+}
+
+function readRuleConditionInput(block: Blockly.Block, inputName: string): RuleCondition {
+  const targetBlock = block.getInputTargetBlock(inputName)
+  return targetBlock ? blocklyBlockToRuleCondition(targetBlock) : defaultRuleCondition()
+}
+
+function blocklyBlockToRuleCondition(block: Blockly.Block): RuleCondition {
+  switch (block.type) {
+    case CONDITION_HAS_BLOCK_TYPE:
+      return {
+        kind: 'has_block',
+        selector: readBlockSelectorInput(block, 'SELECTOR'),
+      }
+    case CONDITION_COUNT_BLOCK_TYPE: {
+      const selector = readBlockSelectorInput(block, 'SELECTOR')
+      const n = readIntegerField(block, 'N', 1)
+      return readBlocklyField(block, 'OP') === 'at_least'
+        ? { kind: 'block_count_at_least', selector, n }
+        : { kind: 'block_count_equals', selector, n }
+    }
+    case CONDITION_COMPOSITE_BLOCK_TYPE: {
+      const conditions = [
+        readRuleConditionInput(block, 'LEFT'),
+        readRuleConditionInput(block, 'RIGHT'),
+      ]
+      return readBlocklyField(block, 'OP') === 'any'
+        ? { kind: 'any', conditions }
+        : { kind: 'all', conditions }
+    }
+    case CONDITION_NOT_BLOCK_TYPE:
+      return {
+        kind: 'not',
+        condition: readRuleConditionInput(block, 'CONDITION'),
+      }
+    default:
+      return defaultRuleCondition()
+  }
+}
+
+function readBlockSelectorInput(block: Blockly.Block, inputName: string): BlockSelector {
+  const targetBlock = block.getInputTargetBlock(inputName)
+  return targetBlock ? blocklyBlockToBlockSelector(targetBlock) : defaultBlockSelector('paragraph')
+}
+
+function blocklyBlockToBlockSelector(block: Blockly.Block): BlockSelector {
+  if (block.type !== SELECTOR_BLOCK_TYPE) return defaultBlockSelector('paragraph')
+
+  const selector: BlockSelector = {}
+  const kinds = blockKindSelectionToKinds(readBlocklyField(block, 'KIND') as BlockKindSelection)
+  if (kinds) selector.kinds = kinds
+
+  const text = readTextMatcher(block)
+  if (text) selector.text = text
+
+  const index = readIndexFilter(block)
+  if (index) selector.index = index
+
+  return selector
+}
+
+function readPositionSpecInput(block: Blockly.Block, inputName: string): PositionSpec {
+  const targetBlock = block.getInputTargetBlock(inputName)
+  return targetBlock ? blocklyBlockToPositionSpec(targetBlock) : { pos: 'front' }
+}
+
+function blocklyBlockToPositionSpec(block: Blockly.Block): PositionSpec {
+  if (block.type !== POSITION_BLOCK_TYPE) return { pos: 'front' }
+
+  switch (readBlocklyField(block, 'POS') as PositionSelection) {
+    case 'back':
+      return { pos: 'back' }
+    case 'index':
+      return { pos: 'index', n: readIntegerField(block, 'N', 0) }
+    case 'before':
+      return {
+        pos: 'before',
+        selector: readBlockSelectorInput(block, 'SELECTOR'),
+      }
+    case 'after':
+      return {
+        pos: 'after',
+        selector: readBlockSelectorInput(block, 'SELECTOR'),
+      }
+    default:
+      return { pos: 'front' }
+  }
+}
+
+function readTextMatcher(block: Blockly.Block): TextMatcher | null {
+  const mode = readBlocklyField(block, 'TEXT_MODE') as TextMatcherSelection
+  const value = readBlocklyField(block, 'TEXT')
+  switch (mode) {
+    case 'contains':
+      clearBlocklyWarning(block)
+      return { mode, needle: value }
+    case 'starts_with':
+      clearBlocklyWarning(block)
+      return { mode, prefix: value }
+    case 'regex':
+      setRegexWarning(block, value)
+      return { mode, pattern: value }
+    default:
+      clearBlocklyWarning(block)
+      return null
+  }
+}
+
+function readIndexFilter(block: Blockly.Block): IndexFilter | null {
+  switch (readBlocklyField(block, 'INDEX_MODE') as IndexFilterSelection) {
+    case 'first':
+      return { mode: 'first' }
+    case 'last':
+      return { mode: 'last' }
+    case 'nth':
+      return { mode: 'nth', n: readIntegerField(block, 'N', 0) }
+    case 'range':
+      return {
+        mode: 'range',
+        start: readIntegerField(block, 'N', 0),
+        end: readIntegerField(block, 'END', 0),
+      }
+    default:
+      return null
+  }
+}
+
+function blockKindSelectionToKinds(value: BlockKindSelection): BlockKindFilter[] | null {
+  switch (value) {
+    case 'paragraph':
+    case 'reply':
+    case 'poke':
+    case 'json_card':
+    case 'forward':
+      return [value]
+    case 'attachment_any':
+      return [{ attachment: { media_kind: null } }]
+    case 'attachment_image':
+      return [{ attachment: { media_kind: 'Image' } }]
+    case 'attachment_video':
+      return [{ attachment: { media_kind: 'Video' } }]
+    case 'attachment_file':
+      return [{ attachment: { media_kind: 'File' } }]
+    case 'attachment_audio':
+      return [{ attachment: { media_kind: 'Audio' } }]
+    case 'attachment_sticker':
+      return [{ attachment: { media_kind: 'Sticker' } }]
+    default:
+      return null
+  }
+}
+
+function selectorKindSelection(selector: BlockSelector): BlockKindSelection {
+  const firstKind = selector.kinds?.[0]
+  if (!firstKind) return 'any'
+  if (typeof firstKind === 'string') return firstKind as BlockKindSelection
+  const mediaKind = firstKind.attachment.media_kind
+  switch (mediaKind) {
+    case 'Image':
+      return 'attachment_image'
+    case 'Video':
+      return 'attachment_video'
+    case 'File':
+      return 'attachment_file'
+    case 'Audio':
+      return 'attachment_audio'
+    case 'Sticker':
+      return 'attachment_sticker'
+    default:
+      return 'attachment_any'
+  }
+}
+
+function textMatcherSelection(matcher: TextMatcher | null): TextMatcherSelection {
+  return matcher?.mode ?? 'none'
+}
+
+function textMatcherValue(matcher: TextMatcher | null) {
+  switch (matcher?.mode) {
+    case 'contains':
+      return matcher.needle
+    case 'starts_with':
+      return matcher.prefix
+    case 'regex':
+      return matcher.pattern
+    default:
+      return ''
+  }
+}
+
+function indexFilterSelection(index: IndexFilter | null): IndexFilterSelection {
+  return index?.mode ?? 'all'
+}
+
+function indexFilterStart(index: IndexFilter | null) {
+  switch (index?.mode) {
+    case 'nth':
+      return String(index.n)
+    case 'range':
+      return String(index.start)
+    default:
+      return '0'
+  }
+}
+
+function indexFilterEnd(index: IndexFilter | null) {
+  return index?.mode === 'range' ? String(index.end) : '0'
+}
+
+function normalizeBinaryConditions(
+  kind: 'all' | 'any',
+  conditions: RuleCondition[]
+): [RuleCondition, RuleCondition] {
+  if (conditions.length === 0) return [defaultRuleCondition(), defaultRuleCondition()]
+  if (conditions.length === 1) return [conditions[0], defaultRuleCondition()]
+  if (conditions.length === 2) return [conditions[0], conditions[1]]
+  return [conditions[0], { kind, conditions: conditions.slice(1) }]
+}
+
+function defaultRuleCondition(): RuleCondition {
+  return {
+    kind: 'block_count_equals',
+    selector: defaultBlockSelector('paragraph'),
+    n: 1,
+  }
+}
+
+function defaultBlockSelector(kind: BlockKindSelection): BlockSelector {
+  const selector: BlockSelector = {}
+  const kinds = blockKindSelectionToKinds(kind)
+  if (kinds) selector.kinds = kinds
+  return selector
+}
+
+function defaultDraftTransform(): DraftTransform {
+  return {
+    kind: 'move_blocks',
+    selector: defaultBlockSelector('paragraph'),
+    position: { pos: 'front' },
+  }
+}
+
+function readIntegerField(block: Blockly.Block, fieldName: string, fallback: number) {
+  const parsed = Number.parseInt(readBlocklyField(block, fieldName), 10)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function setRegexWarning(block: Blockly.Block, pattern: string) {
+  try {
+    new RegExp(pattern)
+    clearBlocklyWarning(block)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '正则表达式无效'
+    setBlocklyWarning(block, `正则表达式无效：${message}`)
+  }
+}
+
+function clearBlocklyWarning(block: Blockly.Block) {
+  setBlocklyWarning(block, null)
+}
+
+function setBlocklyWarning(block: Blockly.Block, warning: string | null) {
+  ;(block as Blockly.Block & { setWarningText?: (text: string | null) => void }).setWarningText?.(
+    warning
+  )
+}
+
+function dropdownOptions<T extends string>(options: ReadonlyArray<{ value: T; label: string }>) {
   return options.map((option) => [option.label, option.value])
 }
 
 function textValueArg(name: string) {
   return { type: 'input_value', name, check: 'String' }
+}
+
+function selectorValueArg(name: string) {
+  return { type: 'input_value', name, check: 'BlockSelector' }
+}
+
+function positionValueArg(name: string) {
+  return { type: 'input_value', name, check: 'PositionSpec' }
+}
+
+function conditionValueArg(name: string) {
+  return { type: 'input_value', name, check: 'RuleCondition' }
 }
 
 function textInputShadows(values: Record<string, string>) {
@@ -1408,6 +2225,39 @@ function textInputShadow(value: string) {
     shadow: {
       type: TEXT_LITERAL_BLOCK_TYPE,
       fields: { TEXT: value },
+    },
+  }
+}
+
+function selectorInputShadow(kind: BlockKindSelection) {
+  return {
+    shadow: {
+      type: SELECTOR_BLOCK_TYPE,
+      fields: { KIND: kind, TEXT_MODE: 'none', INDEX_MODE: 'all', N: '0', END: '0' },
+    },
+  }
+}
+
+function positionInputShadow(pos: PositionSelection) {
+  return {
+    shadow: {
+      type: POSITION_BLOCK_TYPE,
+      fields: { POS: pos, N: '0' },
+      inputs: {
+        SELECTOR: selectorInputShadow('paragraph'),
+      },
+    },
+  }
+}
+
+function conditionInputShadow() {
+  return {
+    shadow: {
+      type: CONDITION_COUNT_BLOCK_TYPE,
+      fields: { OP: 'equals', N: '1' },
+      inputs: {
+        SELECTOR: selectorInputShadow('paragraph'),
+      },
     },
   }
 }
@@ -1427,6 +2277,31 @@ function setBlocklyTextInput(block: Blockly.Block, inputName: string, value: str
   textBlock.render()
   if (textBlock.outputConnection) {
     connection.connect(textBlock.outputConnection)
+  }
+}
+
+function setBlocklySelectorInput(block: Blockly.Block, inputName: string, selector: BlockSelector) {
+  setBlocklyOutputInput(block, inputName, createSelectorBlock(block.workspace, selector))
+}
+
+function setBlocklyPositionInput(block: Blockly.Block, inputName: string, position: PositionSpec) {
+  setBlocklyOutputInput(block, inputName, createPositionBlock(block.workspace, position))
+}
+
+function setBlocklyConditionInput(block: Blockly.Block, inputName: string, condition: RuleCondition) {
+  setBlocklyOutputInput(block, inputName, createConditionBlock(block.workspace, condition))
+}
+
+function setBlocklyOutputInput(block: Blockly.Block, inputName: string, valueBlock: Blockly.Block) {
+  const connection = block.getInput(inputName)?.connection
+  if (!connection) {
+    valueBlock.dispose(false)
+    return
+  }
+
+  connection.targetBlock()?.dispose(false)
+  if (valueBlock.outputConnection) {
+    connection.connect(valueBlock.outputConnection)
   }
 }
 

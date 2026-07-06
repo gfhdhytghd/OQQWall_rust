@@ -8,18 +8,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use oqqwall_rust_core::command::{
-    GlobalAction, GlobalActionBatchCommand, GlobalActionCommand, ReviewAction,
-    ReviewActionBatchCommand, ReviewActionCommand, ShortcutScope,
+    GlobalAction, GlobalActionBatchCommand, GlobalActionCommand, PostAction, PostActionCommand,
+    ReviewAction, ReviewActionBatchCommand, ReviewActionCommand, ShortcutScope,
 };
 use oqqwall_rust_core::draft::{
-    IngressAttachment, IngressMessage, IngressRouteMeta, MediaKind, MediaReference, ReplyPreview,
-    json_card_marker, poke_marker, reply_marker,
+    Draft, IngressAttachment, IngressMessage, IngressRouteMeta, MediaKind, MediaReference,
+    ReplyPreview, json_card_marker, poke_marker, reply_marker,
+};
+use oqqwall_rust_core::draft_transform::{
+    DraftTransform, RuleCondition, evaluate_condition, validate_condition, validate_transform,
 };
 use oqqwall_rust_core::event::{
-    BlobEvent, DraftEvent, Event, IngressEvent, InputStatusKind, MediaEvent, ReviewDecision,
-    ReviewEvent, ScheduleEvent, SendEvent, SendPriority,
+    BlobEvent, DraftEvent, Event, IngressEvent, InputStatusKind, LifecycleEvent, MediaEvent,
+    ReviewDecision, ReviewEvent, ScheduleEvent, SendEvent, SendPriority,
 };
 use oqqwall_rust_core::ids::{BlobId, ExternalCode, IngressId, PostId, ReviewCode, ReviewId};
+use oqqwall_rust_core::state::PostStage;
 use oqqwall_rust_core::{Command, IngressCommand, StateView, derive_blob_id, derive_ingress_id};
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use std::path::{Path, PathBuf};
@@ -202,12 +206,22 @@ fn agent_command_enabled_default() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommandTrigger {
+    #[default]
+    PrivateCommand,
+    SubmissionReceived,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCommandConfig {
     #[serde(default = "agent_command_enabled_default")]
     pub enabled: bool,
     #[serde(default)]
     pub admin_only: bool,
+    #[serde(default)]
+    pub trigger: AgentCommandTrigger,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -219,6 +233,7 @@ impl Default for AgentCommandConfig {
         Self {
             enabled: true,
             admin_only: false,
+            trigger: AgentCommandTrigger::PrivateCommand,
             description: String::new(),
             blocks: Vec::new(),
         }
@@ -352,6 +367,16 @@ pub enum AgentCommandGlobalAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case")]
+pub enum AgentCommandPostTarget {
+    TriggeringPost,
+    ReviewCode {
+        #[serde(default)]
+        template: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentCommandBlock {
     ReplyPrivateMessage {
@@ -382,6 +407,18 @@ pub enum AgentCommandBlock {
     },
     ExecuteGlobalAction {
         action: AgentCommandGlobalAction,
+    },
+    If {
+        condition: RuleCondition,
+        #[serde(default)]
+        then_blocks: Vec<AgentCommandBlock>,
+        #[serde(default)]
+        else_blocks: Vec<AgentCommandBlock>,
+    },
+    SetDraftTransforms {
+        target: AgentCommandPostTarget,
+        #[serde(default)]
+        transforms: Vec<DraftTransform>,
     },
     SendWebhook {
         #[serde(default)]
@@ -415,6 +452,7 @@ pub fn normalize_agent_command_config(config: &AgentCommandConfig) -> AgentComma
     AgentCommandConfig {
         enabled: config.enabled,
         admin_only: config.admin_only,
+        trigger: config.trigger,
         description: config.description.trim().to_string(),
         blocks: config
             .blocks
@@ -436,7 +474,7 @@ pub fn validate_agent_command_config(
         ));
     }
     for (index, block) in config.blocks.iter().enumerate() {
-        validate_agent_command_block(&normalized_name, index, block)?;
+        validate_agent_command_block(&normalized_name, config.trigger, index, block, 0)?;
     }
     Ok(())
 }
@@ -478,6 +516,27 @@ fn normalize_agent_command_block(block: &AgentCommandBlock) -> AgentCommandBlock
                 action: normalize_agent_command_global_action(action),
             }
         }
+        AgentCommandBlock::If {
+            condition,
+            then_blocks,
+            else_blocks,
+        } => AgentCommandBlock::If {
+            condition: condition.clone(),
+            then_blocks: then_blocks
+                .iter()
+                .map(normalize_agent_command_block)
+                .collect(),
+            else_blocks: else_blocks
+                .iter()
+                .map(normalize_agent_command_block)
+                .collect(),
+        },
+        AgentCommandBlock::SetDraftTransforms { target, transforms } => {
+            AgentCommandBlock::SetDraftTransforms {
+                target: normalize_agent_command_post_target(target),
+                transforms: transforms.clone(),
+            }
+        }
         AgentCommandBlock::SendWebhook {
             url,
             source_webhook,
@@ -490,6 +549,15 @@ fn normalize_agent_command_block(block: &AgentCommandBlock) -> AgentCommandBlock
             text_template: text_template.replace("\r\n", "\n"),
             tags: normalize_agent_command_values(tags),
             images: normalize_agent_command_values(images),
+        },
+    }
+}
+
+fn normalize_agent_command_post_target(target: &AgentCommandPostTarget) -> AgentCommandPostTarget {
+    match target {
+        AgentCommandPostTarget::TriggeringPost => AgentCommandPostTarget::TriggeringPost,
+        AgentCommandPostTarget::ReviewCode { template } => AgentCommandPostTarget::ReviewCode {
+            template: template.trim().to_string(),
         },
     }
 }
@@ -619,16 +687,44 @@ fn normalize_agent_command_global_action(
 
 fn validate_agent_command_block(
     command_name: &str,
+    trigger: AgentCommandTrigger,
     index: usize,
     block: &AgentCommandBlock,
+    depth: usize,
 ) -> Result<(), String> {
+    if depth > 8 {
+        return Err(format!(
+            "agent_commands['{}'] 的第 {} 个积木嵌套过深",
+            command_name,
+            index + 1
+        ));
+    }
     match block {
         AgentCommandBlock::ReplyPrivateMessage { .. }
         | AgentCommandBlock::StartSubmissionSession
         | AgentCommandBlock::FinishSubmissionSession
         | AgentCommandBlock::ResumeSubmissionSession
         | AgentCommandBlock::SubmitSubmissionSession
-        | AgentCommandBlock::CancelSubmissionSession => Ok(()),
+        | AgentCommandBlock::CancelSubmissionSession => {
+            if trigger == AgentCommandTrigger::SubmissionReceived
+                && matches!(
+                    block,
+                    AgentCommandBlock::StartSubmissionSession
+                        | AgentCommandBlock::FinishSubmissionSession
+                        | AgentCommandBlock::ResumeSubmissionSession
+                        | AgentCommandBlock::SubmitSubmissionSession
+                        | AgentCommandBlock::CancelSubmissionSession
+                )
+            {
+                Err(format!(
+                    "agent_commands['{}'] 的第 {} 个积木仅可用于私聊触发的指令",
+                    command_name,
+                    index + 1
+                ))
+            } else {
+                Ok(())
+            }
+        }
         AgentCommandBlock::InsertQueuedPost {
             moving_post_code,
             anchor_post_code,
@@ -651,6 +747,13 @@ fn validate_agent_command_block(
             review_code,
             action,
         } => {
+            if trigger == AgentCommandTrigger::SubmissionReceived {
+                return Err(format!(
+                    "agent_commands['{}'] 的第 {} 个积木仅可用于私聊触发的指令",
+                    command_name,
+                    index + 1
+                ));
+            }
             validate_agent_command_required_field(
                 command_name,
                 index,
@@ -661,6 +764,73 @@ fn validate_agent_command_block(
         }
         AgentCommandBlock::ExecuteGlobalAction { action } => {
             validate_agent_command_global_action(command_name, index, action)
+        }
+        AgentCommandBlock::If {
+            condition,
+            then_blocks,
+            else_blocks,
+        } => {
+            if trigger != AgentCommandTrigger::SubmissionReceived {
+                return Err(format!(
+                    "agent_commands['{}'] 的第 {} 个积木仅可用于收到新投稿触发的指令",
+                    command_name,
+                    index + 1
+                ));
+            }
+            validate_condition(condition).map_err(|err| {
+                format!(
+                    "agent_commands['{}'] 的第 {} 个积木条件无效: {}",
+                    command_name,
+                    index + 1,
+                    err
+                )
+            })?;
+            for (child_index, block) in then_blocks.iter().enumerate() {
+                validate_agent_command_block(command_name, trigger, child_index, block, depth + 1)?;
+            }
+            for (child_index, block) in else_blocks.iter().enumerate() {
+                validate_agent_command_block(command_name, trigger, child_index, block, depth + 1)?;
+            }
+            Ok(())
+        }
+        AgentCommandBlock::SetDraftTransforms { target, transforms } => {
+            if transforms.is_empty() {
+                return Err(format!(
+                    "agent_commands['{}'] 的第 {} 个积木缺少稿件变换规则",
+                    command_name,
+                    index + 1
+                ));
+            }
+            match target {
+                AgentCommandPostTarget::TriggeringPost => {
+                    if trigger != AgentCommandTrigger::SubmissionReceived {
+                        return Err(format!(
+                            "agent_commands['{}'] 的第 {} 个积木的当前触发稿件目标仅可用于收到新投稿触发的指令",
+                            command_name,
+                            index + 1
+                        ));
+                    }
+                }
+                AgentCommandPostTarget::ReviewCode { template } => {
+                    validate_agent_command_required_field(
+                        command_name,
+                        index,
+                        "稿件编号",
+                        template,
+                    )?;
+                }
+            }
+            for transform in transforms {
+                validate_transform(transform).map_err(|err| {
+                    format!(
+                        "agent_commands['{}'] 的第 {} 个积木变换规则无效: {}",
+                        command_name,
+                        index + 1,
+                        err
+                    )
+                })?;
+            }
+            Ok(())
         }
         AgentCommandBlock::SendWebhook { url, .. } => {
             if url.trim().is_empty() {
@@ -1003,7 +1173,9 @@ struct NapCatState {
     ingress_summary: HashMap<IngressId, IngressSummary>,
     pending_summary: HashMap<IngressId, String>,
     post_ingress: HashMap<PostId, Vec<IngressId>>,
+    post_draft: HashMap<PostId, Draft>,
     post_group: HashMap<PostId, String>,
+    post_stage: HashMap<PostId, PostStage>,
     post_created_at_ms: HashMap<PostId, i64>,
     post_safe: HashMap<PostId, bool>,
     post_review_id: HashMap<PostId, ReviewId>,
@@ -1095,8 +1267,12 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
     for (post_id, ingress_ids) in &view.post_ingress {
         state.post_ingress.insert(*post_id, ingress_ids.clone());
     }
+    for (post_id, draft) in &view.drafts {
+        state.post_draft.insert(*post_id, draft.clone());
+    }
     for (post_id, post) in &view.posts {
         state.post_group.insert(*post_id, post.group_id.clone());
+        state.post_stage.insert(*post_id, post.stage);
         state
             .post_created_at_ms
             .insert(*post_id, post.created_at_ms);
@@ -1186,6 +1362,57 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
         }
     }
     state
+}
+
+fn evict_napcat_post_cache(state: &mut NapCatState, post_id: PostId, ingress_ids: &[IngressId]) {
+    state.post_draft.remove(&post_id);
+    state.post_group.remove(&post_id);
+    state.post_stage.remove(&post_id);
+    state.post_created_at_ms.remove(&post_id);
+    state.post_safe.remove(&post_id);
+    state.post_external_code.remove(&post_id);
+    state.send_plans.remove(&post_id);
+    state.sending.remove(&post_id);
+
+    if let Some(review_id) = state.post_review_id.remove(&post_id) {
+        if let Some(info) = state.review_info.remove(&review_id) {
+            state.review_by_code.remove(&info.review_code);
+        }
+        state.review_publish_attempts.remove(&review_id);
+        state.review_submitter.remove(&review_id);
+        state.processed_reviews.remove(&review_id);
+        state
+            .audit_msg_to_review
+            .retain(|_, value| *value != review_id);
+    }
+    if let Some(review_code) = state.post_review_code.remove(&post_id) {
+        state.review_by_code.remove(&review_code);
+    }
+
+    let removed_ingress = state
+        .post_ingress
+        .remove(&post_id)
+        .unwrap_or_else(|| ingress_ids.to_vec());
+    for ingress_id in removed_ingress {
+        let still_referenced = state
+            .post_ingress
+            .values()
+            .any(|ids| ids.contains(&ingress_id));
+        if !still_referenced {
+            state.ingress_summary.remove(&ingress_id);
+            state.pending_summary.remove(&ingress_id);
+        }
+    }
+}
+
+fn delete_persisted_blob_file(path: &str) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            debug_log!("blob gc remove failed: path={} error={}", path, err);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1566,7 +1793,7 @@ async fn run_napcat_session(
         send_group_text(&out_tx, startup_group_id, "系统已启动").await;
     }
 
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             if ws_write
                 .send(tokio_tungstenite::tungstenite::Message::Text(msg))
@@ -1584,7 +1811,7 @@ async fn run_napcat_session(
     let state_read = Arc::clone(&state_ref);
     let out_tx_read = out_tx.clone();
     let account_id_read = account_id.clone();
-    let reader = tokio::spawn(async move {
+    let mut reader = tokio::spawn(async move {
         while let Some(msg) = ws_read.next().await {
             let msg = match msg {
                 Ok(msg) => msg,
@@ -1635,8 +1862,9 @@ async fn run_napcat_session(
     let state_bus = Arc::clone(&state_ref);
     let runtime_bus = runtime.clone();
     let out_tx_bus = out_tx.clone();
+    let cmd_tx_bus = cmd_tx.clone();
     let account_id_bus = account_id.clone();
-    let bus_task = tokio::spawn(async move {
+    let mut bus_task = tokio::spawn(async move {
         loop {
             let env = match bus_task_rx.recv().await {
                 Ok(env) => env,
@@ -1647,6 +1875,7 @@ async fn run_napcat_session(
             let action = build_action_from_event(
                 &runtime_bus,
                 &state_bus,
+                &cmd_tx_bus,
                 &out_tx_bus,
                 &account_id_bus,
                 env.ts_ms,
@@ -1667,6 +1896,16 @@ async fn run_napcat_session(
         }
     });
 
+    // A closed WebSocket reader must tear down the whole session; otherwise
+    // reconnects are treated as duplicate accounts until the app restarts.
+    tokio::select! {
+        _ = &mut writer => {}
+        _ = &mut reader => {}
+        _ = &mut bus_task => {}
+    }
+    writer.abort();
+    reader.abort();
+    bus_task.abort();
     let _ = tokio::join!(writer, reader, bus_task);
     unregister_ws_session(&account_id);
     notify_account_online_change(&runtime, &account_id, false).await;
@@ -1931,6 +2170,7 @@ pub async fn napcat_ws_request(
 async fn build_action_from_event(
     runtime: &NapCatRuntimeConfig,
     state: &Arc<Mutex<NapCatState>>,
+    cmd_tx: &mpsc::Sender<Command>,
     out_tx: &mpsc::Sender<String>,
     account_id: &str,
     event_timestamp_ms: i64,
@@ -1995,13 +2235,44 @@ async fn build_action_from_event(
             group_id,
             is_safe,
             created_at_ms,
+            draft,
+            ..
+        }) => {
+            let is_new_post = {
+                let mut guard = state.lock().await;
+                let is_new_post = !guard.post_ingress.contains_key(&post_id);
+                guard.post_ingress.insert(post_id, ingress_ids);
+                guard.post_draft.insert(post_id, draft);
+                guard.post_group.insert(post_id, group_id);
+                guard.post_stage.insert(post_id, PostStage::Drafted);
+                guard.post_created_at_ms.insert(post_id, created_at_ms);
+                guard.post_safe.insert(post_id, is_safe);
+                is_new_post
+            };
+            if is_new_post {
+                spawn_submission_agent_commands(
+                    runtime,
+                    state,
+                    cmd_tx,
+                    out_tx,
+                    account_id,
+                    post_id,
+                    event_timestamp_ms,
+                )
+                .await;
+            }
+            None
+        }
+        Event::Draft(DraftEvent::DraftTransformsSet { .. }) => None,
+        Event::Lifecycle(LifecycleEvent::PostEvicted {
+            post_id,
+            blob_ids,
+            ingress_ids,
             ..
         }) => {
             let mut guard = state.lock().await;
-            guard.post_ingress.insert(post_id, ingress_ids);
-            guard.post_group.insert(post_id, group_id);
-            guard.post_created_at_ms.insert(post_id, created_at_ms);
-            guard.post_safe.insert(post_id, is_safe);
+            evict_napcat_post_cache(&mut guard, post_id, &ingress_ids);
+            blob_cache::release_many(blob_ids);
             None
         }
         Event::Review(ReviewEvent::ReviewInfoSynced {
@@ -2026,6 +2297,7 @@ async fn build_action_from_event(
             guard.post_review_id.insert(post_id, review_id);
             guard.review_by_code.insert(review_code, review_id);
             guard.post_review_code.insert(post_id, review_code);
+            guard.post_stage.insert(post_id, PostStage::ReviewPending);
             if let Some(user_id) = resolve_post_submitter(&guard, post_id) {
                 guard.review_submitter.insert(review_id, user_id);
             }
@@ -2049,10 +2321,21 @@ async fn build_action_from_event(
             guard.blob_paths.insert(blob_id, path.clone());
             None
         }
-        Event::Blob(BlobEvent::BlobReleased { blob_id })
-        | Event::Blob(BlobEvent::BlobGcRequested { blob_id }) => {
+        Event::Blob(BlobEvent::BlobReleased { blob_id }) => {
             let mut guard = state.lock().await;
             guard.blob_paths.remove(&blob_id);
+            blob_cache::release(blob_id);
+            None
+        }
+        Event::Blob(BlobEvent::BlobGcRequested { blob_id }) => {
+            let path = {
+                let mut guard = state.lock().await;
+                guard.blob_paths.remove(&blob_id)
+            };
+            blob_cache::release(blob_id);
+            if let Some(path) = path {
+                delete_persisted_blob_file(&path);
+            }
             None
         }
         Event::Review(ReviewEvent::ReviewItemCreated {
@@ -2083,6 +2366,7 @@ async fn build_action_from_event(
             guard.post_review_id.insert(post_id, review_id);
             guard.review_by_code.insert(review_code, review_id);
             guard.post_review_code.insert(post_id, review_code);
+            guard.post_stage.insert(post_id, PostStage::ReviewPending);
             if let Some(user_id) = resolve_post_submitter(&guard, post_id) {
                 guard.review_submitter.insert(review_id, user_id);
             }
@@ -2192,6 +2476,16 @@ async fn build_action_from_event(
                     info.decision = Some(decision);
                     info.decided_by = Some(decided_by.clone());
                     info.decided_at_ms = Some(decided_at_ms);
+                }
+                if let Some(post_id) = guard.review_info.get(&review_id).map(|info| info.post_id) {
+                    let stage = match decision {
+                        ReviewDecision::Approved => PostStage::Reviewed,
+                        ReviewDecision::Rejected => PostStage::Rejected,
+                        ReviewDecision::Deferred => PostStage::ReviewPending,
+                        ReviewDecision::Skipped => PostStage::Skipped,
+                        ReviewDecision::Deleted => PostStage::Deleted,
+                    };
+                    guard.post_stage.insert(post_id, stage);
                 }
                 match decision {
                     ReviewDecision::Approved
@@ -2481,6 +2775,7 @@ async fn build_action_from_event(
                         seq,
                     },
                 );
+                guard.post_stage.insert(post_id, PostStage::Scheduled);
                 let queue_event_ms = guard
                     .post_review_id
                     .get(&post_id)
@@ -2646,6 +2941,7 @@ async fn build_action_from_event(
                     seq,
                 },
             );
+            guard.post_stage.insert(post_id, PostStage::Scheduled);
             None
         }
         Event::Schedule(ScheduleEvent::SendPlanCanceled { post_id }) => {
@@ -2678,6 +2974,7 @@ async fn build_action_from_event(
                 );
                 let batch_label = post_batch_label(&guard, &batch_posts);
                 for batch_post_id in batch_posts {
+                    guard.post_stage.insert(batch_post_id, PostStage::Sending);
                     guard.sending.insert(
                         batch_post_id,
                         SendingInfo {
@@ -2724,6 +3021,7 @@ async fn build_action_from_event(
             let (group_id, submitter_id, context) = {
                 let mut guard = state.lock().await;
                 let sending_info = guard.sending.remove(&post_id);
+                guard.post_stage.insert(post_id, PostStage::Sent);
                 let group_id = sending_info
                     .as_ref()
                     .map(|info| info.group_id.clone())
@@ -2857,6 +3155,7 @@ async fn build_action_from_event(
             let (group_id, label) = {
                 let mut guard = state.lock().await;
                 let sending_info = guard.sending.remove(&post_id);
+                guard.post_stage.insert(post_id, PostStage::Failed);
                 if let Some(ref info) = sending_info {
                     let extra_ids = guard
                         .sending
@@ -2907,6 +3206,7 @@ async fn build_action_from_event(
             let (group_id, label) = {
                 let mut guard = state.lock().await;
                 let sending_info = guard.sending.remove(&post_id);
+                guard.post_stage.insert(post_id, PostStage::Failed);
                 if let Some(ref info) = sending_info {
                     let extra_ids = guard
                         .sending
@@ -5972,6 +6272,37 @@ struct AgentCommandTemplateContext {
     previous_post_info: String,
     previous_post_created_at: String,
     previous_post_created_timestamp_ms: String,
+    submission_post_id: String,
+    submission_sender_id: String,
+    submission_sender_name: String,
+    submission_message_count: String,
+    submission_image_count: String,
+    submission_text_message_count: String,
+    submission_is_multi_image_single_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct AgentCommandExecutionMeta {
+    trigger: AgentCommandTrigger,
+    submission_post_id: Option<PostId>,
+    user_id: String,
+    sender_name: Option<String>,
+    account_id: String,
+    raw_message: String,
+    message_text: String,
+    command_args: String,
+    timestamp_ms: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SubmissionTemplateData {
+    post_id: String,
+    sender_id: String,
+    sender_name: String,
+    message_count: String,
+    image_count: String,
+    text_message_count: String,
+    is_multi_image_single_text: String,
 }
 
 fn find_latest_sender_post(state: &NapCatState, group_id: &str, sender_id: &str) -> Option<PostId> {
@@ -6028,6 +6359,7 @@ async fn build_agent_command_context(
     sender_name: Option<&str>,
     account_id: &str,
     timestamp_ms: i64,
+    submission_post_id: Option<PostId>,
 ) -> AgentCommandTemplateContext {
     let (
         submission_session_active,
@@ -6039,6 +6371,7 @@ async fn build_agent_command_context(
         previous_post_info,
         previous_post_created_at,
         previous_post_created_timestamp_ms,
+        submission_data,
     ) = {
         let guard = state.lock().await;
         let (submission_session_active, submission_session_message_count) =
@@ -6075,6 +6408,9 @@ async fn build_agent_command_context(
         } else {
             String::new()
         };
+        let submission_data = submission_post_id
+            .map(|post_id| build_submission_template_data(&guard, post_id))
+            .unwrap_or_default();
         (
             submission_session_active,
             submission_session_message_count,
@@ -6089,6 +6425,7 @@ async fn build_agent_command_context(
             } else {
                 String::new()
             },
+            submission_data,
         )
     };
     AgentCommandTemplateContext {
@@ -6112,6 +6449,57 @@ async fn build_agent_command_context(
         previous_post_info,
         previous_post_created_at,
         previous_post_created_timestamp_ms,
+        submission_post_id: submission_data.post_id,
+        submission_sender_id: submission_data.sender_id,
+        submission_sender_name: submission_data.sender_name,
+        submission_message_count: submission_data.message_count,
+        submission_image_count: submission_data.image_count,
+        submission_text_message_count: submission_data.text_message_count,
+        submission_is_multi_image_single_text: submission_data.is_multi_image_single_text,
+    }
+}
+
+fn build_submission_template_data(state: &NapCatState, post_id: PostId) -> SubmissionTemplateData {
+    let ingress_ids = state
+        .post_ingress
+        .get(&post_id)
+        .cloned()
+        .unwrap_or_default();
+    let (sender_id, sender_name) = ingress_ids
+        .first()
+        .and_then(|ingress_id| state.ingress_summary.get(ingress_id))
+        .map(|summary| {
+            (
+                summary.user_id.clone(),
+                summary.sender_name.clone().unwrap_or_default(),
+            )
+        })
+        .unwrap_or_default();
+    let mut image_count = 0usize;
+    let mut text_message_count = 0usize;
+    for ingress_id in &ingress_ids {
+        let Some(summary) = state.ingress_summary.get(ingress_id) else {
+            continue;
+        };
+        if !summary.text.trim().is_empty() && summary.attachments.is_empty() {
+            text_message_count = text_message_count.saturating_add(1);
+        }
+        image_count = image_count.saturating_add(
+            summary
+                .attachments
+                .iter()
+                .filter(|attachment| attachment.kind == MediaKind::Image)
+                .count(),
+        );
+    }
+    SubmissionTemplateData {
+        post_id: post_id.0.to_string(),
+        sender_id,
+        sender_name,
+        message_count: ingress_ids.len().to_string(),
+        image_count: image_count.to_string(),
+        text_message_count: text_message_count.to_string(),
+        is_multi_image_single_text: (image_count >= 2 && text_message_count == 1).to_string(),
     }
 }
 
@@ -6166,6 +6554,15 @@ fn agent_command_variable_value(
         "previous_post_created_at" => Some(context.previous_post_created_at.clone()),
         "previous_post_created_timestamp_ms" => {
             Some(context.previous_post_created_timestamp_ms.clone())
+        }
+        "submission_post_id" => Some(context.submission_post_id.clone()),
+        "submission_sender_id" => Some(context.submission_sender_id.clone()),
+        "submission_sender_name" => Some(context.submission_sender_name.clone()),
+        "submission_message_count" => Some(context.submission_message_count.clone()),
+        "submission_image_count" => Some(context.submission_image_count.clone()),
+        "submission_text_message_count" => Some(context.submission_text_message_count.clone()),
+        "submission_is_multi_image_single_text" => {
+            Some(context.submission_is_multi_image_single_text.clone())
         }
         _ => None,
     }
@@ -6932,6 +7329,9 @@ fn private_agent_command_match_with_state(
     if !command.enabled {
         return PrivateAgentCommandMatch::NoMatch;
     }
+    if command.trigger != AgentCommandTrigger::PrivateCommand {
+        return PrivateAgentCommandMatch::NoMatch;
+    }
     if is_blacklisted_agent_command_sender(state, runtime, user_id) {
         return PrivateAgentCommandMatch::IgnoredBlacklisted;
     }
@@ -6999,6 +7399,80 @@ fn spawn_private_agent_command(
     });
 }
 
+async fn spawn_submission_agent_commands(
+    runtime: &NapCatRuntimeConfig,
+    state: &Arc<Mutex<NapCatState>>,
+    cmd_tx: &mpsc::Sender<Command>,
+    out_tx: &mpsc::Sender<String>,
+    account_id: &str,
+    post_id: PostId,
+    timestamp_ms: i64,
+) {
+    let mut commands = {
+        let guard = runtime
+            .agent_commands
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        guard
+            .iter()
+            .filter(|(_, command)| {
+                command.enabled && command.trigger == AgentCommandTrigger::SubmissionReceived
+            })
+            .map(|(name, command)| (name.clone(), command.clone()))
+            .collect::<Vec<_>>()
+    };
+    commands.sort_by(|left, right| left.0.cmp(&right.0));
+    for (command_name, command) in commands {
+        spawn_submission_agent_command(
+            runtime.clone(),
+            Arc::clone(state),
+            cmd_tx.clone(),
+            out_tx.clone(),
+            account_id.to_string(),
+            post_id,
+            command_name,
+            command,
+            timestamp_ms,
+        );
+    }
+}
+
+fn spawn_submission_agent_command(
+    runtime: NapCatRuntimeConfig,
+    state: Arc<Mutex<NapCatState>>,
+    cmd_tx: mpsc::Sender<Command>,
+    out_tx: mpsc::Sender<String>,
+    account_id: String,
+    post_id: PostId,
+    command_name: String,
+    command: AgentCommandConfig,
+    timestamp_ms: i64,
+) {
+    tokio::spawn(async move {
+        let result = execute_submission_agent_command(
+            &runtime,
+            &state,
+            &cmd_tx,
+            &out_tx,
+            &account_id,
+            post_id,
+            &command_name,
+            command,
+            timestamp_ms,
+        )
+        .await;
+        if let Err(err) = result {
+            debug_log!(
+                "submission agent command failed group_id={} post_id={} command={} err={}",
+                runtime.group_id,
+                post_id.0,
+                command_name,
+                err
+            );
+        }
+    });
+}
+
 fn agent_command_client() -> &'static Client {
     AGENT_WEBHOOK_CLIENT.get_or_init(|| {
         Client::builder()
@@ -7006,6 +7480,384 @@ fn agent_command_client() -> &'static Client {
             .build()
             .unwrap_or_else(|_| Client::new())
     })
+}
+
+async fn execute_agent_command_blocks(
+    runtime: &NapCatRuntimeConfig,
+    state: &Arc<Mutex<NapCatState>>,
+    cmd_tx: &mpsc::Sender<Command>,
+    out_tx: &mpsc::Sender<String>,
+    settings: UserNotificationSettings,
+    command_name: String,
+    blocks: Vec<AgentCommandBlock>,
+    meta: AgentCommandExecutionMeta,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 8 {
+        return Err("agent 指令积木嵌套过深".to_string());
+    }
+    for block in blocks {
+        let context = build_agent_command_context(
+            state,
+            runtime,
+            &command_name,
+            &meta.command_args,
+            &meta.raw_message,
+            &meta.message_text,
+            &meta.user_id,
+            meta.sender_name.as_deref(),
+            &meta.account_id,
+            meta.timestamp_ms,
+            meta.submission_post_id,
+        )
+        .await;
+        match block {
+            AgentCommandBlock::ReplyPrivateMessage {
+                text_template,
+                tags,
+                images,
+            } => {
+                let message = build_agent_command_message(
+                    &settings,
+                    &text_template,
+                    &tags,
+                    &images,
+                    &context,
+                );
+                if !message.is_empty() {
+                    send_private_segments(out_tx, &meta.user_id, message).await;
+                }
+            }
+            AgentCommandBlock::StartSubmissionSession => {
+                ensure_private_agent_block(meta.trigger)?;
+                let mut guard = state.lock().await;
+                guard.submission_sessions.insert(
+                    meta.user_id.clone(),
+                    SubmissionSession {
+                        messages: Vec::new(),
+                        started_at_ms: meta.timestamp_ms,
+                        group_id: runtime.group_id.clone(),
+                        confirming: false,
+                    },
+                );
+            }
+            AgentCommandBlock::FinishSubmissionSession => {
+                ensure_private_agent_block(meta.trigger)?;
+                let mut guard = state.lock().await;
+                if let Some(session) = guard.submission_sessions.get_mut(&meta.user_id) {
+                    session.confirming = true;
+                }
+            }
+            AgentCommandBlock::ResumeSubmissionSession => {
+                ensure_private_agent_block(meta.trigger)?;
+                let mut guard = state.lock().await;
+                if let Some(session) = guard.submission_sessions.get_mut(&meta.user_id) {
+                    session.confirming = false;
+                }
+            }
+            AgentCommandBlock::SubmitSubmissionSession => {
+                ensure_private_agent_block(meta.trigger)?;
+                let mut guard = state.lock().await;
+                let command = build_submission_session_ingress(
+                    runtime,
+                    &mut guard,
+                    &meta.account_id,
+                    &meta.user_id,
+                    meta.timestamp_ms,
+                )?;
+                drop(guard);
+                cmd_tx
+                    .send(command)
+                    .await
+                    .map_err(|err| format!("提交投稿会话失败: {}", err))?;
+                send_private_text(out_tx, &meta.user_id, "投稿会话已提交，系统正在继续处理。")
+                    .await;
+            }
+            AgentCommandBlock::CancelSubmissionSession => {
+                ensure_private_agent_block(meta.trigger)?;
+                let mut guard = state.lock().await;
+                guard.submission_sessions.remove(&meta.user_id);
+            }
+            AgentCommandBlock::InsertQueuedPost {
+                moving_post_code,
+                anchor_post_code,
+                position,
+            } => {
+                let moving_post_code = render_agent_command_template(&moving_post_code, &context)
+                    .trim()
+                    .to_string();
+                let anchor_post_code = render_agent_command_template(&anchor_post_code, &context)
+                    .trim()
+                    .to_string();
+                execute_agent_insert_queued_post(
+                    runtime,
+                    state,
+                    cmd_tx,
+                    &moving_post_code,
+                    &anchor_post_code,
+                    position,
+                )
+                .await?;
+            }
+            AgentCommandBlock::ExecuteReviewAction {
+                review_code,
+                action,
+            } => {
+                ensure_private_agent_block(meta.trigger)?;
+                let review_code = render_agent_command_template(&review_code, &context)
+                    .trim()
+                    .to_string();
+                execute_agent_review_action(
+                    runtime,
+                    state,
+                    cmd_tx,
+                    &review_code,
+                    &action,
+                    &context,
+                    &meta.user_id,
+                    meta.timestamp_ms,
+                )
+                .await?;
+            }
+            AgentCommandBlock::ExecuteGlobalAction { action } => {
+                let operator_id =
+                    agent_command_operator_id(meta.trigger, &command_name, &meta.user_id);
+                execute_agent_global_action(
+                    runtime,
+                    state,
+                    cmd_tx,
+                    out_tx,
+                    &meta.user_id,
+                    &action,
+                    &context,
+                    &operator_id,
+                    meta.timestamp_ms,
+                )
+                .await?;
+            }
+            AgentCommandBlock::If {
+                condition,
+                then_blocks,
+                else_blocks,
+            } => {
+                let post_id = meta
+                    .submission_post_id
+                    .ok_or_else(|| "if 条件只能用于收到新投稿触发的指令".to_string())?;
+                let draft = {
+                    let guard = state.lock().await;
+                    guard.post_draft.get(&post_id).cloned()
+                }
+                .ok_or_else(|| "找不到当前触发稿件的草稿".to_string())?;
+                let selected_blocks = if evaluate_condition(&draft, &condition) {
+                    then_blocks
+                } else {
+                    else_blocks
+                };
+                Box::pin(execute_agent_command_blocks(
+                    runtime,
+                    state,
+                    cmd_tx,
+                    out_tx,
+                    settings.clone(),
+                    command_name.clone(),
+                    selected_blocks,
+                    meta.clone(),
+                    depth + 1,
+                ))
+                .await?;
+            }
+            AgentCommandBlock::SetDraftTransforms { target, transforms } => {
+                execute_agent_set_draft_transforms(
+                    runtime,
+                    state,
+                    cmd_tx,
+                    &command_name,
+                    &context,
+                    &meta,
+                    &target,
+                    transforms,
+                )
+                .await?;
+            }
+            AgentCommandBlock::SendWebhook {
+                url,
+                source_webhook,
+                text_template,
+                tags,
+                images,
+            } => {
+                let rendered_url = render_agent_command_template(&url, &context);
+                let target_url = rendered_url.trim();
+                if target_url.is_empty() {
+                    return Err("webhook 地址为空".to_string());
+                }
+                validate_agent_command_webhook_url(target_url)?;
+                let rendered_source_webhook =
+                    render_agent_command_template(&source_webhook, &context);
+                let rendered_tags = render_agent_command_tags(&settings, &tags, &context);
+                let rendered_images = render_agent_command_images(&images, &context);
+                let rendered_text = render_agent_command_template(&text_template, &context);
+                let payload = serde_json::json!({
+                    "command_name": context.command_name,
+                    "command_args": context.command_args,
+                    "command_text": context.command_text,
+                    "raw_message": context.raw_message,
+                    "message_text": context.message_text,
+                    "sender_id": context.sender_id,
+                    "sender_name": context.sender_name,
+                    "group_id": context.group_id,
+                    "account_id": context.account_id,
+                    "received_at": context.received_at,
+                    "received_timestamp_ms": context.received_timestamp_ms,
+                    "submission_session_active": context.submission_session_active,
+                    "submission_session_message_count": context.submission_session_message_count,
+                    "submission_post_id": context.submission_post_id,
+                    "submission_sender_id": context.submission_sender_id,
+                    "submission_sender_name": context.submission_sender_name,
+                    "submission_message_count": context.submission_message_count,
+                    "submission_image_count": context.submission_image_count,
+                    "submission_text_message_count": context.submission_text_message_count,
+                    "submission_is_multi_image_single_text": context.submission_is_multi_image_single_text,
+                    "source_webhook": rendered_source_webhook.trim(),
+                    "tags": rendered_tags,
+                    "text": rendered_text.trim(),
+                    "images": rendered_images,
+                });
+                let response = agent_command_client()
+                    .post(target_url)
+                    .json(&payload)
+                    .send()
+                    .await
+                    .map_err(|err| format!("webhook 请求失败: {}", err))?;
+                response
+                    .error_for_status()
+                    .map_err(|err| format!("webhook 响应失败: {}", err))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_private_agent_block(trigger: AgentCommandTrigger) -> Result<(), String> {
+    if trigger == AgentCommandTrigger::PrivateCommand {
+        Ok(())
+    } else {
+        Err("该积木只能用于私聊触发的 agent 指令".to_string())
+    }
+}
+
+fn agent_command_operator_id(
+    trigger: AgentCommandTrigger,
+    command_name: &str,
+    user_id: &str,
+) -> String {
+    match trigger {
+        AgentCommandTrigger::PrivateCommand => user_id.to_string(),
+        AgentCommandTrigger::SubmissionReceived => format!("agent:{}", command_name),
+    }
+}
+
+async fn execute_agent_set_draft_transforms(
+    runtime: &NapCatRuntimeConfig,
+    state: &Arc<Mutex<NapCatState>>,
+    cmd_tx: &mpsc::Sender<Command>,
+    command_name: &str,
+    context: &AgentCommandTemplateContext,
+    meta: &AgentCommandExecutionMeta,
+    target: &AgentCommandPostTarget,
+    transforms: Vec<DraftTransform>,
+) -> Result<(), String> {
+    for transform in &transforms {
+        validate_transform(transform)?;
+    }
+    let post_id = match target {
+        AgentCommandPostTarget::TriggeringPost => meta
+            .submission_post_id
+            .ok_or_else(|| "当前触发稿件目标只能用于收到新投稿触发的指令".to_string())?,
+        AgentCommandPostTarget::ReviewCode { template } => {
+            let rendered = render_agent_command_template(template, context);
+            let guard = state.lock().await;
+            resolve_agent_post_id_by_code(&guard, &runtime.group_id, rendered.trim())?
+        }
+    };
+    {
+        let guard = state.lock().await;
+        if let Some(stage) = guard.post_stage.get(&post_id).copied() {
+            if !agent_can_set_transforms_at_stage(stage) {
+                return Err("当前稿件阶段不允许修改内容块规则".to_string());
+            }
+        }
+    }
+    cmd_tx
+        .send(Command::PostAction(PostActionCommand {
+            post_id,
+            action: PostAction::SetDraftTransforms { transforms },
+            operator_id: format!("agent:{}", command_name),
+            now_ms: meta.timestamp_ms,
+        }))
+        .await
+        .map_err(|err| format!("设置稿件内容块规则失败: {}", err))
+}
+
+fn agent_can_set_transforms_at_stage(stage: PostStage) -> bool {
+    matches!(
+        stage,
+        PostStage::Drafted
+            | PostStage::RenderRequested
+            | PostStage::Rendered
+            | PostStage::ReviewPending
+            | PostStage::Reviewed
+            | PostStage::Scheduled
+            | PostStage::Failed
+    )
+}
+
+async fn execute_submission_agent_command(
+    runtime: &NapCatRuntimeConfig,
+    state: &Arc<Mutex<NapCatState>>,
+    cmd_tx: &mpsc::Sender<Command>,
+    out_tx: &mpsc::Sender<String>,
+    account_id: &str,
+    post_id: PostId,
+    command_name: &str,
+    command: AgentCommandConfig,
+    timestamp_ms: i64,
+) -> Result<(), String> {
+    if !command.enabled || command.trigger != AgentCommandTrigger::SubmissionReceived {
+        return Ok(());
+    }
+    let (user_id, sender_name) = {
+        let guard = state.lock().await;
+        resolve_post_submitter_with_name(&guard, post_id)
+            .ok_or_else(|| "找不到投稿者信息".to_string())?
+    };
+    let settings = runtime
+        .user_notifications
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    execute_agent_command_blocks(
+        runtime,
+        state,
+        cmd_tx,
+        out_tx,
+        settings,
+        command_name.to_string(),
+        command.blocks,
+        AgentCommandExecutionMeta {
+            trigger: AgentCommandTrigger::SubmissionReceived,
+            submission_post_id: Some(post_id),
+            user_id,
+            sender_name,
+            account_id: account_id.to_string(),
+            raw_message: String::new(),
+            message_text: String::new(),
+            command_args: String::new(),
+            timestamp_ms,
+        },
+        0,
+    )
+    .await
 }
 
 async fn execute_private_agent_command(
@@ -7042,190 +7894,36 @@ async fn execute_private_agent_command(
     if command.admin_only && !is_agent_command_admin(runtime, user_id) {
         return Ok(());
     }
+    if command.trigger != AgentCommandTrigger::PrivateCommand {
+        return Ok(());
+    }
     let settings = runtime
         .user_notifications
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .clone();
-    for block in command.blocks {
-        let context = build_agent_command_context(
-            state,
-            runtime,
-            command_name,
-            command_args,
-            raw_message,
-            message_text,
-            user_id,
-            sender_name,
-            account_id,
+    execute_agent_command_blocks(
+        runtime,
+        state,
+        cmd_tx,
+        out_tx,
+        settings,
+        command_name.to_string(),
+        command.blocks,
+        AgentCommandExecutionMeta {
+            trigger: AgentCommandTrigger::PrivateCommand,
+            submission_post_id: None,
+            user_id: user_id.to_string(),
+            sender_name: sender_name.map(str::to_string),
+            account_id: account_id.to_string(),
+            raw_message: raw_message.to_string(),
+            message_text: message_text.to_string(),
+            command_args: command_args.to_string(),
             timestamp_ms,
-        )
-        .await;
-        match block {
-            AgentCommandBlock::ReplyPrivateMessage {
-                text_template,
-                tags,
-                images,
-            } => {
-                let message = build_agent_command_message(
-                    &settings,
-                    &text_template,
-                    &tags,
-                    &images,
-                    &context,
-                );
-                if !message.is_empty() {
-                    send_private_segments(out_tx, user_id, message).await;
-                }
-            }
-            AgentCommandBlock::StartSubmissionSession => {
-                let mut guard = state.lock().await;
-                guard.submission_sessions.insert(
-                    user_id.to_string(),
-                    SubmissionSession {
-                        messages: Vec::new(),
-                        started_at_ms: timestamp_ms,
-                        group_id: runtime.group_id.clone(),
-                        confirming: false,
-                    },
-                );
-            }
-            AgentCommandBlock::FinishSubmissionSession => {
-                let mut guard = state.lock().await;
-                if let Some(session) = guard.submission_sessions.get_mut(user_id) {
-                    session.confirming = true;
-                }
-            }
-            AgentCommandBlock::ResumeSubmissionSession => {
-                let mut guard = state.lock().await;
-                if let Some(session) = guard.submission_sessions.get_mut(user_id) {
-                    session.confirming = false;
-                }
-            }
-            AgentCommandBlock::SubmitSubmissionSession => {
-                let mut guard = state.lock().await;
-                let command = build_submission_session_ingress(
-                    runtime,
-                    &mut guard,
-                    account_id,
-                    user_id,
-                    timestamp_ms,
-                )?;
-                drop(guard);
-                cmd_tx
-                    .send(command)
-                    .await
-                    .map_err(|err| format!("提交投稿会话失败: {}", err))?;
-                send_private_text(out_tx, user_id, "投稿会话已提交，系统正在继续处理。").await;
-            }
-            AgentCommandBlock::CancelSubmissionSession => {
-                let mut guard = state.lock().await;
-                guard.submission_sessions.remove(user_id);
-            }
-            AgentCommandBlock::InsertQueuedPost {
-                moving_post_code,
-                anchor_post_code,
-                position,
-            } => {
-                let moving_post_code = render_agent_command_template(&moving_post_code, &context)
-                    .trim()
-                    .to_string();
-                let anchor_post_code = render_agent_command_template(&anchor_post_code, &context)
-                    .trim()
-                    .to_string();
-                execute_agent_insert_queued_post(
-                    runtime,
-                    state,
-                    cmd_tx,
-                    &moving_post_code,
-                    &anchor_post_code,
-                    position,
-                )
-                .await?;
-            }
-            AgentCommandBlock::ExecuteReviewAction {
-                review_code,
-                action,
-            } => {
-                let review_code = render_agent_command_template(&review_code, &context)
-                    .trim()
-                    .to_string();
-                execute_agent_review_action(
-                    runtime,
-                    state,
-                    cmd_tx,
-                    &review_code,
-                    &action,
-                    &context,
-                    user_id,
-                    timestamp_ms,
-                )
-                .await?;
-            }
-            AgentCommandBlock::ExecuteGlobalAction { action } => {
-                execute_agent_global_action(
-                    runtime,
-                    state,
-                    cmd_tx,
-                    out_tx,
-                    user_id,
-                    &action,
-                    &context,
-                    user_id,
-                    timestamp_ms,
-                )
-                .await?;
-            }
-            AgentCommandBlock::SendWebhook {
-                url,
-                source_webhook,
-                text_template,
-                tags,
-                images,
-            } => {
-                let rendered_url = render_agent_command_template(&url, &context);
-                let target_url = rendered_url.trim();
-                if target_url.is_empty() {
-                    return Err("webhook 地址为空".to_string());
-                }
-                validate_agent_command_webhook_url(target_url)?;
-                let rendered_source_webhook =
-                    render_agent_command_template(&source_webhook, &context);
-                let rendered_tags = render_agent_command_tags(&settings, &tags, &context);
-                let rendered_images = render_agent_command_images(&images, &context);
-                let rendered_text = render_agent_command_template(&text_template, &context);
-                let payload = serde_json::json!({
-                    "command_name": context.command_name,
-                    "command_args": context.command_args,
-                    "command_text": context.command_text,
-                    "raw_message": context.raw_message,
-                    "message_text": context.message_text,
-                    "sender_id": context.sender_id,
-                    "sender_name": context.sender_name,
-                    "group_id": context.group_id,
-                    "account_id": context.account_id,
-                    "received_at": context.received_at,
-                    "received_timestamp_ms": context.received_timestamp_ms,
-                    "submission_session_active": context.submission_session_active,
-                    "submission_session_message_count": context.submission_session_message_count,
-                    "source_webhook": rendered_source_webhook.trim(),
-                    "tags": rendered_tags,
-                    "text": rendered_text.trim(),
-                    "images": rendered_images,
-                });
-                let response = agent_command_client()
-                    .post(target_url)
-                    .json(&payload)
-                    .send()
-                    .await
-                    .map_err(|err| format!("webhook 请求失败: {}", err))?;
-                response
-                    .error_for_status()
-                    .map_err(|err| format!("webhook 响应失败: {}", err))?;
-            }
-        }
-    }
-    Ok(())
+        },
+        0,
+    )
+    .await
 }
 
 fn display_operator_name(raw: &str) -> &str {
@@ -7271,6 +7969,17 @@ fn civil_from_days(days_since_epoch: i64) -> String {
 fn resolve_post_submitter(state: &NapCatState, post_id: PostId) -> Option<String> {
     let ingress_ids = state.post_ingress.get(&post_id)?;
     resolve_post_submitter_with_ingress(state, ingress_ids)
+}
+
+fn resolve_post_submitter_with_name(
+    state: &NapCatState,
+    post_id: PostId,
+) -> Option<(String, Option<String>)> {
+    let ingress_ids = state.post_ingress.get(&post_id)?;
+    ingress_ids.iter().find_map(|ingress_id| {
+        let summary = state.ingress_summary.get(ingress_id)?;
+        Some((summary.user_id.clone(), summary.sender_name.clone()))
+    })
 }
 
 fn resolve_post_submitter_with_ingress(
@@ -7916,6 +8625,7 @@ fn next_echo(state: &mut NapCatState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oqqwall_rust_core::Id128;
     use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock as StdOnceLock};
 
     fn global_test_lock() -> &'static StdMutex<()> {
@@ -7990,6 +8700,13 @@ mod tests {
             previous_post_info: "summary".to_string(),
             previous_post_created_at: "1970-01-01 00:00:00".to_string(),
             previous_post_created_timestamp_ms: "0".to_string(),
+            submission_post_id: "13".to_string(),
+            submission_sender_id: "20002".to_string(),
+            submission_sender_name: "sender".to_string(),
+            submission_message_count: "2".to_string(),
+            submission_image_count: "2".to_string(),
+            submission_text_message_count: "1".to_string(),
+            submission_is_multi_image_single_text: "true".to_string(),
         }
     }
 
@@ -8024,6 +8741,7 @@ mod tests {
             AgentCommandConfig {
                 enabled: true,
                 admin_only: false,
+                trigger: AgentCommandTrigger::PrivateCommand,
                 description: String::new(),
                 blocks: vec![AgentCommandBlock::CancelSubmissionSession],
             },
@@ -8072,6 +8790,164 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(removed, "agent command should cancel the active session");
+    }
+
+    #[tokio::test]
+    async fn submission_agent_triggers_only_for_new_post() {
+        let mut runtime = test_runtime();
+        runtime.accounts = vec!["sub-agent-100".to_string()];
+        register_ws_session("sub-agent-100", mock_session());
+        runtime.agent_commands = Arc::new(std::sync::Mutex::new(HashMap::from([(
+            "规则".to_string(),
+            AgentCommandConfig {
+                enabled: true,
+                admin_only: false,
+                trigger: AgentCommandTrigger::SubmissionReceived,
+                description: String::new(),
+                blocks: vec![AgentCommandBlock::SetDraftTransforms {
+                    target: AgentCommandPostTarget::TriggeringPost,
+                    transforms: vec![DraftTransform::MoveBlocks {
+                        selector: oqqwall_rust_core::BlockSelector {
+                            kinds: Some(vec![oqqwall_rust_core::BlockKindFilter::Paragraph]),
+                            text: None,
+                            index: None,
+                        },
+                        position: oqqwall_rust_core::PositionSpec::Front,
+                    }],
+                }],
+            },
+        )])));
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let (out_tx, _out_rx) = mpsc::channel(4);
+        let ingress_id = Id128(100);
+        let post_id = Id128(101);
+        let session_id = Id128(102);
+        let draft = Draft {
+            blocks: vec![oqqwall_rust_core::DraftBlock::Paragraph {
+                text: "caption".to_string(),
+            }],
+        };
+
+        let _ = build_action_from_event(
+            &runtime,
+            &state,
+            &cmd_tx,
+            &out_tx,
+            "sub-agent-100",
+            1,
+            Event::Ingress(IngressEvent::MessageAccepted {
+                ingress_id,
+                profile_id: "bot".to_string(),
+                chat_id: "chat".to_string(),
+                user_id: "20002".to_string(),
+                sender_name: Some("sender".to_string()),
+                group_id: runtime.group_id.clone(),
+                platform_msg_id: "msg-1".to_string(),
+                route_meta: None,
+                received_at_ms: 1,
+                message: IngressMessage {
+                    text: "caption".to_string(),
+                    attachments: Vec::new(),
+                },
+            }),
+        )
+        .await;
+        let draft_event = Event::Draft(DraftEvent::PostDraftCreated {
+            post_id,
+            session_id,
+            group_id: runtime.group_id.clone(),
+            ingress_ids: vec![ingress_id],
+            is_anonymous: false,
+            is_safe: true,
+            draft,
+            created_at_ms: 2,
+        });
+
+        let _ = build_action_from_event(
+            &runtime,
+            &state,
+            &cmd_tx,
+            &out_tx,
+            "sub-agent-100",
+            2,
+            draft_event.clone(),
+        )
+        .await;
+        let command = tokio::time::timeout(Duration::from_secs(1), cmd_rx.recv())
+            .await
+            .expect("submission command")
+            .expect("command value");
+        assert!(matches!(
+            command,
+            Command::PostAction(PostActionCommand { post_id: id, .. }) if id == post_id
+        ));
+
+        let _ = build_action_from_event(
+            &runtime,
+            &state,
+            &cmd_tx,
+            &out_tx,
+            "sub-agent-100",
+            3,
+            draft_event,
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), cmd_rx.recv())
+                .await
+                .is_err(),
+            "rebuilt post should not retrigger submission agent"
+        );
+        unregister_ws_session("sub-agent-100");
+    }
+
+    #[test]
+    fn private_match_ignores_submission_trigger_commands() {
+        let mut runtime = test_runtime();
+        runtime.agent_commands = Arc::new(std::sync::Mutex::new(HashMap::from([(
+            "规则".to_string(),
+            AgentCommandConfig {
+                enabled: true,
+                admin_only: false,
+                trigger: AgentCommandTrigger::SubmissionReceived,
+                description: String::new(),
+                blocks: vec![AgentCommandBlock::ReplyPrivateMessage {
+                    text_template: "ok".to_string(),
+                    tags: Vec::new(),
+                    images: Vec::new(),
+                }],
+            },
+        )])));
+        let state = NapCatState::default();
+
+        assert_eq!(
+            private_agent_command_match_with_state(&runtime, &state, "规则", "20002"),
+            PrivateAgentCommandMatch::NoMatch
+        );
+    }
+
+    #[test]
+    fn validate_rejects_triggering_post_target_for_private_command() {
+        let config = AgentCommandConfig {
+            enabled: true,
+            admin_only: false,
+            trigger: AgentCommandTrigger::PrivateCommand,
+            description: String::new(),
+            blocks: vec![AgentCommandBlock::SetDraftTransforms {
+                target: AgentCommandPostTarget::TriggeringPost,
+                transforms: vec![DraftTransform::MoveBlocks {
+                    selector: oqqwall_rust_core::BlockSelector {
+                        kinds: Some(vec![oqqwall_rust_core::BlockKindFilter::Paragraph]),
+                        text: None,
+                        index: None,
+                    },
+                    position: oqqwall_rust_core::PositionSpec::Front,
+                }],
+            }],
+        };
+
+        assert!(validate_agent_command_config("规则", &config).is_err());
     }
 
     #[test]

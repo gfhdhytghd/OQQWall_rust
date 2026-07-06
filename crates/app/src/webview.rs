@@ -24,10 +24,11 @@ use crate::config::{
 };
 use crate::engine::EngineHandle;
 use oqqwall_rust_drivers::napcat::{
-    AgentCommandBlock, AgentCommandConfig, TagValueMappingGroup, UserNotificationSettings,
-    UserNotificationTemplate, normalize_agent_command_config, update_group_agent_command_admins,
-    update_group_agent_commands, update_group_user_notification_settings,
-    validate_agent_command_config, validate_agent_command_name,
+    AgentCommandBlock, AgentCommandConfig, AgentCommandTrigger, TagValueMappingGroup,
+    UserNotificationSettings, UserNotificationTemplate, normalize_agent_command_config,
+    update_group_agent_command_admins, update_group_agent_commands,
+    update_group_user_notification_settings, validate_agent_command_config,
+    validate_agent_command_name,
 };
 
 include!(concat!(env!("OUT_DIR"), "/webview_assets.rs"));
@@ -366,6 +367,8 @@ struct AppConfigAgentCommandPayload {
     enabled: bool,
     #[serde(default)]
     admin_only: bool,
+    #[serde(default)]
+    trigger: AgentCommandTrigger,
     #[serde(default)]
     description: String,
     #[serde(default)]
@@ -1802,6 +1805,7 @@ fn set_agent_commands_field(
             let config = AgentCommandConfig {
                 enabled: entry.enabled,
                 admin_only: entry.admin_only,
+                trigger: entry.trigger,
                 description: entry.description,
                 blocks: entry.blocks,
             };
@@ -2058,6 +2062,7 @@ fn payload_agent_commands(value: Option<&Value>) -> Vec<AppConfigAgentCommandPay
                 name: name.trim().to_string(),
                 enabled: normalized.enabled,
                 admin_only: normalized.admin_only,
+                trigger: normalized.trigger,
                 description: normalized.description,
                 blocks: normalized.blocks,
             })
@@ -2196,6 +2201,7 @@ fn normalize_agent_command_payloads(
         let config = normalize_agent_command_config(&AgentCommandConfig {
             enabled: entry.enabled,
             admin_only: entry.admin_only,
+            trigger: entry.trigger,
             description: entry.description.clone(),
             blocks: entry.blocks.clone(),
         });
@@ -2204,6 +2210,7 @@ fn normalize_agent_command_payloads(
             name: normalized_name,
             enabled: config.enabled,
             admin_only: config.admin_only,
+            trigger: config.trigger,
             description: config.description,
             blocks: config.blocks,
         });
@@ -2907,6 +2914,48 @@ fn agent_command_variables() -> Vec<UserNotificationVariableInfo> {
             label: "会话消息数",
             description: "当前私聊投稿会话里已经缓存的消息条数。",
             example: "<submission_session_message_count>",
+        },
+        UserNotificationVariableInfo {
+            key: "submission_post_id",
+            label: "触发投稿 ID",
+            description: "收到新投稿触发时的当前 post_id，私聊指令触发时为空。",
+            example: "<submission_post_id>",
+        },
+        UserNotificationVariableInfo {
+            key: "submission_sender_id",
+            label: "投稿人 QQ",
+            description: "收到新投稿触发时的投稿人 QQ 号，私聊指令触发时为空。",
+            example: "<submission_sender_id>",
+        },
+        UserNotificationVariableInfo {
+            key: "submission_sender_name",
+            label: "投稿人昵称",
+            description: "收到新投稿触发时的投稿人昵称或备注名。",
+            example: "<submission_sender_name>",
+        },
+        UserNotificationVariableInfo {
+            key: "submission_message_count",
+            label: "投稿消息数",
+            description: "收到新投稿触发时，构成当前稿件的原始消息条数。",
+            example: "<submission_message_count>",
+        },
+        UserNotificationVariableInfo {
+            key: "submission_image_count",
+            label: "投稿图片数",
+            description: "收到新投稿触发时，当前稿件里的图片附件数量。",
+            example: "<submission_image_count>",
+        },
+        UserNotificationVariableInfo {
+            key: "submission_text_message_count",
+            label: "投稿文本消息数",
+            description: "收到新投稿触发时，含文本内容的原始消息条数。",
+            example: "<submission_text_message_count>",
+        },
+        UserNotificationVariableInfo {
+            key: "submission_is_multi_image_single_text",
+            label: "多图单文",
+            description: "当前投稿是否为多张图片加一条文本消息，值为 true 或 false。",
+            example: "<submission_is_multi_image_single_text>",
         },
         UserNotificationVariableInfo {
             key: "previous_post_id",

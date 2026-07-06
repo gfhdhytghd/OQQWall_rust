@@ -1515,7 +1515,8 @@ a {
 }
 
 .scratch-command-tab strong,
-.scratch-command-tab span {
+.scratch-command-tab span,
+.scratch-command-tab em {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1528,6 +1529,17 @@ a {
 .scratch-command-tab span {
   color: var(--muted);
   font-size: 12px;
+}
+
+.scratch-command-tab em {
+  width: fit-content;
+  max-width: 100%;
+  padding: 2px 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 11px;
+  font-style: normal;
 }
 
 .scratch-command-stage {

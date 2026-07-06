@@ -1,6 +1,7 @@
 use crate::draft::{IngressMessage, IngressRouteMeta};
+use crate::draft_transform::DraftTransform;
 use crate::event::Event;
-use crate::ids::{AuditMsgId, ExternalCode, GroupId, ReviewCode, ReviewId, TimestampMs};
+use crate::ids::{AuditMsgId, ExternalCode, GroupId, PostId, ReviewCode, ReviewId, TimestampMs};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -10,6 +11,7 @@ pub enum Command {
     ReviewActionBatch(ReviewActionBatchCommand),
     GlobalAction(GlobalActionCommand),
     GlobalActionBatch(GlobalActionBatchCommand),
+    PostAction(PostActionCommand),
     DriverEvent(Event),
 }
 
@@ -98,6 +100,19 @@ pub struct GlobalActionBatchCommand {
     pub operator_id: String,
     pub now_ms: TimestampMs,
     pub tz_offset_minutes: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostActionCommand {
+    pub post_id: PostId,
+    pub action: PostAction,
+    pub operator_id: String,
+    pub now_ms: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostAction {
+    SetDraftTransforms { transforms: Vec<DraftTransform> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

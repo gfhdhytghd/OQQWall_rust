@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::draft::{Draft, IngressMessage, IngressRouteMeta, MediaReference};
+use crate::draft_transform::DraftTransform;
 use crate::event::{
     InputStatusKind, QzonePublicationItem, QzonePublicationKey, ReviewDecision, SendPriority,
 };
@@ -253,6 +254,7 @@ pub struct StateView {
 
     pub blobs: HashMap<BlobId, BlobMeta>,
     pub manual_interventions: HashSet<PostId>,
+    pub draft_transforms: HashMap<PostId, Vec<DraftTransform>>,
 }
 
 impl Default for StateView {
@@ -291,6 +293,7 @@ impl Default for StateView {
             qzone_publications_by_post: HashMap::new(),
             blobs: HashMap::new(),
             manual_interventions: HashSet::new(),
+            draft_transforms: HashMap::new(),
         }
     }
 }

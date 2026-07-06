@@ -2,6 +2,7 @@ mod driver;
 mod flush;
 mod global;
 mod ingress;
+mod post_action;
 mod review;
 mod scheduler;
 mod sender;
@@ -22,6 +23,7 @@ pub fn decide(state: &StateView, command: &Command, config: &CoreConfig) -> Vec<
         Command::ReviewActionBatch(cmd) => review::decide_review_action_batch(state, cmd, config),
         Command::GlobalAction(cmd) => global::decide_global_action(state, cmd, config),
         Command::GlobalActionBatch(cmd) => global::decide_global_action_batch(state, cmd, config),
+        Command::PostAction(cmd) => post_action::decide_post_action(state, cmd),
         Command::DriverEvent(event) => driver::decide_driver_event(state, event, config),
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -500,9 +501,29 @@ fn persist_blob(
     fs::create_dir_all(&dir).map_err(|err| format!("create blob dir failed: {}", err))?;
     let filename = format!("{}.{}", id128_hex(blob_id.0), ext);
     let path = dir.join(filename);
-    fs::write(&path, bytes).map_err(|err| format!("write blob failed: {}", err))?;
+    let tmp_path = dir.join(format!("{}.{}.tmp", id128_hex(blob_id.0), ext));
+    let mut file =
+        File::create(&tmp_path).map_err(|err| format!("create blob tmp failed: {}", err))?;
+    file.write_all(bytes)
+        .map_err(|err| format!("write blob failed: {}", err))?;
+    file.sync_all()
+        .map_err(|err| format!("sync blob failed: {}", err))?;
+    drop(file);
+    if let Err(err) = fs::rename(&tmp_path, &path) {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            fs::remove_file(&path).map_err(|err| format!("cleanup blob failed: {}", err))?;
+            fs::rename(&tmp_path, &path).map_err(|err| format!("rename blob failed: {}", err))?;
+        } else {
+            return Err(format!("rename blob failed: {}", err));
+        }
+    }
+    sync_dir(&dir).map_err(|err| format!("sync blob dir failed: {}", err))?;
     let size_bytes = bytes.len() as u64;
     Ok((path.to_string_lossy().to_string(), size_bytes))
+}
+
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
 }
 
 fn derive_attachment_blob_id(ingress_id: IngressId, attachment_index: usize) -> BlobId {

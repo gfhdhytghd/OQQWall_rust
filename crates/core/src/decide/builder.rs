@@ -1,4 +1,7 @@
 use crate::draft::{Draft, DraftBlock, IngressMessage, parse_special_marker};
+use crate::draft_transform::{DraftTransform, apply_transforms};
+use crate::ids::{IngressId, PostId};
+use crate::state::StateView;
 
 pub fn build_draft_from_messages(messages: &[IngressMessage]) -> Draft {
     let mut blocks = Vec::new();
@@ -16,6 +19,37 @@ pub fn build_draft_from_messages(messages: &[IngressMessage]) -> Draft {
     }
 
     Draft { blocks }
+}
+
+pub fn build_draft_for_post(
+    state: &StateView,
+    post_id: PostId,
+    ingress_ids: &[IngressId],
+) -> Option<Draft> {
+    build_draft_for_post_with_transforms(state, post_id, ingress_ids, None)
+}
+
+pub fn build_draft_for_post_with_transforms(
+    state: &StateView,
+    post_id: PostId,
+    ingress_ids: &[IngressId],
+    transforms: Option<&[DraftTransform]>,
+) -> Option<Draft> {
+    let mut messages = Vec::new();
+    for ingress_id in ingress_ids {
+        if let Some(message) = state.ingress_messages.get(ingress_id) {
+            messages.push(message.clone());
+        }
+    }
+    if messages.is_empty() {
+        return None;
+    }
+
+    let draft = build_draft_from_messages(&messages);
+    let transforms = transforms
+        .or_else(|| state.draft_transforms.get(&post_id).map(Vec::as_slice))
+        .unwrap_or(&[]);
+    Some(apply_transforms(&draft, transforms))
 }
 
 fn append_blocks_from_text(text: &str, blocks: &mut Vec<DraftBlock>) {

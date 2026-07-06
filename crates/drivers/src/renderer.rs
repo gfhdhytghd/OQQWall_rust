@@ -15,7 +15,7 @@ use crate::napcat::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use oqqwall_rust_core::decide::builder::build_draft_from_messages;
+use oqqwall_rust_core::decide::builder::build_draft_for_post;
 use oqqwall_rust_core::event::{
     BlobEvent, Event, IngressEvent, MediaEvent, RenderEvent, SendEvent,
 };
@@ -939,16 +939,7 @@ async fn handle_render_request(
 
 fn rebuild_draft_from_state(state: &StateView, post_id: PostId) -> Option<Draft> {
     let ingress_ids = state.post_ingress.get(&post_id)?;
-    let mut messages = Vec::new();
-    for ingress_id in ingress_ids {
-        if let Some(message) = state.ingress_messages.get(ingress_id) {
-            messages.push(message.clone());
-        }
-    }
-    if messages.is_empty() {
-        return None;
-    }
-    Some(build_draft_from_messages(&messages))
+    build_draft_for_post(state, post_id, ingress_ids)
 }
 
 fn collect_post_blob_ids(state: &StateView, post_id: PostId) -> Vec<BlobId> {

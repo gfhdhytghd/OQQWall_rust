@@ -1,4 +1,5 @@
 use crate::draft::{Draft, IngressMessage, IngressRouteMeta};
+use crate::draft_transform::DraftTransform;
 use crate::ids::{
     AccountId, ActorId, AuditMsgId, BlobId, CorrelationId, EventId, ExternalCode, GroupId,
     IngressId, PostId, RemotePostId, ReviewCode, ReviewId, SessionId, TimestampMs,
@@ -29,6 +30,7 @@ pub enum Event {
     Blob(BlobEvent),
     Account(AccountEvent),
     Manual(ManualEvent),
+    Lifecycle(LifecycleEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +142,11 @@ pub enum DraftEvent {
         is_safe: bool,
         draft: Draft,
         created_at_ms: TimestampMs,
+    },
+    DraftTransformsSet {
+        post_id: PostId,
+        transforms: Vec<DraftTransform>,
+        set_at_ms: TimestampMs,
     },
 }
 
@@ -443,6 +450,16 @@ pub enum BlobEvent {
     BlobPersisted { blob_id: BlobId, path: String },
     BlobReleased { blob_id: BlobId },
     BlobGcRequested { blob_id: BlobId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LifecycleEvent {
+    PostEvicted {
+        post_id: PostId,
+        evicted_at_ms: TimestampMs,
+        blob_ids: Vec<BlobId>,
+        ingress_ids: Vec<IngressId>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

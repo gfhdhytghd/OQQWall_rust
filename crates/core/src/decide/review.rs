@@ -1,7 +1,7 @@
 use crate::anonymous::detect_anonymous;
 use crate::command::{ReviewAction, ReviewActionBatchCommand, ReviewActionCommand};
 use crate::config::CoreConfig;
-use crate::decide::builder::build_draft_from_messages;
+use crate::decide::builder::build_draft_for_post;
 use crate::decide::flush::build_group_flush_events;
 use crate::decide::scheduler::{compute_not_before, day_index, minute_of_day};
 use crate::draft::MediaKind;
@@ -388,23 +388,17 @@ fn rebuild_draft_event(
 ) -> Option<DraftEvent> {
     let post = state.posts.get(&post_id)?;
     let ingress_ids = state.post_ingress.get(&post_id)?.clone();
-    let mut messages = Vec::new();
-    for ingress_id in &ingress_ids {
-        if let Some(message) = state.ingress_messages.get(ingress_id) {
-            messages.push(message.clone());
-        }
-    }
-    let draft = build_draft_from_messages(&messages);
+    let draft = build_draft_for_post(state, post_id, &ingress_ids)?;
     let is_anonymous = state
         .posts
         .get(&post_id)
         .map(|meta| meta.is_anonymous)
-        .unwrap_or_else(|| detect_anonymous(&messages));
+        .unwrap_or(false);
     let is_safe = state
         .posts
         .get(&post_id)
         .map(|meta| meta.is_safe)
-        .unwrap_or_else(|| detect_safe(&messages));
+        .unwrap_or(true);
     Some(DraftEvent::PostDraftCreated {
         post_id,
         session_id: post.session_id,
@@ -488,13 +482,9 @@ fn build_merge_events(
     let Some(ingress_ids) = merge_ingress_ids(state, post_id, target_post_id) else {
         return Vec::new();
     };
-    let mut messages = Vec::new();
-    for ingress_id in &ingress_ids {
-        if let Some(message) = state.ingress_messages.get(ingress_id) {
-            messages.push(message.clone());
-        }
-    }
-    let draft = build_draft_from_messages(&messages);
+    let Some(draft) = build_draft_for_post(state, post_id, &ingress_ids) else {
+        return Vec::new();
+    };
     let is_anonymous =
         post_is_anonymous(state, post_id) || post_is_anonymous(state, target_post_id);
     let is_safe = post_is_safe(state, post_id) && post_is_safe(state, target_post_id);

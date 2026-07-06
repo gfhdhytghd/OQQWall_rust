@@ -1,3 +1,4 @@
+mod blob_gc;
 mod config;
 mod connect;
 mod engine;
@@ -71,6 +72,15 @@ async fn main() {
     let data_dir = env::var("OQQWALL_DATA_DIR").unwrap_or_else(|_| "data".to_string());
     let (engine, handle) = Engine::new(core_config, &data_dir).expect("failed to init engine");
     debug_log!("engine created: data_dir={}", data_dir);
+    match blob_gc::sweep_orphan_blobs(&handle, &data_dir, app_config.auto_gc_orphan_blobs) {
+        Ok(removed) if removed > 0 => {
+            debug_log!("blob orphan sweep removed {} file(s)", removed);
+        }
+        Ok(_) => {}
+        Err(err) => {
+            debug_log!("blob orphan sweep failed: {}", err);
+        }
+    }
     let _status = status::spawn_status_logger(&handle);
     let _telemetry =
         telemetry::spawn_submission_telemetry(&handle, &app_config.telemetry, &data_dir);

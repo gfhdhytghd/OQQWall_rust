@@ -93,6 +93,7 @@ pub struct AppConfig {
     pub tz_offset_minutes: i32,
     pub fallback_napcat: Option<NapCatConfig>,
     pub max_cache_mb: u64,
+    pub auto_gc_orphan_blobs: bool,
     pub at_unprived_sender: bool,
     pub web_api_enabled: bool,
     pub web_api_port: u16,
@@ -154,6 +155,7 @@ impl AppConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .or_else(|| parse_u64(common.get("max_cache_mb")))
             .unwrap_or(256);
+        let auto_gc_orphan_blobs = parse_bool(common.get("auto_gc_orphan_blobs")).unwrap_or(true);
         let at_unprived_sender = parse_bool(common.get("at_unprived_sender")).unwrap_or(false);
         let default_friend_request_window_sec =
             parse_u32(common.get("friend_request_window_sec")).unwrap_or(300);
@@ -388,6 +390,7 @@ impl AppConfig {
             tz_offset_minutes,
             fallback_napcat,
             max_cache_mb,
+            auto_gc_orphan_blobs,
             at_unprived_sender,
             web_api_enabled,
             web_api_port,
@@ -1046,6 +1049,14 @@ fn build_core_config(
     core.default_send_timeout_ms =
         parse_duration_ms(common.get("send_timeout_ms")).unwrap_or(300_000);
     core.default_send_max_attempts = parse_u32(common.get("send_max_attempts")).unwrap_or(3);
+    if let Some(retention_ms) =
+        parse_duration_ms(common.get("eviction_retention_ms")).or_else(|| {
+            parse_duration_ms(common.get("eviction_retention_sec"))
+                .map(|value| value.saturating_mul(1000))
+        })
+    {
+        core.eviction_retention_ms = retention_ms.max(0);
+    }
 
     for (group_id, value) in groups {
         let process_waittime_ms =
