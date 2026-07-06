@@ -1714,7 +1714,10 @@ mod tests {
     use serde_json::json;
     use std::fs::File;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static OQQWALL_CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_test_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1880,6 +1883,7 @@ mod tests {
 
     #[test]
     fn resolve_config_path_defaults_to_config_json() {
+        let _guard = OQQWALL_CONFIG_ENV_LOCK.lock().unwrap();
         let key = "OQQWALL_CONFIG";
         unsafe {
             std::env::remove_var(key);
@@ -1889,6 +1893,7 @@ mod tests {
 
     #[test]
     fn resolve_config_path_respects_env_override() {
+        let _guard = OQQWALL_CONFIG_ENV_LOCK.lock().unwrap();
         let key = "OQQWALL_CONFIG";
         unsafe {
             std::env::set_var(key, "/tmp/custom-config.json");
