@@ -1545,7 +1545,7 @@ a {
   padding: 12px;
   border: 1px solid var(--line-soft);
   border-radius: var(--radius-field);
-  background: var(--surface-soft);
+  background: var(--surface);
 }
 
 .scratch-command-name-field {
@@ -1563,11 +1563,32 @@ a {
 .scratch-command-input {
   width: 100%;
   min-width: 0;
-  height: 40px;
+  height: 42px;
   padding-inline: 12px;
-  border-radius: var(--radius-control);
-  box-shadow: none;
+  border: 0 !important;
+  border-radius: var(--radius-control) !important;
+  background: var(--surface-soft) !important;
+  box-shadow: none !important;
+  color: var(--text) !important;
   font-size: 14px;
+  transition:
+    background-color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+.scratch-command-input:hover {
+  background: var(--surface-raised) !important;
+}
+
+.scratch-command-input:focus {
+  background: var(--surface-soft) !important;
+  box-shadow: inset 0 0 0 1px rgb(15 98 254 / 22%) !important;
+  outline: none;
+}
+
+.scratch-command-input::placeholder {
+  color: var(--muted);
+  opacity: 0.74;
 }
 
 .scratch-command-enable-toggle {

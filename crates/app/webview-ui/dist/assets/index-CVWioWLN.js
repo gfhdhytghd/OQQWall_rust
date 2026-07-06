@@ -287,7 +287,7 @@ Error generating stack: `+o.message+`
      padding: 7px;
      overflow: auto;
    }
-
+   
   .blocklyFieldGrid {
     display: grid;
     grid-gap: 7px;
@@ -304,11 +304,11 @@ Error generating stack: `+o.message+`
    cursor: pointer;
    padding: 6px 15px;
  }
-
+ 
  .blocklyFieldGrid .blocklyFieldGridRow {
    display: contents;
  }
-
+ 
  .blocklyFieldGrid .blocklyFieldGridItem.blocklyFieldGridItemSelected {
    background-color: rgba(1, 1, 1, 0.25);
  }
@@ -1325,7 +1325,7 @@ Blockly.YourGeneratorName.nameDB_.setVariableMap(workspace.getVariableMap());`),
 
 `)+R}scrubNakedValue(R){return R+`;
 `}quote_(R){return"'"+(R=R.replace(/\\/g,"\\\\").replace(/\n/g,`\\
-`).replace(/\$/g,"\\$").replace(/'/g,"\\'"))+"'"}multiline_quote_(R){return R.split(/\n/g).map(this.quote_).join(` + '\\n' +
+`).replace(/\$/g,"\\$").replace(/'/g,"\\'"))+"'"}multiline_quote_(R){return R.split(/\n/g).map(this.quote_).join(` + '\\n' + 
 `)}scrub_(R,d,N=!1){let u="";if(!R.outputConnection||!R.outputConnection.targetConnection){var _=R.getCommentText();_&&(_=h.wrap$$module$build$src$core$utils$string(_,this.COMMENT_WRAP-3),u="getProcedureDef"in R?u+this.prefixLines(_+`
 `,"/// "):u+this.prefixLines(_+`
 `,"// "));for(let I=0;I<R.inputList.length;I++)R.inputList[I].type===h.inputTypes$$module$build$src$core$inputs$input_types.VALUE&&(_=R.inputList[I].connection.targetBlock())&&(_=this.allNestedComments(_))&&(u+=this.prefixLines(_,"// "))}return R=R.nextConnection&&R.nextConnection.targetBlock(),u+d+(N?"":this.blockToCode(R))}getAdjusted(R,d,N=0,u=!1,_=E.NONE){R.workspace.options.oneBasedIndex&&N--;const I=R.workspace.options.oneBasedIndex?"1":"0";let f=_;return N?f=E.ADDITIVE:u&&(f=E.UNARY_PREFIX),R=this.valueToCode(R,d,f)||I,N!==0||u?h.isNumber$$module$build$src$core$utils$string(R)?(R=String(Number(R)+N),u&&(R=String(-Number(R))),R):(N>0?R=`${R} + ${N}`:N<0&&(R=`${R} - ${-N}`),u&&(R=N?`-(${R})`:`-${R}`),Math.floor(_)>=Math.floor(f)&&(R=`(${R})`),R):R}},p={lists_create_empty:function(R,d){return["[]",E.ATOMIC]},lists_create_with:function(R,d){const N=Array(R.itemCount_);for(let u=0;u<R.itemCount_;u++)N[u]=d.valueToCode(R,"ADD"+u,E.NONE)||"null";return["["+N.join(", ")+"]",E.ATOMIC]},lists_getIndex:function(R,d){function N(){const f=d.nameDB_.getDistinctName("tmp_list",h.NameType$$module$build$src$core$names.VARIABLE),M="List "+f+" = "+I+`;
@@ -1944,7 +1944,7 @@ end
 `,u+=`end
 `),u+"for "+I+" = "+f+", "+M+", "+F+` do
 `+j+`end
-`},controls_forEach:function(u,_){const I=_.getVariableName(u.getFieldValue("VAR")),f=_.valueToCode(u,"LIST",E.NONE)||"{}";let M=_.statementToCode(u,"DO");return M=_.addLoopTrap(M,u),M=g(M,_.INDENT),"for _, "+I+" in ipairs("+f+`) do
+`},controls_forEach:function(u,_){const I=_.getVariableName(u.getFieldValue("VAR")),f=_.valueToCode(u,"LIST",E.NONE)||"{}";let M=_.statementToCode(u,"DO");return M=_.addLoopTrap(M,u),M=g(M,_.INDENT),"for _, "+I+" in ipairs("+f+`) do 
 `+M+`end
 `}};$.controls_repeat=D,$.controls_repeat_ext=D,$.controls_whileUntil=function(u,_){const I=u.getFieldValue("MODE")==="UNTIL";let f=_.valueToCode(u,"BOOL",I?E.UNARY:E.NONE)||"false",M=_.statementToCode(u,"DO");return M=_.addLoopTrap(M,u),M=g(M,_.INDENT),I&&(f="not "+f),"while "+f+` do
 `+M+`end
@@ -2437,7 +2437,7 @@ def ${u.FUNCTION_NAME_PLACEHOLDER_}(msg):
 
 `)+N}scrubNakedValue(N){return N+`
 `}quote_(N){let u="'";return(N=N.replace(/\\/g,"\\\\").replace(/\n/g,`\\
-`)).includes("'")&&(N.includes('"')?N=N.replace(/'/g,"\\'"):u='"'),u+N+u}multiline_quote_(N){return N.split(/\n/g).map(this.quote_).join(` + '\\n' +
+`)).includes("'")&&(N.includes('"')?N=N.replace(/'/g,"\\'"):u='"'),u+N+u}multiline_quote_(N){return N.split(/\n/g).map(this.quote_).join(` + '\\n' + 
 `)}scrub_(N,u,_=!1){let I="";if(!N.outputConnection||!N.outputConnection.targetConnection){var f=N.getCommentText();f&&(f=h.wrap$$module$build$src$core$utils$string(f,this.COMMENT_WRAP-3),I+=this.prefixLines(f+`
 `,"# "));for(let M=0;M<N.inputList.length;M++)N.inputList[M].type===h.inputTypes$$module$build$src$core$inputs$input_types.VALUE&&(f=N.inputList[M].connection.targetBlock())&&(f=this.allNestedComments(f))&&(I+=this.prefixLines(f,"# "))}return N=N.nextConnection&&N.nextConnection.targetBlock(),I+u+(_?"":this.blockToCode(N))}getAdjustedInt(N,u,_=0,I=!1){N.workspace.options.oneBasedIndex&&_--;const f=N.workspace.options.oneBasedIndex?"1":"0";return N=this.valueToCode(N,u,_?E.ADDITIVE:E.NONE)||f,h.isNumber$$module$build$src$core$utils$string(N)?(N=parseInt(N,10)+_,I&&(N=-N)):(N=_>0?"int("+N+" + "+_+")":_<0?"int("+N+" - "+-_+")":"int("+N+")",I&&(N="-"+N)),N}},p={lists_create_empty:function(N,u){return["[]",E.ATOMIC]},lists_create_with:function(N,u){const _=Array(N.itemCount_);for(let I=0;I<N.itemCount_;I++)_[I]=u.valueToCode(N,"ADD"+I,E.NONE)||"None";return["["+_.join(", ")+"]",E.ATOMIC]},lists_getIndex:function(N,u){const _=N.getFieldValue("MODE")||"GET",I=N.getFieldValue("WHERE")||"FROM_START";var f=u.valueToCode(N,"VALUE",I==="RANDOM"?E.NONE:E.MEMBER)||"[]";switch(I){case"FIRST":if(_==="GET")return[f+"[0]",E.MEMBER];if(_==="GET_REMOVE")return[f+".pop(0)",E.FUNCTION_CALL];if(_==="REMOVE")return f+`.pop(0)
 `;break;case"LAST":if(_==="GET")return[f+"[-1]",E.MEMBER];if(_==="GET_REMOVE")return[f+".pop()",E.FUNCTION_CALL];if(_==="REMOVE")return f+`.pop()
