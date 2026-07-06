@@ -1664,6 +1664,40 @@ a {
   height: 100%;
 }
 
+.scratch-blockly-flyout-resize {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 7;
+  width: 10px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  cursor: ew-resize;
+  transform: translateX(-5px);
+}
+
+.scratch-blockly-flyout-resize::before {
+  content: '';
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  left: 4px;
+  width: 2px;
+  border-radius: 999px;
+  background: rgb(15 98 254 / 18%);
+  transition:
+    background-color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+.scratch-blockly-flyout-resize:hover::before,
+.scratch-blockly-flyout-resize.is-resizing::before {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgb(15 98 254 / 12%);
+}
+
 .scratch-blockly-frame-actions {
   position: absolute;
   top: 18px;

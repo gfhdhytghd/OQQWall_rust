@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { Button, Input } from '@heroui/react'
 import * as Blockly from 'scratch-blocks'
 import * as ZhHans from 'blockly/msg/zh-hans'
@@ -54,6 +54,9 @@ const IF_BLOCK_TYPE = 'oqqwall_if'
 const SET_DRAFT_TRANSFORMS_BLOCK_TYPE = 'oqqwall_set_draft_transforms'
 const MOVE_BLOCKS_BLOCK_TYPE = 'oqqwall_move_blocks'
 const SELECTOR_BLOCK_TYPE = 'oqqwall_block_selector'
+const SELECTOR_KIND_BLOCK_TYPE = 'oqqwall_selector_kind'
+const TEXT_MATCHER_BLOCK_TYPE = 'oqqwall_text_matcher'
+const INDEX_FILTER_BLOCK_TYPE = 'oqqwall_index_filter'
 const POSITION_BLOCK_TYPE = 'oqqwall_position'
 const CONDITION_HAS_BLOCK_TYPE = 'oqqwall_condition_has_block'
 const CONDITION_COUNT_BLOCK_TYPE = 'oqqwall_condition_count'
@@ -63,6 +66,10 @@ const VARIABLE_TOKEN_BLOCK_TYPE = 'oqqwall_variable_token'
 const TEXT_LITERAL_BLOCK_TYPE = 'oqqwall_text_literal'
 const JOIN_TEXT_BLOCK_TYPE = 'oqqwall_join_text'
 const SCRATCH_BLOCKS_MEDIA_PATH = '/scratch-blocks-media/'
+const BLOCKLY_FLYOUT_WIDTH_STORAGE_KEY = 'oqqwall.agentBlockly.flyoutWidth'
+const BLOCKLY_FLYOUT_WIDTH_DEFAULT = 250
+const BLOCKLY_FLYOUT_WIDTH_MIN = 220
+const BLOCKLY_FLYOUT_WIDTH_MAX = 520
 
 const AGENT_COMMAND_TRIGGER_OPTIONS: Array<{ value: AgentCommandTrigger; label: string }> = [
   { value: 'private_command', label: '私聊指令' },
@@ -179,6 +186,16 @@ const scratchTheme = Blockly.Theme.defineTheme('oqqwall_scratch', {
       colourSecondary: '#0b8f6a',
       colourTertiary: '#087654',
     },
+    condition_blocks: {
+      colourPrimary: '#14a38b',
+      colourSecondary: '#0f7c69',
+      colourTertiary: '#0b6657',
+    },
+    transform_blocks: {
+      colourPrimary: '#008fc4',
+      colourSecondary: '#006d93',
+      colourTertiary: '#005b78',
+    },
     variable_blocks: {
       colourPrimary: '#ff6680',
       colourSecondary: '#d84f66',
@@ -192,6 +209,8 @@ const scratchTheme = Blockly.Theme.defineTheme('oqqwall_scratch', {
     review_category: { colour: '#59c059' },
     system_category: { colour: '#9966ff' },
     rule_category: { colour: '#0fbd8c' },
+    condition_category: { colour: '#14a38b' },
+    transform_category: { colour: '#008fc4' },
     variable_category: { colour: '#ff6680' },
   },
   componentStyles: {
@@ -450,13 +469,26 @@ function ScratchBlocklyEditor({
   const onChangeRef = useRef(onChange)
   const initialBlocksRef = useRef(blocks)
   const initialTriggerRef = useRef(trigger)
+  const blocklyFlyoutWidthRef = useRef(BLOCKLY_FLYOUT_WIDTH_DEFAULT)
   const [isFullscreen, setFullscreen] = useState(false)
   const [hasDetachedBlocks, setHasDetachedBlocks] = useState(false)
+  const [blocklyFlyoutWidth, setBlocklyFlyoutWidth] = useState(readStoredBlocklyFlyoutWidth)
+  const [blocklyFlyoutResizeLeft, setBlocklyFlyoutResizeLeft] = useState<number | null>(null)
+  const [isResizingBlocklyFlyout, setResizingBlocklyFlyout] = useState(false)
   const toolbox = useMemo(() => buildToolbox(variables), [variables])
 
   useEffect(() => {
     onChangeRef.current = onChange
   }, [onChange])
+
+  useEffect(() => {
+    blocklyFlyoutWidthRef.current = blocklyFlyoutWidth
+    const workspace = workspaceRef.current
+    if (!workspace) return
+
+    applyBlocklyFlyoutWidth(workspace, blocklyFlyoutWidth)
+    setBlocklyFlyoutResizeLeft(getBlocklyFlyoutResizeLeft(workspace, blocklyFlyoutWidth))
+  }, [blocklyFlyoutWidth])
 
   useEffect(() => {
     registerAgentCommandBlocks()
@@ -493,6 +525,8 @@ function ScratchBlocklyEditor({
       },
     } as Parameters<typeof Blockly.inject>[1] & { media: string })
     workspaceRef.current = workspace
+    applyBlocklyFlyoutWidth(workspace, blocklyFlyoutWidthRef.current)
+    setBlocklyFlyoutResizeLeft(getBlocklyFlyoutResizeLeft(workspace, blocklyFlyoutWidthRef.current))
 
     loadAgentBlocksIntoWorkspace(workspace, initialBlocksRef.current, initialTriggerRef.current)
     setHasDetachedBlocks(workspaceHasDetachedAgentBlocks(workspace))
@@ -510,7 +544,12 @@ function ScratchBlocklyEditor({
 
     const resizeObserver = new ResizeObserver(() => Blockly.svgResize(workspace))
     resizeObserver.observe(containerRef.current)
-    window.requestAnimationFrame(() => Blockly.svgResize(workspace))
+    window.requestAnimationFrame(() => {
+      applyBlocklyFlyoutWidth(workspace, blocklyFlyoutWidthRef.current)
+      setBlocklyFlyoutResizeLeft(
+        getBlocklyFlyoutResizeLeft(workspace, blocklyFlyoutWidthRef.current)
+      )
+    })
     const cleanupDropdownCorrection = installBlocklyDropdownCorrection(containerRef.current)
 
     return () => {
@@ -526,7 +565,12 @@ function ScratchBlocklyEditor({
     const workspace = workspaceRef.current
     if (!workspace) return
 
-    const resize = () => Blockly.svgResize(workspace)
+    const resize = () => {
+      applyBlocklyFlyoutWidth(workspace, blocklyFlyoutWidthRef.current)
+      setBlocklyFlyoutResizeLeft(
+        getBlocklyFlyoutResizeLeft(workspace, blocklyFlyoutWidthRef.current)
+      )
+    }
     const animationFrame = window.requestAnimationFrame(resize)
     const timeout = window.setTimeout(resize, 180)
     return () => {
@@ -591,6 +635,37 @@ function ScratchBlocklyEditor({
     window.setTimeout(() => workspace.endCanvasTransition?.(), 500)
   }
 
+  function beginBlocklyFlyoutResize(event: ReactPointerEvent<HTMLButtonElement>) {
+    const workspace = workspaceRef.current
+    if (!workspace) return
+
+    event.preventDefault()
+    event.currentTarget.setPointerCapture?.(event.pointerId)
+    const startX = event.clientX
+    const startWidth = blocklyFlyoutWidthRef.current
+    setResizingBlocklyFlyout(true)
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const nextWidth = clampBlocklyFlyoutWidth(startWidth + moveEvent.clientX - startX)
+      blocklyFlyoutWidthRef.current = nextWidth
+      setBlocklyFlyoutWidth(nextWidth)
+      applyBlocklyFlyoutWidth(workspace, nextWidth)
+      setBlocklyFlyoutResizeLeft(getBlocklyFlyoutResizeLeft(workspace, nextWidth))
+    }
+
+    const stopResize = () => {
+      setResizingBlocklyFlyout(false)
+      writeStoredBlocklyFlyoutWidth(blocklyFlyoutWidthRef.current)
+      window.removeEventListener('pointermove', onPointerMove)
+      window.removeEventListener('pointerup', stopResize)
+      window.removeEventListener('pointercancel', stopResize)
+    }
+
+    window.addEventListener('pointermove', onPointerMove)
+    window.addEventListener('pointerup', stopResize)
+    window.addEventListener('pointercancel', stopResize)
+  }
+
   return (
     <div className="scratch-blockly-shell">
       {hasDetachedBlocks ? (
@@ -600,6 +675,18 @@ function ScratchBlocklyEditor({
       ) : null}
       <div className={`scratch-blockly-frame${isFullscreen ? ' is-fullscreen' : ''}`}>
         <div ref={containerRef} className="scratch-blockly-workspace" />
+        {blocklyFlyoutResizeLeft === null ? null : (
+          <button
+            type="button"
+            className={`scratch-blockly-flyout-resize${
+              isResizingBlocklyFlyout ? ' is-resizing' : ''
+            }`}
+            style={{ left: blocklyFlyoutResizeLeft }}
+            aria-label="调整左侧积木区域宽度"
+            title="拖动调整左侧积木区域宽度"
+            onPointerDown={beginBlocklyFlyoutResize}
+          />
+        )}
         <div className="scratch-blockly-frame-actions">
           <button
             type="button"
@@ -643,6 +730,75 @@ function ScratchBlocklyEditor({
       </div>
     </div>
   )
+}
+
+type ResizableBlocklyFlyout = NonNullable<ReturnType<Blockly.WorkspaceSvg['getFlyout']>> & {
+  __oqqwallOriginalGetWidth?: () => number
+  getWorkspace?: () => Blockly.WorkspaceSvg
+  position?: () => void
+  reflow?: () => void
+}
+
+type ResizeAwareBlocklyWorkspace = Blockly.WorkspaceSvg & {
+  recordDragTargets?: () => void
+  resizeContents?: () => void
+}
+
+function readStoredBlocklyFlyoutWidth() {
+  if (typeof window === 'undefined') return BLOCKLY_FLYOUT_WIDTH_DEFAULT
+
+  try {
+    const storedValue = Number.parseInt(
+      window.localStorage.getItem(BLOCKLY_FLYOUT_WIDTH_STORAGE_KEY) ?? '',
+      10
+    )
+    return clampBlocklyFlyoutWidth(storedValue)
+  } catch {
+    return BLOCKLY_FLYOUT_WIDTH_DEFAULT
+  }
+}
+
+function writeStoredBlocklyFlyoutWidth(width: number) {
+  try {
+    window.localStorage.setItem(
+      BLOCKLY_FLYOUT_WIDTH_STORAGE_KEY,
+      String(clampBlocklyFlyoutWidth(width))
+    )
+  } catch {
+    // Persisting the UI preference is optional.
+  }
+}
+
+function clampBlocklyFlyoutWidth(width: number) {
+  if (!Number.isFinite(width)) return BLOCKLY_FLYOUT_WIDTH_DEFAULT
+  return Math.min(BLOCKLY_FLYOUT_WIDTH_MAX, Math.max(BLOCKLY_FLYOUT_WIDTH_MIN, Math.round(width)))
+}
+
+function applyBlocklyFlyoutWidth(workspace: Blockly.WorkspaceSvg, width: number) {
+  const flyout = workspace.getFlyout() as ResizableBlocklyFlyout | null
+  if (!flyout) {
+    Blockly.svgResize(workspace)
+    return
+  }
+
+  const nextWidth = clampBlocklyFlyoutWidth(width)
+  if (!flyout.__oqqwallOriginalGetWidth) {
+    flyout.__oqqwallOriginalGetWidth = flyout.getWidth.bind(flyout)
+  }
+  flyout.getWidth = () => nextWidth
+  flyout.reflow?.()
+  flyout.position?.()
+  flyout.getWorkspace?.().resizeContents?.()
+
+  const resizeAwareWorkspace = workspace as ResizeAwareBlocklyWorkspace
+  resizeAwareWorkspace.resizeContents?.()
+  resizeAwareWorkspace.recordDragTargets?.()
+  Blockly.svgResize(workspace)
+}
+
+function getBlocklyFlyoutResizeLeft(workspace: Blockly.WorkspaceSvg, width: number) {
+  const toolboxWidth = workspace.getToolbox()?.getWidth() ?? 0
+  return toolboxWidth + clampBlocklyFlyoutWidth(width)
 }
 
 function installBlocklyDropdownCorrection(container: HTMLElement) {
@@ -962,7 +1118,7 @@ function registerAgentCommandBlocks() {
       args2: [{ type: 'input_statement', name: 'TRANSFORMS', check: 'DraftTransform' }],
       previousStatement: null,
       nextStatement: null,
-      style: 'rule_blocks',
+      style: 'transform_blocks',
       tooltip: '把一组内容块变换保存到指定待处理稿件，并触发重渲染。',
     },
     {
@@ -971,15 +1127,16 @@ function registerAgentCommandBlocks() {
       args0: [selectorValueArg('SELECTOR'), positionValueArg('POSITION')],
       previousStatement: 'DraftTransform',
       nextStatement: 'DraftTransform',
-      style: 'rule_blocks',
+      style: 'transform_blocks',
       tooltip: '按选择器找出内容块，保持相对顺序移动到目标位置。',
     },
     {
       type: CONDITION_HAS_BLOCK_TYPE,
       message0: '含 %1 块',
       args0: [selectorValueArg('SELECTOR')],
-      output: 'RuleCondition',
-      style: 'rule_blocks',
+      output: 'Boolean',
+      outputShape: Blockly.OUTPUT_SHAPE_HEXAGONAL,
+      style: 'condition_blocks',
       tooltip: '判断当前稿件是否含有命中选择器的内容块。',
     },
     {
@@ -994,8 +1151,9 @@ function registerAgentCommandBlocks() {
         },
         { type: 'field_input', name: 'N', text: '1' },
       ],
-      output: 'RuleCondition',
-      style: 'rule_blocks',
+      output: 'Boolean',
+      outputShape: Blockly.OUTPUT_SHAPE_HEXAGONAL,
+      style: 'condition_blocks',
       tooltip: '判断命中选择器的块数量。',
     },
     {
@@ -1010,21 +1168,35 @@ function registerAgentCommandBlocks() {
         },
         conditionValueArg('RIGHT'),
       ],
-      output: 'RuleCondition',
-      style: 'rule_blocks',
+      output: 'Boolean',
+      outputShape: Blockly.OUTPUT_SHAPE_HEXAGONAL,
+      style: 'condition_blocks',
       tooltip: '组合两个条件。',
     },
     {
       type: CONDITION_NOT_BLOCK_TYPE,
       message0: '非 %1',
       args0: [conditionValueArg('CONDITION')],
-      output: 'RuleCondition',
-      style: 'rule_blocks',
+      output: 'Boolean',
+      outputShape: Blockly.OUTPUT_SHAPE_HEXAGONAL,
+      style: 'condition_blocks',
       tooltip: '反转一个条件。',
     },
     {
       type: SELECTOR_BLOCK_TYPE,
       message0: '选择 %1',
+      args0: [selectorKindValueArg('KIND')],
+      message1: '文本 %1',
+      args1: [textMatcherValueArg('TEXT')],
+      message2: '序号 %1',
+      args2: [indexFilterValueArg('INDEX')],
+      output: 'BlockSelector',
+      style: 'condition_blocks',
+      tooltip: '按块类型、段落文本和过滤后的序号选择内容块。',
+    },
+    {
+      type: SELECTOR_KIND_BLOCK_TYPE,
+      message0: '%1',
       args0: [
         {
           type: 'field_dropdown',
@@ -1032,8 +1204,14 @@ function registerAgentCommandBlocks() {
           options: dropdownOptions(BLOCK_KIND_SELECTION_OPTIONS),
         },
       ],
-      message1: '文本 %1 %2',
-      args1: [
+      output: 'SelectorKind',
+      style: 'condition_blocks',
+      tooltip: '选择匹配的内容块类型。',
+    },
+    {
+      type: TEXT_MATCHER_BLOCK_TYPE,
+      message0: '%1 %2',
+      args0: [
         {
           type: 'field_dropdown',
           name: 'TEXT_MODE',
@@ -1041,8 +1219,14 @@ function registerAgentCommandBlocks() {
         },
         { type: 'field_input', name: 'TEXT', text: '' },
       ],
-      message2: '序号 %1 N %2 至 %3',
-      args2: [
+      output: 'TextMatcher',
+      style: 'condition_blocks',
+      tooltip: '按段落文本过滤内容块。',
+    },
+    {
+      type: INDEX_FILTER_BLOCK_TYPE,
+      message0: '%1 N %2 至 %3',
+      args0: [
         {
           type: 'field_dropdown',
           name: 'INDEX_MODE',
@@ -1051,9 +1235,9 @@ function registerAgentCommandBlocks() {
         { type: 'field_input', name: 'N', text: '0' },
         { type: 'field_input', name: 'END', text: '0' },
       ],
-      output: 'BlockSelector',
-      style: 'rule_blocks',
-      tooltip: '按块类型、段落文本和过滤后的序号选择内容块。',
+      output: 'IndexFilter',
+      style: 'condition_blocks',
+      tooltip: '按过滤后的块序号选择内容块。',
     },
     {
       type: POSITION_BLOCK_TYPE,
@@ -1068,7 +1252,7 @@ function registerAgentCommandBlocks() {
         selectorValueArg('SELECTOR'),
       ],
       output: 'PositionSpec',
-      style: 'rule_blocks',
+      style: 'transform_blocks',
       tooltip: '指定移动后的插入位置；之前/之后需要参照选择器。',
     },
     {
@@ -1179,31 +1363,13 @@ function buildToolbox(variables: AgentCommandVariable[]) {
               CONDITION: conditionInputShadow(),
             },
           },
-          {
-            kind: 'block',
-            type: SET_DRAFT_TRANSFORMS_BLOCK_TYPE,
-            fields: { TARGET: 'triggering_post' },
-            inputs: {
-              REVIEW_CODE: textInputShadow('<previous_post_internal_code>'),
-              TRANSFORMS: {
-                block: {
-                  type: MOVE_BLOCKS_BLOCK_TYPE,
-                  inputs: {
-                    SELECTOR: selectorInputShadow('paragraph'),
-                    POSITION: positionInputShadow('front'),
-                  },
-                },
-              },
-            },
-          },
-          {
-            kind: 'block',
-            type: MOVE_BLOCKS_BLOCK_TYPE,
-            inputs: {
-              SELECTOR: selectorInputShadow('paragraph'),
-              POSITION: positionInputShadow('front'),
-            },
-          },
+        ],
+      },
+      {
+        kind: 'category',
+        name: '条件',
+        categorystyle: 'condition_category',
+        contents: [
           {
             kind: 'block',
             type: CONDITION_COUNT_BLOCK_TYPE,
@@ -1238,7 +1404,39 @@ function buildToolbox(variables: AgentCommandVariable[]) {
           {
             kind: 'block',
             type: SELECTOR_BLOCK_TYPE,
-            fields: { KIND: 'paragraph', TEXT_MODE: 'none', INDEX_MODE: 'all' },
+            inputs: selectorBlockInputShadows('paragraph'),
+          },
+        ],
+      },
+      {
+        kind: 'category',
+        name: '变换',
+        categorystyle: 'transform_category',
+        contents: [
+          {
+            kind: 'block',
+            type: SET_DRAFT_TRANSFORMS_BLOCK_TYPE,
+            fields: { TARGET: 'triggering_post' },
+            inputs: {
+              REVIEW_CODE: textInputShadow('<previous_post_internal_code>'),
+              TRANSFORMS: {
+                block: {
+                  type: MOVE_BLOCKS_BLOCK_TYPE,
+                  inputs: {
+                    SELECTOR: selectorInputShadow('paragraph'),
+                    POSITION: positionInputShadow('front'),
+                  },
+                },
+              },
+            },
+          },
+          {
+            kind: 'block',
+            type: MOVE_BLOCKS_BLOCK_TYPE,
+            inputs: {
+              SELECTOR: selectorInputShadow('paragraph'),
+              POSITION: positionInputShadow('front'),
+            },
           },
           {
             kind: 'block',
@@ -1368,11 +1566,47 @@ function createSelectorBlock(
 ): Blockly.Block {
   const block = workspace.newBlock(SELECTOR_BLOCK_TYPE) as Blockly.BlockSvg
   block.initSvg()
-  setBlocklyField(block, 'KIND', selectorKindSelection(selector))
+  setBlocklySelectorKindInput(block, 'KIND', selectorKindSelection(selector))
   const text = selector.text ?? null
-  setBlocklyField(block, 'TEXT_MODE', textMatcherSelection(text))
-  setBlocklyField(block, 'TEXT', textMatcherValue(text))
+  setBlocklyTextMatcherInput(block, 'TEXT', text)
   const index = selector.index ?? null
+  setBlocklyIndexFilterInput(block, 'INDEX', index)
+  block.render()
+  return block
+}
+
+function createSelectorKindBlock(
+  workspace: Blockly.Workspace,
+  kind: BlockKindSelection
+): Blockly.Block {
+  const block = workspace.newBlock(SELECTOR_KIND_BLOCK_TYPE) as Blockly.BlockSvg
+  block.setShadow(true)
+  block.initSvg()
+  setBlocklyField(block, 'KIND', kind)
+  block.render()
+  return block
+}
+
+function createTextMatcherBlock(
+  workspace: Blockly.Workspace,
+  matcher: TextMatcher | null
+): Blockly.Block {
+  const block = workspace.newBlock(TEXT_MATCHER_BLOCK_TYPE) as Blockly.BlockSvg
+  block.setShadow(true)
+  block.initSvg()
+  setBlocklyField(block, 'TEXT_MODE', textMatcherSelection(matcher))
+  setBlocklyField(block, 'TEXT', textMatcherValue(matcher))
+  block.render()
+  return block
+}
+
+function createIndexFilterBlock(
+  workspace: Blockly.Workspace,
+  index: IndexFilter | null
+): Blockly.Block {
+  const block = workspace.newBlock(INDEX_FILTER_BLOCK_TYPE) as Blockly.BlockSvg
+  block.setShadow(true)
+  block.initSvg()
   setBlocklyField(block, 'INDEX_MODE', indexFilterSelection(index))
   setBlocklyField(block, 'N', indexFilterStart(index))
   setBlocklyField(block, 'END', indexFilterEnd(index))
@@ -1976,13 +2210,13 @@ function blocklyBlockToBlockSelector(block: Blockly.Block): BlockSelector {
   if (block.type !== SELECTOR_BLOCK_TYPE) return defaultBlockSelector('paragraph')
 
   const selector: BlockSelector = {}
-  const kinds = blockKindSelectionToKinds(readBlocklyField(block, 'KIND') as BlockKindSelection)
+  const kinds = blockKindSelectionToKinds(readSelectorKindInput(block, 'KIND'))
   if (kinds) selector.kinds = kinds
 
-  const text = readTextMatcher(block)
+  const text = readTextMatcherInput(block, 'TEXT')
   if (text) selector.text = text
 
-  const index = readIndexFilter(block)
+  const index = readIndexFilterInput(block, 'INDEX')
   if (index) selector.index = index
 
   return selector
@@ -2016,7 +2250,19 @@ function blocklyBlockToPositionSpec(block: Blockly.Block): PositionSpec {
   }
 }
 
+function readSelectorKindInput(block: Blockly.Block, inputName: string): BlockKindSelection {
+  const targetBlock = block.getInputTargetBlock(inputName)
+  if (targetBlock?.type !== SELECTOR_KIND_BLOCK_TYPE) return 'paragraph'
+  return readBlocklyField(targetBlock, 'KIND') as BlockKindSelection
+}
+
+function readTextMatcherInput(block: Blockly.Block, inputName: string): TextMatcher | null {
+  const targetBlock = block.getInputTargetBlock(inputName)
+  return targetBlock ? readTextMatcher(targetBlock) : null
+}
+
 function readTextMatcher(block: Blockly.Block): TextMatcher | null {
+  if (block.type !== TEXT_MATCHER_BLOCK_TYPE) return null
   const mode = readBlocklyField(block, 'TEXT_MODE') as TextMatcherSelection
   const value = readBlocklyField(block, 'TEXT')
   switch (mode) {
@@ -2035,7 +2281,13 @@ function readTextMatcher(block: Blockly.Block): TextMatcher | null {
   }
 }
 
+function readIndexFilterInput(block: Blockly.Block, inputName: string): IndexFilter | null {
+  const targetBlock = block.getInputTargetBlock(inputName)
+  return targetBlock ? readIndexFilter(targetBlock) : null
+}
+
 function readIndexFilter(block: Blockly.Block): IndexFilter | null {
+  if (block.type !== INDEX_FILTER_BLOCK_TYPE) return null
   switch (readBlocklyField(block, 'INDEX_MODE') as IndexFilterSelection) {
     case 'first':
       return { mode: 'first' }
@@ -2206,12 +2458,24 @@ function selectorValueArg(name: string) {
   return { type: 'input_value', name, check: 'BlockSelector' }
 }
 
+function selectorKindValueArg(name: string) {
+  return { type: 'input_value', name, check: 'SelectorKind' }
+}
+
+function textMatcherValueArg(name: string) {
+  return { type: 'input_value', name, check: 'TextMatcher' }
+}
+
+function indexFilterValueArg(name: string) {
+  return { type: 'input_value', name, check: 'IndexFilter' }
+}
+
 function positionValueArg(name: string) {
   return { type: 'input_value', name, check: 'PositionSpec' }
 }
 
 function conditionValueArg(name: string) {
-  return { type: 'input_value', name, check: 'RuleCondition' }
+  return { type: 'input_value', name, check: 'Boolean' }
 }
 
 function textInputShadows(values: Record<string, string>) {
@@ -2229,11 +2493,53 @@ function textInputShadow(value: string) {
   }
 }
 
+function selectorBlockInputShadows(kind: BlockKindSelection) {
+  return {
+    KIND: selectorKindInputShadow(kind),
+    TEXT: textMatcherInputShadow(null),
+    INDEX: indexFilterInputShadow(null),
+  }
+}
+
+function selectorKindInputShadow(kind: BlockKindSelection) {
+  return {
+    shadow: {
+      type: SELECTOR_KIND_BLOCK_TYPE,
+      fields: { KIND: kind },
+    },
+  }
+}
+
+function textMatcherInputShadow(matcher: TextMatcher | null) {
+  return {
+    shadow: {
+      type: TEXT_MATCHER_BLOCK_TYPE,
+      fields: {
+        TEXT_MODE: textMatcherSelection(matcher),
+        TEXT: textMatcherValue(matcher),
+      },
+    },
+  }
+}
+
+function indexFilterInputShadow(index: IndexFilter | null) {
+  return {
+    shadow: {
+      type: INDEX_FILTER_BLOCK_TYPE,
+      fields: {
+        INDEX_MODE: indexFilterSelection(index),
+        N: indexFilterStart(index),
+        END: indexFilterEnd(index),
+      },
+    },
+  }
+}
+
 function selectorInputShadow(kind: BlockKindSelection) {
   return {
     shadow: {
       type: SELECTOR_BLOCK_TYPE,
-      fields: { KIND: kind, TEXT_MODE: 'none', INDEX_MODE: 'all', N: '0', END: '0' },
+      inputs: selectorBlockInputShadows(kind),
     },
   }
 }
@@ -2282,6 +2588,30 @@ function setBlocklyTextInput(block: Blockly.Block, inputName: string, value: str
 
 function setBlocklySelectorInput(block: Blockly.Block, inputName: string, selector: BlockSelector) {
   setBlocklyOutputInput(block, inputName, createSelectorBlock(block.workspace, selector))
+}
+
+function setBlocklySelectorKindInput(
+  block: Blockly.Block,
+  inputName: string,
+  kind: BlockKindSelection
+) {
+  setBlocklyOutputInput(block, inputName, createSelectorKindBlock(block.workspace, kind))
+}
+
+function setBlocklyTextMatcherInput(
+  block: Blockly.Block,
+  inputName: string,
+  matcher: TextMatcher | null
+) {
+  setBlocklyOutputInput(block, inputName, createTextMatcherBlock(block.workspace, matcher))
+}
+
+function setBlocklyIndexFilterInput(
+  block: Blockly.Block,
+  inputName: string,
+  index: IndexFilter | null
+) {
+  setBlocklyOutputInput(block, inputName, createIndexFilterBlock(block.workspace, index))
 }
 
 function setBlocklyPositionInput(block: Blockly.Block, inputName: string, position: PositionSpec) {
