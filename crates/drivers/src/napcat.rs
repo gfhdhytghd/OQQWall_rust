@@ -1100,6 +1100,9 @@ const FRIEND_APPROVE_DELAY_MAX_SEC: u64 = 240;
 const FRIEND_NOTIFY_DELAY_SEC: u64 = 30;
 const FRIEND_REQUEST_ID_MAX_LEN: usize = 20;
 const PENDING_SUBMISSION_RECALL_TTL_MS: i64 = 10 * 60 * 1000;
+const SUBMISSION_MESSAGE_LOOKUP_TIMEOUT_SEC: u64 = 5;
+const SUBMISSION_RECALL_PROBE_FIRST_DELAY_SEC: u64 = 3;
+const SUBMISSION_RECALL_PROBE_CONFIRM_DELAY_SEC: u64 = 3;
 const FRIEND_SUPPRESS_REMOVE_CHARS: &str =
     r#"　“”‘’《》〈〉【】。，：；？！（）、「」『』—［］＂＇"'`~!@#$%^&*()_+-={}[]|:;<>?,./"#;
 static STARTUP_NOTICE_SENT: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
@@ -3466,13 +3469,13 @@ async fn handle_action_response(
         }
         PendingAction::WsRequest { resp_tx } => {
             if status != "ok" || retcode != 0 {
-                let msg = value
-                    .get("msg")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
                 let mut error = format!("status={} retcode={}", status, retcode);
-                if !msg.is_empty() {
-                    error.push_str(&format!(" msg={}", msg));
+                for field in ["msg", "message", "wording"] {
+                    if let Some(text) = value.get(field).and_then(|value| value.as_str()) {
+                        if !text.trim().is_empty() {
+                            error.push_str(&format!(" {}={}", field, text.trim()));
+                        }
+                    }
                 }
                 let _ = resp_tx.send(Err(error));
                 return None;
@@ -4048,13 +4051,31 @@ async fn parse_inbound_event(
             let mut guard = state.lock().await;
             if guard.submission_sessions.contains_key(&user_id) {
                 if builtin_submission_command == Some(PrivateSubmissionCommand::Finish) {
-                    let (count, preview_session, preview_prefetch) =
-                        if let Some(session) = guard.submission_sessions.get_mut(&user_id) {
-                            session.confirming = true;
-                            let count = session.messages.len();
-                            let preview_session = session.clone();
-                            let preview_prefetch = guard.submission_prefetch.clone();
-                            (count, preview_session, preview_prefetch)
+                    let count = if let Some(session) = guard.submission_sessions.get_mut(&user_id) {
+                        session.confirming = true;
+                        session.messages.len()
+                    } else {
+                        0
+                    };
+                    drop(guard);
+                    if count > 0 {
+                        send_private_text(out_tx, &user_id, "处理中...").await;
+                        if let Some(reply) =
+                            validate_recalled_submission_session_messages(state, &self_id, &user_id)
+                                .await
+                        {
+                            send_private_text(out_tx, &reply.user_id, &reply.text).await;
+                            return None;
+                        }
+                    }
+                    let (count, preview_session, preview_prefetch) = {
+                        let guard = state.lock().await;
+                        if let Some(session) = guard.submission_sessions.get(&user_id) {
+                            (
+                                session.messages.len(),
+                                session.clone(),
+                                guard.submission_prefetch.clone(),
+                            )
                         } else {
                             (
                                 0,
@@ -4066,14 +4087,13 @@ async fn parse_inbound_event(
                                 },
                                 HashMap::new(),
                             )
-                        };
-                    drop(guard);
+                        }
+                    };
                     let confirm_text = format!(
                         "收到共 {} 条消息。\n发送 #确认 提交投稿\n发送 #追加 继续添加内容\n发送 #取消 放弃本次投稿",
                         count
                     );
                     if count > 0 {
-                        send_private_text(out_tx, &user_id, "处理中...").await;
                         match render_submission_session_preview_image(
                             runtime,
                             cmd_tx,
@@ -4113,6 +4133,35 @@ async fn parse_inbound_event(
                     return None;
                 }
                 if builtin_submission_command == Some(PrivateSubmissionCommand::Confirm) {
+                    match guard.submission_sessions.get(&user_id) {
+                        Some(session_meta) if !session_meta.confirming => {
+                            drop(guard);
+                            send_private_text(out_tx, &user_id, "请先发送 #结束投稿 再确认。")
+                                .await;
+                            return None;
+                        }
+                        Some(session_meta) if session_meta.messages.is_empty() => {
+                            if let Some(session) = guard.submission_sessions.remove(&user_id) {
+                                clear_submission_prefetch_for_session(
+                                    &mut guard, &self_id, &user_id, &session,
+                                );
+                            }
+                            drop(guard);
+                            send_private_text(out_tx, &user_id, "没有可提交的内容。").await;
+                            return None;
+                        }
+                        Some(_) => {}
+                        None => return None,
+                    }
+                    drop(guard);
+                    if let Some(reply) =
+                        validate_recalled_submission_session_messages(state, &self_id, &user_id)
+                            .await
+                    {
+                        send_private_text(out_tx, &reply.user_id, &reply.text).await;
+                        return None;
+                    }
+                    let mut guard = state.lock().await;
                     let Some(session_meta) = guard.submission_sessions.get(&user_id) else {
                         return None;
                     };
@@ -4131,7 +4180,6 @@ async fn parse_inbound_event(
                         send_private_text(out_tx, &user_id, "没有可提交的内容。").await;
                         return None;
                     }
-
                     let count = session_meta.messages.len();
                     let prepared = match build_submission_session_ingress_batch(
                         runtime,
@@ -4218,7 +4266,10 @@ async fn parse_inbound_event(
                     send_private_text(out_tx, &user_id, "请先发送 #确认、#取消 或 #追加。").await;
                     return None;
                 }
-                let (count, prefetch_requests) = if let Some((next_index, started_at_ms)) =
+                let (count, prefetch_requests, probe_message_id) = if let Some((
+                    next_index,
+                    started_at_ms,
+                )) =
                     guard.submission_sessions.get(&user_id).map(|session| {
                         (
                             session.messages.len().saturating_add(1),
@@ -4258,15 +4309,24 @@ async fn parse_inbound_event(
                             &platform_msg_id,
                             &attachments,
                         );
-                        (count, requests)
+                        (count, requests, Some(platform_msg_id))
                     } else {
-                        (0, Vec::new())
+                        (0, Vec::new(), None)
                     }
                 } else {
-                    (0, Vec::new())
+                    (0, Vec::new(), None)
                 };
                 drop(guard);
                 start_submission_prefetches(Arc::clone(state), prefetch_requests);
+                if let Some(probe_message_id) = probe_message_id {
+                    spawn_submission_recall_probe(
+                        Arc::clone(state),
+                        out_tx.clone(),
+                        self_id.clone(),
+                        user_id.clone(),
+                        probe_message_id,
+                    );
+                }
                 send_private_text(
                     out_tx,
                     &user_id,
@@ -4737,6 +4797,13 @@ struct RecalledSubmissionReply {
     text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmissionMessageAvailability {
+    Available,
+    RecalledOrMissing,
+    Unknown,
+}
+
 async fn remove_recalled_submission_session_message(
     state: &Arc<Mutex<NapCatState>>,
     account_id: &str,
@@ -4744,6 +4811,7 @@ async fn remove_recalled_submission_session_message(
     message_id: &str,
 ) -> Option<RecalledSubmissionReply> {
     let mut guard = state.lock().await;
+    let message_ids = vec![message_id.to_string()];
     let user_id = user_id_candidates
         .iter()
         .find(|candidate| {
@@ -4761,18 +4829,56 @@ async fn remove_recalled_submission_session_message(
                     session_has_recalled_message(session, message_id).then(|| candidate.clone())
                 })
         })?;
+    remove_recalled_submission_session_messages_locked(
+        &mut guard,
+        account_id,
+        &user_id,
+        &message_ids,
+    )
+}
+
+async fn remove_recalled_submission_session_messages(
+    state: &Arc<Mutex<NapCatState>>,
+    account_id: &str,
+    user_id: &str,
+    message_ids: &[String],
+) -> Option<RecalledSubmissionReply> {
+    let mut guard = state.lock().await;
+    remove_recalled_submission_session_messages_locked(&mut guard, account_id, user_id, message_ids)
+}
+
+fn remove_recalled_submission_session_messages_locked(
+    guard: &mut NapCatState,
+    account_id: &str,
+    user_id: &str,
+    message_ids: &[String],
+) -> Option<RecalledSubmissionReply> {
+    let message_ids = message_ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<HashSet<_>>();
+    if message_ids.is_empty() {
+        return None;
+    }
     let (removed, count, was_confirming) = {
-        let session = guard.submission_sessions.get_mut(&user_id)?;
+        let session = guard.submission_sessions.get_mut(user_id)?;
         let before = session.messages.len();
         let removed = session
             .messages
             .iter()
-            .filter(|buffered| buffered_message_matches_recall(buffered, message_id))
+            .filter(|buffered| {
+                message_ids
+                    .iter()
+                    .any(|message_id| buffered_message_matches_recall(buffered, message_id))
+            })
             .cloned()
             .collect::<Vec<_>>();
-        session
-            .messages
-            .retain(|buffered| !buffered_message_matches_recall(buffered, message_id));
+        session.messages.retain(|buffered| {
+            !message_ids
+                .iter()
+                .any(|message_id| buffered_message_matches_recall(buffered, message_id))
+        });
         if session.messages.len() == before {
             return None;
         }
@@ -4788,7 +4894,7 @@ async fn remove_recalled_submission_session_message(
         for attachment_index in 0..attachments.len() {
             let key = submission_prefetch_key(
                 account_id,
-                &user_id,
+                user_id,
                 &buffered.platform_msg_id,
                 attachment_index,
             );
@@ -4806,7 +4912,195 @@ async fn remove_recalled_submission_session_message(
     } else {
         format!("已移除撤回的投稿消息，当前共 {} 条。", count)
     };
-    Some(RecalledSubmissionReply { user_id, text })
+    Some(RecalledSubmissionReply {
+        user_id: user_id.to_string(),
+        text,
+    })
+}
+
+async fn validate_recalled_submission_session_messages(
+    state: &Arc<Mutex<NapCatState>>,
+    account_id: &str,
+    user_id: &str,
+) -> Option<RecalledSubmissionReply> {
+    let message_ids = {
+        let guard = state.lock().await;
+        guard
+            .submission_sessions
+            .get(user_id)
+            .map(verifiable_submission_message_ids)
+            .unwrap_or_default()
+    };
+    if message_ids.is_empty() {
+        return None;
+    }
+
+    let mut recalled = Vec::new();
+    for message_id in message_ids {
+        match lookup_submission_message_availability(account_id, &message_id).await {
+            SubmissionMessageAvailability::Available | SubmissionMessageAvailability::Unknown => {}
+            SubmissionMessageAvailability::RecalledOrMissing => recalled.push(message_id),
+        }
+    }
+    if recalled.is_empty() {
+        return None;
+    }
+    remove_recalled_submission_session_messages(state, account_id, user_id, &recalled).await
+}
+
+fn spawn_submission_recall_probe(
+    state: Arc<Mutex<NapCatState>>,
+    out_tx: mpsc::Sender<String>,
+    account_id: String,
+    user_id: String,
+    message_id: String,
+) {
+    if !is_verifiable_submission_message_id(&message_id) {
+        return;
+    }
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(SUBMISSION_RECALL_PROBE_FIRST_DELAY_SEC)).await;
+        if !submission_session_contains_message(&state, &user_id, &message_id).await {
+            return;
+        }
+        if lookup_submission_message_availability(&account_id, &message_id).await
+            != SubmissionMessageAvailability::RecalledOrMissing
+        {
+            return;
+        }
+        sleep(Duration::from_secs(
+            SUBMISSION_RECALL_PROBE_CONFIRM_DELAY_SEC,
+        ))
+        .await;
+        if !submission_session_contains_message(&state, &user_id, &message_id).await {
+            return;
+        }
+        if lookup_submission_message_availability(&account_id, &message_id).await
+            != SubmissionMessageAvailability::RecalledOrMissing
+        {
+            return;
+        }
+        if let Some(reply) = remove_recalled_submission_session_messages(
+            &state,
+            &account_id,
+            &user_id,
+            &[message_id],
+        )
+        .await
+        {
+            send_private_text(&out_tx, &reply.user_id, &reply.text).await;
+        }
+    });
+}
+
+async fn submission_session_contains_message(
+    state: &Arc<Mutex<NapCatState>>,
+    user_id: &str,
+    message_id: &str,
+) -> bool {
+    let guard = state.lock().await;
+    guard
+        .submission_sessions
+        .get(user_id)
+        .is_some_and(|session| session_has_recalled_message(session, message_id))
+}
+
+async fn lookup_submission_message_availability(
+    account_id: &str,
+    message_id: &str,
+) -> SubmissionMessageAvailability {
+    let message_id = message_id.trim();
+    if !is_verifiable_submission_message_id(message_id) {
+        return SubmissionMessageAvailability::Unknown;
+    }
+    let params = json!({
+        "message_id": json_id(message_id)
+    });
+    match napcat_ws_request(
+        account_id,
+        "get_msg",
+        params,
+        Duration::from_secs(SUBMISSION_MESSAGE_LOOKUP_TIMEOUT_SEC),
+    )
+    .await
+    {
+        Ok(value) => {
+            if get_msg_response_looks_recalled_or_missing(&value) {
+                debug_log!(
+                    "napcat submission message unavailable: account_id={} message_id={} reason=empty_get_msg",
+                    account_id,
+                    message_id
+                );
+                SubmissionMessageAvailability::RecalledOrMissing
+            } else {
+                SubmissionMessageAvailability::Available
+            }
+        }
+        Err(err) if is_get_msg_recalled_or_missing_error(&err) => {
+            debug_log!(
+                "napcat submission message unavailable: account_id={} message_id={} error={}",
+                account_id,
+                message_id,
+                err
+            );
+            SubmissionMessageAvailability::RecalledOrMissing
+        }
+        Err(err) => {
+            debug_log!(
+                "napcat submission message lookup inconclusive: account_id={} message_id={} error={}",
+                account_id,
+                message_id,
+                err
+            );
+            SubmissionMessageAvailability::Unknown
+        }
+    }
+}
+
+fn get_msg_response_looks_recalled_or_missing(value: &Value) -> bool {
+    let data = value.get("data").unwrap_or(value);
+    if data.get("message_id").is_none() {
+        return false;
+    }
+    let raw_message_empty = data
+        .get("raw_message")
+        .and_then(Value::as_str)
+        .is_none_or(|raw| raw.trim().is_empty());
+    let message_empty = match data.get("message") {
+        Some(Value::Array(items)) => items.is_empty(),
+        Some(Value::String(text)) => text.trim().is_empty(),
+        None => true,
+        _ => false,
+    };
+    raw_message_empty && message_empty
+}
+
+fn is_get_msg_recalled_or_missing_error(error: &str) -> bool {
+    error.starts_with("status=")
+}
+
+fn verifiable_submission_message_ids(session: &SubmissionSession) -> Vec<String> {
+    let mut seen = HashSet::new();
+    session
+        .messages
+        .iter()
+        .filter_map(|buffered| {
+            let message_id = buffered.platform_msg_id.trim();
+            if !is_verifiable_submission_message_id(message_id) {
+                return None;
+            }
+            if seen.insert(message_id.to_string()) {
+                Some(message_id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_verifiable_submission_message_id(message_id: &str) -> bool {
+    let message_id = message_id.trim();
+    !message_id.is_empty() && !message_id.starts_with("submission-")
 }
 
 fn session_has_recalled_message(session: &SubmissionSession, message_id: &str) -> bool {
@@ -10208,6 +10502,189 @@ mod tests {
         assert!(session.messages.is_empty());
         drop(guard);
         assert!(out_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn get_msg_validation_removes_unavailable_submission_message() {
+        let account_id = "lookup-validation-10001";
+        let user_id = "20002";
+        unregister_ws_session(account_id);
+
+        let ws_state = Arc::new(Mutex::new(NapCatState::default()));
+        let (ws_out_tx, mut ws_out_rx) = mpsc::channel(4);
+        register_ws_session(
+            account_id,
+            NapCatWsSession {
+                out_tx: ws_out_tx,
+                state: Arc::clone(&ws_state),
+            },
+        );
+
+        let runtime = test_runtime();
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        {
+            let mut guard = state.lock().await;
+            guard.submission_sessions.insert(
+                user_id.to_string(),
+                SubmissionSession {
+                    messages: vec![BufferedMessage {
+                        message: serde_json::json!({
+                            "message_id": "m1",
+                            "message": [{"type": "text", "data": {"text": "撤回"}}]
+                        }),
+                        platform_msg_id: "m1".to_string(),
+                    }],
+                    started_at_ms: 1000,
+                    group_id: runtime.group_id.clone(),
+                    confirming: true,
+                },
+            );
+        }
+
+        let validation = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                validate_recalled_submission_session_messages(&state, account_id, user_id).await
+            }
+        });
+
+        let payload = tokio::time::timeout(Duration::from_secs(1), ws_out_rx.recv())
+            .await
+            .expect("get_msg request timeout")
+            .expect("get_msg request");
+        let payload: Value = serde_json::from_str(&payload).expect("get_msg payload");
+        assert_eq!(
+            payload.get("action").and_then(Value::as_str),
+            Some("get_msg")
+        );
+        assert_eq!(
+            payload
+                .get("params")
+                .and_then(|params| params.get("message_id"))
+                .and_then(Value::as_str),
+            Some("m1")
+        );
+        let echo = payload
+            .get("echo")
+            .and_then(Value::as_str)
+            .expect("echo")
+            .to_string();
+        let response = serde_json::json!({
+            "status": "failed",
+            "retcode": 1400,
+            "message": "message not found",
+            "echo": echo
+        });
+        assert!(
+            handle_action_response(&ws_state, &echo, &response)
+                .await
+                .is_none()
+        );
+
+        let reply = tokio::time::timeout(Duration::from_secs(1), validation)
+            .await
+            .expect("validation timeout")
+            .expect("validation join")
+            .expect("recall reply");
+        assert!(reply.text.contains("当前没有可提交内容"));
+        let guard = state.lock().await;
+        let session = guard.submission_sessions.get(user_id).expect("session");
+        assert!(session.messages.is_empty());
+        assert!(!session.confirming);
+        drop(guard);
+
+        unregister_ws_session(account_id);
+    }
+
+    #[tokio::test]
+    async fn get_msg_validation_removes_empty_recalled_submission_message() {
+        let account_id = "lookup-empty-validation-10001";
+        let user_id = "20002";
+        unregister_ws_session(account_id);
+
+        let ws_state = Arc::new(Mutex::new(NapCatState::default()));
+        let (ws_out_tx, mut ws_out_rx) = mpsc::channel(4);
+        register_ws_session(
+            account_id,
+            NapCatWsSession {
+                out_tx: ws_out_tx,
+                state: Arc::clone(&ws_state),
+            },
+        );
+
+        let runtime = test_runtime();
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        {
+            let mut guard = state.lock().await;
+            guard.submission_sessions.insert(
+                user_id.to_string(),
+                SubmissionSession {
+                    messages: vec![BufferedMessage {
+                        message: serde_json::json!({
+                            "message_id": "m1",
+                            "raw_message": "撤回",
+                            "message": [{"type": "text", "data": {"text": "撤回"}}]
+                        }),
+                        platform_msg_id: "m1".to_string(),
+                    }],
+                    started_at_ms: 1000,
+                    group_id: runtime.group_id.clone(),
+                    confirming: true,
+                },
+            );
+        }
+
+        let validation = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                validate_recalled_submission_session_messages(&state, account_id, user_id).await
+            }
+        });
+
+        let payload = tokio::time::timeout(Duration::from_secs(1), ws_out_rx.recv())
+            .await
+            .expect("get_msg request timeout")
+            .expect("get_msg request");
+        let payload: Value = serde_json::from_str(&payload).expect("get_msg payload");
+        let echo = payload
+            .get("echo")
+            .and_then(Value::as_str)
+            .expect("echo")
+            .to_string();
+        let response = serde_json::json!({
+            "status": "ok",
+            "retcode": 0,
+            "data": {
+                "self_id": account_id,
+                "user_id": user_id,
+                "message_id": "m1",
+                "message_type": "private",
+                "raw_message": "",
+                "message": []
+            },
+            "message": "",
+            "wording": "",
+            "echo": echo
+        });
+        assert!(
+            handle_action_response(&ws_state, &echo, &response)
+                .await
+                .is_none()
+        );
+
+        let reply = tokio::time::timeout(Duration::from_secs(1), validation)
+            .await
+            .expect("validation timeout")
+            .expect("validation join")
+            .expect("recall reply");
+        assert!(reply.text.contains("当前没有可提交内容"));
+        let guard = state.lock().await;
+        let session = guard.submission_sessions.get(user_id).expect("session");
+        assert!(session.messages.is_empty());
+        assert!(!session.confirming);
+        drop(guard);
+
+        unregister_ws_session(account_id);
     }
 
     #[tokio::test]
