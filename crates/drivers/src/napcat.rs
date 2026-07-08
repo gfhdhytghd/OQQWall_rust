@@ -3495,7 +3495,12 @@ async fn parse_inbound_event(
             return None;
         }
         let raw_message = value.get("raw_message").and_then(|v| v.as_str());
-        let mentions_self = message_mentions_self(message_value, raw_message, &self_id);
+        let raw_command_text = raw_message.and_then(|raw| {
+            command_text_after_self_mention(raw, &self_id)
+                .or_else(|| command_text_after_plain_mention(raw))
+        });
+        let mentions_self = message_mentions_self(message_value, raw_message, &self_id)
+            || raw_command_text.is_some();
         let reply_bound = if let Some(reply_msg_id) = reply_id.as_ref() {
             let guard = state.lock().await;
             guard
@@ -3504,8 +3509,6 @@ async fn parse_inbound_event(
         } else {
             false
         };
-        let raw_command_text =
-            raw_message.and_then(|raw| command_text_after_self_mention(raw, &self_id));
         let command_text = raw_command_text.as_deref().unwrap_or(&text);
         if let Some(command) = parse_audit_command(command_text, reply_id.is_some(), runtime) {
             if !command_context_allowed(&command, mentions_self, reply_bound) {
@@ -5265,6 +5268,20 @@ fn command_text_after_self_mention(raw_message: &str, self_id: &str) -> Option<S
 
     let command = rest.trim();
     if command.is_empty() {
+        None
+    } else {
+        Some(command.to_string())
+    }
+}
+
+fn command_text_after_plain_mention(raw_message: &str) -> Option<String> {
+    let rest = raw_message.trim_start().strip_prefix('@')?;
+    let split_idx = rest
+        .char_indices()
+        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))?;
+    let mention_text = rest[..split_idx].trim();
+    let command = rest[split_idx..].trim();
+    if mention_text.is_empty() || command.is_empty() {
         None
     } else {
         Some(command.to_string())
@@ -8854,14 +8871,29 @@ mod tests {
     #[tokio::test]
     async fn group_global_command_uses_account_id_when_self_id_missing() {
         let runtime = test_runtime();
-        for (idx, message) in [
-            serde_json::json!([
-                {"type": "text", "data": {"text": "自检"}}
-            ]),
-            serde_json::json!("[CQ:at,qq=100] 自检"),
-            serde_json::json!([
-                {"type": "text", "data": {"text": ""}}
-            ]),
+        for (idx, (raw_message, message)) in [
+            (
+                "[CQ:at,qq=100] 自检",
+                serde_json::json!([
+                    {"type": "text", "data": {"text": "自检"}}
+                ]),
+            ),
+            (
+                "[CQ:at,qq=100] 自检",
+                serde_json::json!("[CQ:at,qq=100] 自检"),
+            ),
+            (
+                "[CQ:at,qq=100] 自检",
+                serde_json::json!([
+                    {"type": "text", "data": {"text": ""}}
+                ]),
+            ),
+            (
+                "@AI接稿竹溪第一建材批发墙 自检",
+                serde_json::json!([
+                    {"type": "text", "data": {"text": "@AI接稿竹溪第一建材批发墙 自检"}}
+                ]),
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -8877,7 +8909,7 @@ mod tests {
                 "user_id": "20002",
                 "message_id": format!("m{}", idx),
                 "time": 1001,
-                "raw_message": "[CQ:at,qq=100] 自检",
+                "raw_message": raw_message,
                 "message": message,
                 "sender": {
                     "role": "admin"
