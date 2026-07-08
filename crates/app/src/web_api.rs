@@ -17,8 +17,9 @@ use oqqwall_rust_core::state::PostStage;
 use oqqwall_rust_core::{
     Command, GlobalAction, GlobalActionCommand, Id128, IngressAttachment, IngressCommand,
     IngressMessage, IngressRouteMeta, MediaKind, MediaReference, ReplyPreview, ReviewAction,
-    ReviewActionCommand, StateView, build_draft_from_messages, derive_blob_id, derive_ingress_id,
-    derive_post_id, derive_session_id, forward_marker, json_card_marker, poke_marker, reply_marker,
+    ReviewActionBatchCommand, ReviewActionCommand, StateView, build_draft_from_messages,
+    derive_blob_id, derive_ingress_id, derive_post_id, derive_session_id, forward_marker,
+    json_card_marker, poke_marker, reply_marker,
 };
 use oqqwall_rust_drivers::avatar_cache;
 use oqqwall_rust_drivers::napcat::{
@@ -1807,22 +1808,20 @@ async fn decide_review(
         auth_guard.idempotency_seen.insert(dedup_key);
     }
 
-    let action = match parse_review_action(&req) {
-        Ok(action) => action,
+    let actions = match parse_review_actions(&req) {
+        Ok(actions) => actions,
         Err(reason) => {
             return error_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", reason, request_id);
         }
     };
 
-    let cmd = Command::ReviewAction(ReviewActionCommand {
-        review_id: Some(review_id),
-        review_code: None,
-        audit_msg_id: None,
-        action,
-        operator_id: format!("api:{}", auth.token_id),
-        now_ms: now_ms(),
-        tz_offset_minutes: state.tz_offset_minutes,
-    });
+    let cmd = build_review_command(
+        review_id,
+        actions,
+        format!("api:{}", auth.token_id),
+        now_ms(),
+        state.tz_offset_minutes,
+    );
 
     if state.cmd_tx.send(cmd).await.is_err() {
         return error_response(
@@ -1861,8 +1860,8 @@ async fn decide_review_batch(
         quick_reply_key: req.quick_reply_key,
         target_review_code: req.target_review_code,
     };
-    let action = match parse_review_action(&action_template) {
-        Ok(action) => action,
+    let actions = match parse_review_actions(&action_template) {
+        Ok(actions) => actions,
         Err(reason) => {
             return error_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", reason, request_id);
         }
@@ -1904,15 +1903,13 @@ async fn decide_review_batch(
             });
             continue;
         }
-        let cmd = Command::ReviewAction(ReviewActionCommand {
-            review_id: Some(review_id),
-            review_code: None,
-            audit_msg_id: None,
-            action: action.clone(),
-            operator_id: format!("api:{}", auth.token_id),
-            now_ms: now_ms(),
-            tz_offset_minutes: state.tz_offset_minutes,
-        });
+        let cmd = build_review_command(
+            review_id,
+            actions.clone(),
+            format!("api:{}", auth.token_id),
+            now_ms(),
+            state.tz_offset_minutes,
+        );
         if state.cmd_tx.send(cmd).await.is_err() {
             failed.push(ReviewFailure {
                 review_id: id_to_string(review_id),
@@ -3184,53 +3181,91 @@ fn parse_id128(value: &str) -> Option<Id128> {
     value.parse::<u128>().ok().map(Id128)
 }
 
-fn parse_review_action(req: &ReviewDecisionRequest) -> Result<ReviewAction, &'static str> {
+fn build_review_command(
+    review_id: Id128,
+    actions: Vec<ReviewAction>,
+    operator_id: String,
+    now_ms: i64,
+    tz_offset_minutes: i32,
+) -> Command {
+    if actions.len() == 1 {
+        return Command::ReviewAction(ReviewActionCommand {
+            review_id: Some(review_id),
+            review_code: None,
+            audit_msg_id: None,
+            action: actions.into_iter().next().expect("single action exists"),
+            operator_id,
+            now_ms,
+            tz_offset_minutes,
+        });
+    }
+    Command::ReviewActionBatch(ReviewActionBatchCommand {
+        review_id: Some(review_id),
+        review_code: None,
+        audit_msg_id: None,
+        actions,
+        operator_id,
+        now_ms,
+        tz_offset_minutes,
+    })
+}
+
+fn optional_request_text(req: &ReviewDecisionRequest) -> Option<String> {
+    req.text
+        .as_deref()
+        .or(req.comment.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn review_note_reply_text(text: String) -> String {
+    if text.starts_with("审核备注：") || text.starts_with("审核备注:") {
+        text
+    } else {
+        format!("审核备注：{}", text)
+    }
+}
+
+fn parse_review_actions(req: &ReviewDecisionRequest) -> Result<Vec<ReviewAction>, &'static str> {
     match req.action.as_str() {
-        "approve" => Ok(ReviewAction::Approve),
-        "reject" => Ok(ReviewAction::Reject),
-        "delete" => Ok(ReviewAction::Delete),
-        "defer" => Ok(ReviewAction::Defer {
+        "approve" => Ok(vec![ReviewAction::Approve]),
+        "reject" => {
+            let mut actions = vec![ReviewAction::Reject];
+            if let Some(text) = optional_request_text(req) {
+                actions.push(ReviewAction::Reply {
+                    text: review_note_reply_text(text),
+                });
+            }
+            Ok(actions)
+        }
+        "delete" => Ok(vec![ReviewAction::Delete]),
+        "defer" => Ok(vec![ReviewAction::Defer {
             delay_ms: req.delay_ms.unwrap_or(0),
-        }),
-        "skip" => Ok(ReviewAction::Skip),
-        "immediate" => Ok(ReviewAction::Immediate),
-        "refresh" => Ok(ReviewAction::Refresh),
-        "rerender" => Ok(ReviewAction::Rerender),
-        "select_all" => Ok(ReviewAction::SelectAllMessages),
-        "toggle_anonymous" => Ok(ReviewAction::ToggleAnonymous),
-        "expand_audit" => Ok(ReviewAction::ExpandAudit),
-        "show" => Ok(ReviewAction::Show),
+        }]),
+        "skip" => Ok(vec![ReviewAction::Skip]),
+        "immediate" => Ok(vec![ReviewAction::Immediate]),
+        "refresh" => Ok(vec![ReviewAction::Refresh]),
+        "rerender" => Ok(vec![ReviewAction::Rerender]),
+        "select_all" => Ok(vec![ReviewAction::SelectAllMessages]),
+        "toggle_anonymous" => Ok(vec![ReviewAction::ToggleAnonymous]),
+        "expand_audit" => Ok(vec![ReviewAction::ExpandAudit]),
+        "show" => Ok(vec![ReviewAction::Show]),
         "comment" => {
-            let text = req
-                .text
-                .as_deref()
-                .or(req.comment.as_deref())
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .ok_or("comment requires text")?;
-            Ok(ReviewAction::Comment {
-                text: text.to_string(),
-            })
+            let text = optional_request_text(req).ok_or("comment requires text")?;
+            Ok(vec![ReviewAction::Comment { text }])
         }
         "reply" => {
-            let text = req
-                .text
-                .as_deref()
-                .or(req.comment.as_deref())
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .ok_or("reply requires text")?;
-            Ok(ReviewAction::Reply {
-                text: text.to_string(),
-            })
+            let text = optional_request_text(req).ok_or("reply requires text")?;
+            Ok(vec![ReviewAction::Reply { text }])
         }
-        "blacklist" => Ok(ReviewAction::Blacklist {
+        "blacklist" => Ok(vec![ReviewAction::Blacklist {
             reason: req
                 .comment
                 .as_ref()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
-        }),
+        }]),
         "quick_reply" => {
             let key = req
                 .quick_reply_key
@@ -3238,15 +3273,15 @@ fn parse_review_action(req: &ReviewDecisionRequest) -> Result<ReviewAction, &'st
                 .map(|value| value.trim())
                 .filter(|value| !value.is_empty())
                 .ok_or("quick_reply requires quick_reply_key")?;
-            Ok(ReviewAction::QuickReply {
+            Ok(vec![ReviewAction::QuickReply {
                 key: key.to_string(),
-            })
+            }])
         }
         "merge" => {
             let code = req
                 .target_review_code
                 .ok_or("merge requires target_review_code")?;
-            Ok(ReviewAction::Merge { review_code: code })
+            Ok(vec![ReviewAction::Merge { review_code: code }])
         }
         _ => Err("unsupported action"),
     }
@@ -4615,6 +4650,82 @@ mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn decide_review_reject_with_comment_sends_reply_action_batch() {
+        let (state, mut rx, session_id) = build_test_state(Some(vec!["10001"]));
+        let post_id = Id128(72501);
+        let review_id = Id128(72511);
+        {
+            let mut guard = state.state.write().expect("lock");
+            guard.posts.insert(
+                post_id,
+                PostMeta {
+                    post_id,
+                    session_id: Id128(72500),
+                    group_id: "10001".to_string(),
+                    stage: PostStage::ReviewPending,
+                    review_id: Some(review_id),
+                    created_at_ms: 13,
+                    is_anonymous: false,
+                    is_safe: true,
+                    last_error: None,
+                },
+            );
+            guard.reviews.insert(
+                review_id,
+                ReviewMeta {
+                    review_id,
+                    post_id,
+                    review_code: 82,
+                    decision: None,
+                    audit_msg_id: None,
+                    delayed_until_ms: None,
+                    needs_republish: false,
+                    decided_by: None,
+                    decided_at_ms: None,
+                    decision_reason: None,
+                    publish_retry_at_ms: None,
+                    publish_last_error: None,
+                    publish_attempt: 0,
+                },
+            );
+        }
+        let headers = build_headers(&session_id, None);
+        let response = decide_review(
+            State(state),
+            Path(review_id.0.to_string()),
+            headers,
+            Json(ReviewDecisionRequest {
+                action: "reject".to_string(),
+                comment: Some("内容不合适".to_string()),
+                delay_ms: None,
+                text: None,
+                quick_reply_key: None,
+                target_review_code: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sent = rx.try_recv().expect("review cmd");
+        match sent {
+            Command::ReviewActionBatch(cmd) => {
+                assert_eq!(cmd.review_id, Some(review_id));
+                assert_eq!(
+                    cmd.actions,
+                    vec![
+                        ReviewAction::Reject,
+                        ReviewAction::Reply {
+                            text: "审核备注：内容不合适".to_string()
+                        }
+                    ]
+                );
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
         assert!(rx.try_recv().is_err());
     }
 
