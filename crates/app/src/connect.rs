@@ -50,6 +50,10 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) -> Result
             max_queue: core_config.max_queue(&group.group_id),
             max_images_per_post: core_config.max_images_per_post(&group.group_id),
             thank_you_filter: config.thank_you_filter.clone(),
+            submission_session_enabled: group.submission_session_enabled,
+            submission_session_required: group.submission_session_required,
+            submission_session_merge_text_to_first_message: group
+                .submission_session_merge_text_to_first_message,
             user_notifications: Arc::new(Mutex::new(group.user_notifications.clone())),
             quick_replies: Arc::new(Mutex::new(group.quick_replies.clone())),
             review_shortcuts: Arc::new(Mutex::new(group.review_shortcuts.clone())),

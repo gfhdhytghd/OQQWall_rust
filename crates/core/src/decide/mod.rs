@@ -18,6 +18,7 @@ use crate::state::StateView;
 pub fn decide(state: &StateView, command: &Command, config: &CoreConfig) -> Vec<Event> {
     match command {
         Command::Ingress(cmd) => ingress::decide_ingress(state, cmd, config),
+        Command::IngressBatch(cmd) => ingress::decide_ingress_batch(state, cmd, config),
         Command::Tick(cmd) => tick::decide_tick(state, cmd, config),
         Command::ReviewAction(cmd) => review::decide_review_action(state, cmd, config),
         Command::ReviewActionBatch(cmd) => review::decide_review_action_batch(state, cmd, config),

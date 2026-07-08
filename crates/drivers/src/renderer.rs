@@ -25,6 +25,7 @@ use oqqwall_rust_core::{
 };
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use qrcode::{Color as QrColor, QrCode};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1984,23 +1985,6 @@ fn render_png(
         color_meta,
     );
 
-    let mut divider = Paint::default();
-    divider.set_color4f(color_border, None);
-    divider.set_anti_alias(true);
-    divider.set_style(skia_safe::paint::Style::Stroke);
-    divider.set_stroke_width(1.0);
-    canvas.draw_line(
-        (
-            padding as f32,
-            (header_y + header_height + spacing_xxl / 2) as f32,
-        ),
-        (
-            (padding + content_width) as f32,
-            (header_y + header_height + spacing_xxl / 2) as f32,
-        ),
-        &divider,
-    );
-
     let mut face_cache: HashMap<String, ResolvedImage> = HashMap::new();
     let mut face_image_cache: HashMap<String, Option<Image>> = HashMap::new();
     let mut file_icon_cache: HashMap<&'static str, Option<Image>> = HashMap::new();
@@ -2764,6 +2748,20 @@ pub fn render_preview_png(
     render_png(&draft, &header, &image_sources, config)
 }
 
+pub async fn render_submission_session_preview_png(
+    draft: &Draft,
+    header: RenderPreviewHeader,
+    config: &RendererRuntimeConfig,
+    remote_timeout: Duration,
+    cmd_tx: &mpsc::Sender<Command>,
+) -> Result<Vec<u8>, String> {
+    let header = HeaderInfo::from(header);
+    let draft = expand_embedded_forward_draft(draft);
+    let image_sources =
+        render_preview_image_sources_with_remote(&draft, &header, remote_timeout, cmd_tx).await;
+    render_png(&draft, &header, &image_sources, config)
+}
+
 fn color_from_hex(hex: u32) -> Color4f {
     let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
     let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
@@ -3439,7 +3437,14 @@ async fn resolve_image_sources(
             }
         }
     }
-    let avatar = resolve_avatar_image(header, cmd_tx, image_cache, &mut used_keys).await;
+    let avatar = resolve_avatar_image(
+        header,
+        cmd_tx,
+        image_cache,
+        &mut used_keys,
+        AVATAR_FETCH_TIMEOUT,
+    )
+    .await;
     (
         RenderImageSources {
             avatar,
@@ -3480,6 +3485,87 @@ fn render_preview_image_sources(draft: &Draft) -> RenderImageSources {
         block_images,
         block_labels,
     }
+}
+
+const PREVIEW_REMOTE_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
+const PREVIEW_REMOTE_IMAGE_MAX_COUNT: usize = 6;
+
+async fn render_preview_image_sources_with_remote(
+    draft: &Draft,
+    header: &HeaderInfo,
+    remote_timeout: Duration,
+    cmd_tx: &mpsc::Sender<Command>,
+) -> RenderImageSources {
+    let mut image_cache = ImageMemoryCache::default();
+    let client = Client::builder()
+        .timeout(remote_timeout)
+        .build()
+        .unwrap_or_else(|_| Client::new());
+    let mut block_images = vec![None; draft.blocks.len()];
+    let mut block_labels = vec![None; draft.blocks.len()];
+    let mut remote_image_count = 0usize;
+    let mut used_keys = HashSet::new();
+
+    for (idx, block) in draft.blocks.iter().enumerate() {
+        let DraftBlock::Attachment {
+            kind, reference, ..
+        } = block
+        else {
+            continue;
+        };
+        match reference {
+            MediaReference::RemoteUrl { url } if is_renderable_image(*kind) => {
+                if is_remote_http(url) {
+                    if remote_image_count < PREVIEW_REMOTE_IMAGE_MAX_COUNT {
+                        remote_image_count = remote_image_count.saturating_add(1);
+                        block_images[idx] = fetch_remote_preview_image(&client, url).await;
+                    }
+                } else {
+                    block_images[idx] = image_cache.get_or_load_source(url);
+                }
+            }
+            MediaReference::RemoteUrl { url } => {
+                block_labels[idx] = Some(url.clone());
+            }
+            MediaReference::Blob { .. } => {}
+        }
+    }
+    let avatar = resolve_avatar_image(
+        header,
+        cmd_tx,
+        &mut image_cache,
+        &mut used_keys,
+        AVATAR_FETCH_TIMEOUT,
+    )
+    .await;
+
+    RenderImageSources {
+        avatar,
+        block_images,
+        block_labels,
+    }
+}
+
+async fn fetch_remote_preview_image(client: &Client, url: &str) -> Option<ResolvedImage> {
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        debug_log!(
+            "submission preview image download failed: url={} status={}",
+            url,
+            response.status()
+        );
+        return None;
+    }
+    let bytes = response.bytes().await.ok()?;
+    if bytes.len() > PREVIEW_REMOTE_IMAGE_MAX_BYTES {
+        debug_log!(
+            "submission preview image too large: url={} bytes={}",
+            url,
+            bytes.len()
+        );
+        return None;
+    }
+    Some(ResolvedImage::from_bytes(bytes.to_vec()))
 }
 
 fn resolve_media_reference_for_image(
@@ -3584,6 +3670,7 @@ async fn resolve_avatar_image(
     cmd_tx: &mpsc::Sender<Command>,
     image_cache: &mut ImageMemoryCache,
     used_keys: &mut HashSet<ImageCacheKey>,
+    timeout: Duration,
 ) -> Option<ResolvedImage> {
     if header.is_anonymous {
         return resolve_default_avatar(image_cache, used_keys);
@@ -3601,9 +3688,7 @@ async fn resolve_avatar_image(
             )
             .await;
         }
-        if let Some(bytes) =
-            avatar_cache::wait_for_avatar(&header.user_id, notify, AVATAR_FETCH_TIMEOUT).await
-        {
+        if let Some(bytes) = avatar_cache::wait_for_avatar(&header.user_id, notify, timeout).await {
             return Some(ResolvedImage::from_arc(bytes));
         }
     }

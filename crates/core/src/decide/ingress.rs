@@ -1,10 +1,17 @@
-use crate::command::IngressCommand;
+use crate::anonymous::detect_anonymous;
+use crate::command::{IngressBatchCommand, IngressCommand};
 use crate::config::CoreConfig;
+use crate::decide::builder::build_draft_for_post;
 use crate::draft::MediaReference;
-use crate::event::{Event, IngressEvent, IngressIgnoreReason, MediaEvent, SessionEvent};
-use crate::ids::derive_ingress_id;
-use crate::ids::derive_session_id;
+use crate::event::{
+    DraftEvent, Event, EventEnvelope, IngressEvent, IngressIgnoreReason, MediaEvent, RenderEvent,
+    SessionEvent,
+};
+use crate::ids::{ActorId, Id128, derive_ingress_id};
+use crate::ids::{derive_post_id, derive_session_id};
+use crate::safety::detect_safe;
 use crate::state::{SessionKey, StateView};
+use std::collections::HashSet;
 
 pub fn decide_ingress(state: &StateView, cmd: &IngressCommand, config: &CoreConfig) -> Vec<Event> {
     let ingress_id = derive_ingress_id(&[
@@ -84,6 +91,99 @@ pub fn decide_ingress(state: &StateView, cmd: &IngressCommand, config: &CoreConf
     }
 
     events
+}
+
+pub fn decide_ingress_batch(
+    state: &StateView,
+    cmd: &IngressBatchCommand,
+    config: &CoreConfig,
+) -> Vec<Event> {
+    let mut scratch = state.clone();
+    let mut out = Vec::new();
+    let mut env_id = 1u128;
+    let mut keys = Vec::new();
+    let mut seen_keys = HashSet::new();
+
+    for entry in &cmd.entries {
+        let key = SessionKey {
+            chat_id: entry.chat_id.clone(),
+            user_id: entry.user_id.clone(),
+            group_id: entry.group_id.clone(),
+        };
+        if seen_keys.insert(key.clone()) {
+            keys.push(key);
+        }
+        let step_events = decide_ingress(&scratch, entry, config);
+        for event in &step_events {
+            scratch = reduce_scratch(&scratch, event.clone(), cmd.now_ms, &mut env_id);
+        }
+        out.extend(step_events);
+    }
+
+    for key in keys {
+        let Some(session_id) = scratch.session_by_key.get(&key).copied() else {
+            continue;
+        };
+        let Some(ingress_ids) = scratch.session_ingress.get(&session_id).cloned() else {
+            continue;
+        };
+        if ingress_ids.is_empty() {
+            continue;
+        }
+        let mut messages = Vec::new();
+        for ingress_id in &ingress_ids {
+            if let Some(message) = scratch.ingress_messages.get(ingress_id) {
+                messages.push(message.clone());
+            }
+        }
+        let is_anonymous = detect_anonymous(&messages);
+        let is_safe = detect_safe(&messages);
+        let session_bytes = session_id.to_be_bytes();
+        let post_id = derive_post_id(&[&session_bytes]);
+        let Some(draft) = build_draft_for_post(&scratch, post_id, &ingress_ids) else {
+            continue;
+        };
+
+        let close_event = Event::Session(SessionEvent::Closed {
+            session_id,
+            closed_at_ms: cmd.now_ms,
+        });
+        scratch = reduce_scratch(&scratch, close_event.clone(), cmd.now_ms, &mut env_id);
+        out.push(close_event);
+
+        let draft_event = Event::Draft(DraftEvent::PostDraftCreated {
+            post_id,
+            session_id,
+            group_id: key.group_id,
+            ingress_ids,
+            is_anonymous,
+            is_safe,
+            draft,
+            created_at_ms: cmd.now_ms,
+        });
+        scratch = reduce_scratch(&scratch, draft_event.clone(), cmd.now_ms, &mut env_id);
+        out.push(draft_event);
+
+        out.push(Event::Render(RenderEvent::RenderRequested {
+            post_id,
+            attempt: 1,
+            requested_at_ms: cmd.now_ms,
+        }));
+    }
+
+    out
+}
+
+fn reduce_scratch(state: &StateView, event: Event, ts_ms: i64, env_id: &mut u128) -> StateView {
+    let next = state.reduce(&EventEnvelope {
+        id: Id128(*env_id),
+        ts_ms,
+        actor: ActorId::from_u128(0),
+        correlation_id: None,
+        event,
+    });
+    *env_id = (*env_id).saturating_add(1);
+    next
 }
 
 fn initial_close_at(state: &StateView, cmd: &IngressCommand, config: &CoreConfig) -> i64 {

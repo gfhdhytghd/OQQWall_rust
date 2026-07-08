@@ -11,9 +11,9 @@ pub mod safety;
 pub mod state;
 
 pub use command::{
-    Command, GlobalAction, GlobalActionBatchCommand, GlobalActionCommand, IngressCommand,
-    PostAction, PostActionCommand, ReviewAction, ReviewActionBatchCommand, ReviewActionCommand,
-    ShortcutScope, TickCommand,
+    Command, GlobalAction, GlobalActionBatchCommand, GlobalActionCommand, IngressBatchCommand,
+    IngressCommand, PostAction, PostActionCommand, ReviewAction, ReviewActionBatchCommand,
+    ReviewActionCommand, ShortcutScope, TickCommand,
 };
 pub use config::{CoreConfig, GroupConfig, TimeWindow};
 pub use decide::builder::build_draft_from_messages;

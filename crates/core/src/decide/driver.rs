@@ -105,6 +105,9 @@ pub fn decide_driver_event(state: &StateView, event: &Event, config: &CoreConfig
             ingress_id,
             recalled_at_ms,
         }) => derive_recall_events(state, *ingress_id, *recalled_at_ms),
+        Event::Media(crate::event::MediaEvent::MediaFetchSucceeded { ingress_id, .. }) => {
+            derive_media_refresh_events(state, *ingress_id)
+        }
         _ => Vec::new(),
     };
 
@@ -147,6 +150,33 @@ fn resolve_review_meta(state: &StateView, post_id: PostId) -> Option<(ReviewId, 
         })?;
     let review = state.reviews.get(&review_id)?;
     Some((review_id, review.review_code))
+}
+
+fn derive_media_refresh_events(state: &StateView, ingress_id: crate::ids::IngressId) -> Vec<Event> {
+    let affected_posts = state
+        .post_ingress
+        .iter()
+        .filter_map(|(post_id, ingress_ids)| ingress_ids.contains(&ingress_id).then_some(*post_id))
+        .collect::<Vec<_>>();
+    if affected_posts.is_empty() {
+        return Vec::new();
+    }
+
+    let requested_at_ms = state.last_ts_ms.unwrap_or(0);
+    let mut events = Vec::new();
+    for post_id in affected_posts {
+        if let Some(review_id) = state.posts.get(&post_id).and_then(|post| post.review_id) {
+            events.push(Event::Review(ReviewEvent::ReviewRefreshRequested {
+                review_id,
+            }));
+        }
+        events.push(Event::Render(RenderEvent::RenderRequested {
+            post_id,
+            attempt: 1,
+            requested_at_ms,
+        }));
+    }
+    events
 }
 
 fn derive_recall_events(

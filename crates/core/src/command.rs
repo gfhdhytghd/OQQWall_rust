@@ -6,6 +6,7 @@ use crate::ids::{AuditMsgId, ExternalCode, GroupId, PostId, ReviewCode, ReviewId
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Ingress(IngressCommand),
+    IngressBatch(IngressBatchCommand),
     Tick(TickCommand),
     ReviewAction(ReviewActionCommand),
     ReviewActionBatch(ReviewActionBatchCommand),
@@ -27,6 +28,12 @@ pub struct IngressCommand {
     pub route_meta: Option<IngressRouteMeta>,
     pub received_at_ms: TimestampMs,
     pub close_immediately: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressBatchCommand {
+    pub entries: Vec<IngressCommand>,
+    pub now_ms: TimestampMs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

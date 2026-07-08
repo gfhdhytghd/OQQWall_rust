@@ -54,6 +54,9 @@ pub struct AppGroupConfig {
     pub user_notifications: UserNotificationSettings,
     pub individual_image_in_posts: bool,
     pub watermark_text: Option<String>,
+    pub submission_session_enabled: bool,
+    pub submission_session_required: bool,
+    pub submission_session_merge_text_to_first_message: bool,
     pub quick_replies: HashMap<String, String>,
     pub review_shortcuts: HashMap<String, String>,
     pub global_shortcuts: HashMap<String, String>,
@@ -285,6 +288,19 @@ impl AppConfig {
             let individual_image_in_posts =
                 parse_bool(group_value.get("individual_image_in_posts")).unwrap_or(true);
             let watermark_text = nonempty(parse_string(group_value.get("watermark_text")));
+            let submission_session_enabled =
+                parse_bool(group_value.get("submission_session_enabled")).unwrap_or(true);
+            let submission_session_required =
+                parse_bool(group_value.get("submission_session_required")).unwrap_or(false);
+            let submission_session_merge_text_to_first_message =
+                parse_bool(group_value.get("submission_session_merge_text_to_first_message"))
+                    .unwrap_or(false);
+            if submission_session_required && !submission_session_enabled {
+                return Err(format!(
+                    "group {}: submission_session_required requires submission_session_enabled",
+                    group_id
+                ));
+            }
             let quick_replies = parse_quick_replies(group_value.get("quick_replies"))
                 .map_err(|err| format!("group {}: {}", group_id, err))?;
             let review_shortcuts =
@@ -318,6 +334,9 @@ impl AppConfig {
                 user_notifications,
                 individual_image_in_posts,
                 watermark_text,
+                submission_session_enabled,
+                submission_session_required,
+                submission_session_merge_text_to_first_message,
                 quick_replies,
                 review_shortcuts,
                 global_shortcuts,
@@ -353,6 +372,9 @@ impl AppConfig {
                 user_notifications: UserNotificationSettings::default(),
                 individual_image_in_posts: true,
                 watermark_text: None,
+                submission_session_enabled: true,
+                submission_session_required: false,
+                submission_session_merge_text_to_first_message: false,
                 quick_replies: HashMap::new(),
                 review_shortcuts: HashMap::new(),
                 global_shortcuts: HashMap::new(),
@@ -606,54 +628,9 @@ fn parse_duration_ms(value: Option<&Value>) -> Option<i64> {
 }
 
 fn parse_thank_you_filter_config(
-    value: Option<&Value>,
+    _value: Option<&Value>,
 ) -> Result<ThankYouFilterRuntimeConfig, String> {
-    let Some(value) = value else {
-        return ThankYouFilterRuntimeConfig::builtin_enabled()
-            .map_err(|err| format!("thank_you_filter built-in registry invalid: {}", err));
-    };
-    let Value::Object(obj) = value else {
-        return Err("thank_you_filter must be an object".to_string());
-    };
-    let enabled = obj
-        .get("enabled")
-        .map(|raw| {
-            parse_bool(Some(raw))
-                .ok_or_else(|| "thank_you_filter.enabled must be a boolean".to_string())
-        })
-        .transpose()?
-        .unwrap_or(true);
-    let window_sec = parse_u64(obj.get("window_sec"))
-        .unwrap_or(30 * 60)
-        .clamp(60, 86_400);
-    let max_text_chars = parse_usize(obj.get("max_text_chars"))
-        .unwrap_or(16)
-        .clamp(2, 80);
-    let phash_distance = parse_u32(obj.get("phash_distance"))
-        .unwrap_or(6)
-        .clamp(0, 32);
-    let registry_path = nonempty(
-        parse_string(obj.get("seed_registry")).or_else(|| parse_string(obj.get("registry_path"))),
-    );
-    if let Some(path) = registry_path {
-        let json = fs::read_to_string(&path)
-            .map_err(|err| format!("failed to read thank_you_filter registry {}: {}", path, err))?;
-        return ThankYouFilterRuntimeConfig::with_registry_json(
-            enabled,
-            window_sec,
-            max_text_chars,
-            phash_distance,
-            &json,
-        )
-        .map_err(|err| format!("thank_you_filter registry {} invalid: {}", path, err));
-    }
-    ThankYouFilterRuntimeConfig::with_builtin_registry(
-        enabled,
-        window_sec,
-        max_text_chars,
-        phash_distance,
-    )
-    .map_err(|err| format!("thank_you_filter built-in registry invalid: {}", err))
+    Ok(ThankYouFilterRuntimeConfig::disabled())
 }
 
 fn parse_send_success_reply_config(
@@ -1991,17 +1968,14 @@ mod tests {
     }
 
     #[test]
-    fn thank_you_filter_defaults_to_enabled_and_parses_overrides() {
+    fn thank_you_filter_is_unconditionally_disabled() {
         let root = json!({
             "common": {
                 "napcat_base_url": "127.0.0.1:3001/oqqwall/ws"
             }
         });
         let config = AppConfig::from_value(&root).expect("config");
-        assert!(config.thank_you_filter.enabled);
-        assert_eq!(config.thank_you_filter.window_sec, 1800);
-        assert_eq!(config.thank_you_filter.max_text_chars, 16);
-        assert_eq!(config.thank_you_filter.phash_distance, 6);
+        assert!(!config.thank_you_filter.enabled);
 
         let root = json!({
             "common": {
@@ -2016,9 +1990,64 @@ mod tests {
         });
         let config = AppConfig::from_value(&root).expect("config");
         assert!(!config.thank_you_filter.enabled);
-        assert_eq!(config.thank_you_filter.window_sec, 60);
-        assert_eq!(config.thank_you_filter.max_text_chars, 80);
-        assert_eq!(config.thank_you_filter.phash_distance, 32);
+    }
+
+    #[test]
+    fn submission_session_flags_default_and_parse_group_overrides() {
+        let root = json!({
+            "common": {
+                "napcat_base_url": "127.0.0.1:3001/oqqwall/ws"
+            },
+            "groups": {
+                "default": {
+                    "mangroupid": "123",
+                    "accounts": ["10001"]
+                },
+                "strict": {
+                    "mangroupid": "456",
+                    "accounts": ["10002"],
+                    "submission_session_enabled": true,
+                    "submission_session_required": true,
+                    "submission_session_merge_text_to_first_message": true
+                }
+            }
+        });
+        let config = AppConfig::from_value(&root).expect("config");
+        let default_group = config
+            .groups
+            .iter()
+            .find(|group| group.group_id == "default")
+            .expect("default group");
+        assert!(default_group.submission_session_enabled);
+        assert!(!default_group.submission_session_required);
+        assert!(!default_group.submission_session_merge_text_to_first_message);
+        let strict_group = config
+            .groups
+            .iter()
+            .find(|group| group.group_id == "strict")
+            .expect("strict group");
+        assert!(strict_group.submission_session_enabled);
+        assert!(strict_group.submission_session_required);
+        assert!(strict_group.submission_session_merge_text_to_first_message);
+    }
+
+    #[test]
+    fn submission_session_required_rejects_disabled_session_mode() {
+        let root = json!({
+            "common": {
+                "napcat_base_url": "127.0.0.1:3001/oqqwall/ws"
+            },
+            "groups": {
+                "default": {
+                    "mangroupid": "123",
+                    "accounts": ["10001"],
+                    "submission_session_enabled": false,
+                    "submission_session_required": true
+                }
+            }
+        });
+        let err = AppConfig::from_value(&root).expect_err("invalid flags");
+        assert!(err.contains("submission_session_required"));
     }
 
     #[test]

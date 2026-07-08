@@ -53,7 +53,7 @@
 | `at_unprived_sender` | bool/string/number | `false` | 发件时是否 @ 非匿名且空间不可访问的投稿人 |
 | `friend_request_window_sec` | number/string | `300` | 好友申请去重/限频窗口，组内可覆盖 |
 | `friend_add_message` | string | 无 | 通过好友申请后自动发送的默认文本，组内可覆盖 |
-| `thank_you_filter` | object | 启用 | 投稿反馈后的纯感谢静默过滤，见下节 |
+| `thank_you_filter` | object | 关闭 | 投稿反馈后的纯感谢静默过滤，见下节；当前版本运行时强制关闭 |
 
 ### Web API
 
@@ -90,11 +90,11 @@
 
 ### Thank You Filter
 
-`common.thank_you_filter` 控制投稿反馈后的“谢谢/收到/感谢表情”静默过滤。它只作用于机器人刚给投稿人发送过通过、拒稿或人工回复后的私聊窗口；命中后不会创建新的投稿提醒。
+`common.thank_you_filter` 控制投稿反馈后的“谢谢/收到/感谢表情”静默过滤。当前版本运行时强制关闭该过滤，即使配置写了 `enabled=true` 也不会静默感谢消息。
 
 | Key | 类型 | 默认值 | 作用 |
 | --- | --- | --- | --- |
-| `thank_you_filter.enabled` | bool/string/number | `true` | 是否启用纯感谢过滤 |
+| `thank_you_filter.enabled` | bool/string/number | `false` | 是否启用纯感谢过滤；当前运行时强制为关闭 |
 | `thank_you_filter.window_sec` | number/string | `1800` | 反馈后可静默的窗口，范围会钳制到 60..86400 秒 |
 | `thank_you_filter.max_text_chars` | number/string | `16` | 文本归一化后的最大长度，范围会钳制到 2..80 |
 | `thank_you_filter.phash_distance` | number/string | `6` | 图片感知哈希汉明距离阈值，范围会钳制到 0..32 |
@@ -124,6 +124,9 @@
 | `watermark_text` | string | 无 | 渲染图水印文本，空值不绘制 |
 | `friend_request_window_sec` | number/string | 继承 `common` | 本组好友申请去重/限频窗口 |
 | `friend_add_message` | string | 继承 `common` | 本组通过好友申请后自动发送的文本 |
+| `submission_session_enabled` | bool/string/number | `true` | 是否启用私聊指令式收稿会话，内置指令为 `#开始投稿`、`#结束投稿`、`#确认`、`#追加`、`#取消` |
+| `submission_session_required` | bool/string/number | `false` | 是否仅允许指令式收稿；启用后普通私聊不会自动成稿，必须先进入投稿会话 |
+| `submission_session_merge_text_to_first_message` | bool/string/number | `false` | 指令式收稿提交时是否把全部文本合并到首条消息；关闭时保留逐条消息文本 |
 | `quick_replies` | object | `{}` | 快捷回复，格式为 `{ "指令": "回复文本" }` |
 | `review_shortcuts` | object | `{}` | 审核快捷指令，格式为 `{ "指令": "步骤 DSL" }` |
 | `global_shortcuts` | object | `{}` | 全局快捷指令，格式为 `{ "指令": "步骤 DSL" }` |
@@ -197,7 +200,7 @@ ws://127.0.0.1:3001/oqqwall/ws/3995477265
       "max_append_messages": 2
     },
     "thank_you_filter": {
-      "enabled": true,
+      "enabled": false,
       "window_sec": 1800,
       "max_text_chars": 16,
       "phash_distance": 6
@@ -209,6 +212,9 @@ ws://127.0.0.1:3001/oqqwall/ws/3995477265
       "accounts": ["3995477265"],
       "napcat_base_url": "127.0.0.1:3001/oqqwall/ws",
       "napcat_access_token": "REDACTED",
+      "submission_session_enabled": true,
+      "submission_session_required": false,
+      "submission_session_merge_text_to_first_message": false,
       "max_post_stack": 1,
       "max_image_number_one_post": 30,
       "individual_image_in_posts": true,

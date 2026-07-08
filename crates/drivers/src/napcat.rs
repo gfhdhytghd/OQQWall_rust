@@ -6,6 +6,10 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::media_fetcher::{PrefetchedMedia, prefetch_attachment_blob};
+use crate::renderer::{
+    RenderPreviewHeader, RendererRuntimeConfig, render_submission_session_preview_png,
+};
 use futures_util::{SinkExt, StreamExt};
 use oqqwall_rust_core::command::{
     GlobalAction, GlobalActionBatchCommand, GlobalActionCommand, PostAction, PostActionCommand,
@@ -24,7 +28,10 @@ use oqqwall_rust_core::event::{
 };
 use oqqwall_rust_core::ids::{BlobId, ExternalCode, IngressId, PostId, ReviewCode, ReviewId};
 use oqqwall_rust_core::state::PostStage;
-use oqqwall_rust_core::{Command, IngressCommand, StateView, derive_blob_id, derive_ingress_id};
+use oqqwall_rust_core::{
+    Command, IngressBatchCommand, IngressCommand, StateView, build_draft_from_messages,
+    derive_blob_id, derive_ingress_id,
+};
 use oqqwall_rust_infra::{LocalJournal, SnapshotStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,8 +48,11 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_tungstenite::{
     accept_hdr_async,
-    tungstenite::handshake::server::{ErrorResponse, Request, Response},
-    tungstenite::http::StatusCode,
+    tungstenite::{
+        Message,
+        handshake::server::{ErrorResponse, Request, Response},
+        http::StatusCode,
+    },
 };
 
 use crate::blob_cache;
@@ -66,6 +76,64 @@ macro_rules! debug_log {
 macro_rules! debug_log {
     ($($arg:tt)*) => {};
 }
+
+#[cfg(debug_assertions)]
+fn debug_log_ws_frame(account_id: &str, direction: &str, msg: &Message) {
+    match msg {
+        Message::Text(text) => {
+            debug_log!(
+                "napcat ws raw {} text: account_id={} bytes={} payload={}",
+                direction,
+                account_id,
+                text.len(),
+                text
+            );
+        }
+        Message::Binary(bytes) => {
+            debug_log!(
+                "napcat ws raw {} binary: account_id={} bytes={}",
+                direction,
+                account_id,
+                bytes.len()
+            );
+        }
+        Message::Ping(bytes) => {
+            debug_log!(
+                "napcat ws raw {} ping: account_id={} bytes={}",
+                direction,
+                account_id,
+                bytes.len()
+            );
+        }
+        Message::Pong(bytes) => {
+            debug_log!(
+                "napcat ws raw {} pong: account_id={} bytes={}",
+                direction,
+                account_id,
+                bytes.len()
+            );
+        }
+        Message::Close(frame) => {
+            debug_log!(
+                "napcat ws raw {} close: account_id={} frame={:?}",
+                direction,
+                account_id,
+                frame
+            );
+        }
+        Message::Frame(frame) => {
+            debug_log!(
+                "napcat ws raw {} frame: account_id={} frame={:?}",
+                direction,
+                account_id,
+                frame
+            );
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_log_ws_frame(_: &str, _: &str, _: &Message) {}
 
 #[derive(Debug, Clone)]
 pub struct NapCatConfig {
@@ -1016,6 +1084,9 @@ pub struct NapCatRuntimeConfig {
     pub max_queue: usize,
     pub max_images_per_post: usize,
     pub thank_you_filter: ThankYouFilterRuntimeConfig,
+    pub submission_session_enabled: bool,
+    pub submission_session_required: bool,
+    pub submission_session_merge_text_to_first_message: bool,
     pub user_notifications: Arc<std::sync::Mutex<UserNotificationSettings>>,
     pub quick_replies: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pub review_shortcuts: Arc<std::sync::Mutex<HashMap<String, String>>>,
@@ -1028,6 +1099,7 @@ const MAX_FORWARD_DEPTH: u32 = 4;
 const FRIEND_APPROVE_DELAY_MAX_SEC: u64 = 240;
 const FRIEND_NOTIFY_DELAY_SEC: u64 = 30;
 const FRIEND_REQUEST_ID_MAX_LEN: usize = 20;
+const PENDING_SUBMISSION_RECALL_TTL_MS: i64 = 10 * 60 * 1000;
 const FRIEND_SUPPRESS_REMOVE_CHARS: &str =
     r#"　“”‘’《》〈〉【】。，：；？！（）、「」『』—［］＂＇"'`~!@#$%^&*()_+-={}[]|:;<>?,./"#;
 static STARTUP_NOTICE_SENT: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
@@ -1148,6 +1220,7 @@ struct SuppressionEntry {
 #[derive(Debug, Clone)]
 struct BufferedMessage {
     message: Value,
+    platform_msg_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1191,6 +1264,10 @@ struct NapCatState {
     friend_req_cache: HashMap<String, i64>,
     friend_suppression: HashMap<String, Vec<SuppressionEntry>>,
     submission_sessions: HashMap<String, SubmissionSession>,
+    pending_submission_recalls: HashMap<String, i64>,
+    submitted_message_ingress: HashMap<String, IngressId>,
+    submission_prefetch: HashMap<String, PrefetchedMedia>,
+    submission_prefetch_inflight: HashSet<String>,
     thank_you_feedback: HashMap<String, ThankYouFeedbackRecord>,
     blob_paths: HashMap<BlobId, String>,
     next_echo: u64,
@@ -1263,6 +1340,12 @@ fn build_state_from_view(view: &StateView) -> NapCatState {
                 route_meta: meta.route_meta.clone(),
             },
         );
+        if !meta.platform_msg_id.trim().is_empty() {
+            state.submitted_message_ingress.insert(
+                submission_message_key(&meta.profile_id, &meta.user_id, &meta.platform_msg_id),
+                *ingress_id,
+            );
+        }
     }
     for (post_id, ingress_ids) in &view.post_ingress {
         state.post_ingress.insert(*post_id, ingress_ids.clone());
@@ -1793,13 +1876,12 @@ async fn run_napcat_session(
         send_group_text(&out_tx, startup_group_id, "系统已启动").await;
     }
 
+    let account_id_writer = account_id.clone();
     let mut writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
-            if ws_write
-                .send(tokio_tungstenite::tungstenite::Message::Text(msg))
-                .await
-                .is_err()
-            {
+            let msg = Message::Text(msg);
+            debug_log_ws_frame(&account_id_writer, "outbound", &msg);
+            if ws_write.send(msg).await.is_err() {
                 debug_log!("napcat ws writer send failed");
                 break;
             }
@@ -1820,6 +1902,7 @@ async fn run_napcat_session(
                     break;
                 }
             };
+            debug_log_ws_frame(&account_id_read, "inbound", &msg);
             if !msg.is_text() {
                 debug_log!("napcat ws ignoring non-text message");
                 continue;
@@ -2224,6 +2307,9 @@ async fn build_action_from_event(
             let mut guard = state.lock().await;
             guard.pending_summary.remove(&ingress_id);
             guard.ingress_summary.remove(&ingress_id);
+            guard
+                .submitted_message_ingress
+                .retain(|_, mapped_ingress_id| *mapped_ingress_id != ingress_id);
             for ingress_ids in guard.post_ingress.values_mut() {
                 ingress_ids.retain(|id| *id != ingress_id);
             }
@@ -3428,7 +3514,7 @@ async fn parse_inbound_event(
 ) -> Option<Command> {
     let post_type = value.get("post_type").and_then(|v| v.as_str())?;
     if post_type == "notice" {
-        return parse_notice_event(runtime, value);
+        return parse_notice_event(runtime, state, out_tx, account_id, value).await;
     }
     if post_type == "request" {
         handle_friend_request(runtime, state, out_tx, value).await;
@@ -3923,10 +4009,22 @@ async fn parse_inbound_event(
         let raw_trimmed = raw_message.unwrap_or("").trim();
 
         let builtin_submission_command = parse_builtin_private_submission_command(raw_trimmed);
+        if builtin_submission_command.is_some() && !runtime.submission_session_enabled {
+            send_private_text(out_tx, &user_id, "指令式收稿未启用。").await;
+            return None;
+        }
 
         if builtin_submission_command == Some(PrivateSubmissionCommand::Start) {
             {
                 let mut guard = state.lock().await;
+                if let Some(old_session) = guard.submission_sessions.remove(&user_id) {
+                    clear_submission_prefetch_for_session(
+                        &mut guard,
+                        &self_id,
+                        &user_id,
+                        &old_session,
+                    );
+                }
                 guard.submission_sessions.insert(
                     user_id.clone(),
                     SubmissionSession {
@@ -3950,28 +4048,66 @@ async fn parse_inbound_event(
             let mut guard = state.lock().await;
             if guard.submission_sessions.contains_key(&user_id) {
                 if builtin_submission_command == Some(PrivateSubmissionCommand::Finish) {
-                    let count = guard
-                        .submission_sessions
-                        .get_mut(&user_id)
-                        .map(|session| {
+                    let (count, preview_session, preview_prefetch) =
+                        if let Some(session) = guard.submission_sessions.get_mut(&user_id) {
                             session.confirming = true;
-                            session.messages.len()
-                        })
-                        .unwrap_or(0);
+                            let count = session.messages.len();
+                            let preview_session = session.clone();
+                            let preview_prefetch = guard.submission_prefetch.clone();
+                            (count, preview_session, preview_prefetch)
+                        } else {
+                            (
+                                0,
+                                SubmissionSession {
+                                    messages: Vec::new(),
+                                    started_at_ms: timestamp_ms,
+                                    group_id: runtime.group_id.clone(),
+                                    confirming: true,
+                                },
+                                HashMap::new(),
+                            )
+                        };
                     drop(guard);
-                    send_private_text(
-                        out_tx,
-                        &user_id,
-                        &format!(
-                            "收到共 {} 条消息。\n发送 #确认 提交投稿\n发送 #追加 继续添加内容\n发送 #取消 放弃本次投稿",
-                            count
-                        ),
-                    )
-                    .await;
+                    let confirm_text = format!(
+                        "收到共 {} 条消息。\n发送 #确认 提交投稿\n发送 #追加 继续添加内容\n发送 #取消 放弃本次投稿",
+                        count
+                    );
+                    if count > 0 {
+                        send_private_text(out_tx, &user_id, "处理中...").await;
+                        match render_submission_session_preview_image(
+                            runtime,
+                            cmd_tx,
+                            &self_id,
+                            &user_id,
+                            &preview_session,
+                            &preview_prefetch,
+                        )
+                        .await
+                        {
+                            Ok(png) => {
+                                send_private_image_with_text(out_tx, &user_id, &png, &confirm_text)
+                                    .await;
+                            }
+                            Err(err) => {
+                                send_private_text(
+                                    out_tx,
+                                    &user_id,
+                                    &format!("消息记录预览生成失败：{}\n{}", err, confirm_text),
+                                )
+                                .await;
+                            }
+                        }
+                    } else {
+                        send_private_text(out_tx, &user_id, &confirm_text).await;
+                    }
                     return None;
                 }
                 if builtin_submission_command == Some(PrivateSubmissionCommand::Cancel) {
-                    guard.submission_sessions.remove(&user_id);
+                    if let Some(session) = guard.submission_sessions.remove(&user_id) {
+                        clear_submission_prefetch_for_session(
+                            &mut guard, &self_id, &user_id, &session,
+                        );
+                    }
                     drop(guard);
                     send_private_text(out_tx, &user_id, "投稿已取消。").await;
                     return None;
@@ -3986,80 +4122,44 @@ async fn parse_inbound_event(
                         return None;
                     }
                     if session_meta.messages.is_empty() {
-                        guard.submission_sessions.remove(&user_id);
+                        if let Some(session) = guard.submission_sessions.remove(&user_id) {
+                            clear_submission_prefetch_for_session(
+                                &mut guard, &self_id, &user_id, &session,
+                            );
+                        }
                         drop(guard);
                         send_private_text(out_tx, &user_id, "没有可提交的内容。").await;
                         return None;
                     }
 
-                    let session = guard
-                        .submission_sessions
-                        .remove(&user_id)
-                        .expect("submission session exists");
-                    let first_msg_id =
-                        value_opt_to_string(session.messages[0].message.get("message_id"))
-                            .unwrap_or_else(|| format!("submission-{}", session.started_at_ms));
-                    let sender_name = extract_sender_name(&session.messages[0].message)
-                        .or_else(|| Some(user_id.clone()));
-                    let chat_id = format!("{}_submission_{}", user_id, session.started_at_ms);
-                    let mut combined_text = String::new();
-                    let mut combined_attachments = Vec::new();
-                    let mut combined_summary = String::new();
-                    for buffered in &session.messages {
-                        let ExtractedMessage {
-                            text,
-                            summary_text,
-                            attachments,
-                        } = extract_message_lite(buffered.message.get("message"));
-                        if !text.trim().is_empty() {
-                            if !combined_text.is_empty() {
-                                combined_text.push_str("\n\n");
-                            }
-                            combined_text.push_str(text.trim());
+                    let count = session_meta.messages.len();
+                    let prepared = match build_submission_session_ingress_batch(
+                        runtime,
+                        &mut guard,
+                        &self_id,
+                        &user_id,
+                        timestamp_ms,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(err) => {
+                            drop(guard);
+                            send_private_text(out_tx, &user_id, &err).await;
+                            return None;
                         }
-                        if !summary_text.trim().is_empty() {
-                            if !combined_summary.is_empty() {
-                                combined_summary.push_str("\n\n");
-                            }
-                            combined_summary.push_str(summary_text.trim());
-                        }
-                        combined_attachments.extend(attachments);
-                    }
-                    if combined_summary.is_empty() {
-                        combined_summary = format!("[{} 条投稿消息]", session.messages.len());
-                    }
-                    let ingress_id = derive_ingress_id(&[
-                        self_id.as_bytes(),
-                        chat_id.as_bytes(),
-                        user_id.as_bytes(),
-                        first_msg_id.as_bytes(),
-                    ]);
-                    guard.pending_summary.insert(ingress_id, combined_summary);
-                    let count = session.messages.len();
-                    let group_id = session.group_id;
-                    let started_at_ms = session.started_at_ms;
+                    };
                     drop(guard);
+                    for event in prepared.blob_events {
+                        if cmd_tx.send(Command::DriverEvent(event)).await.is_err() {
+                            return None;
+                        }
+                    }
                     send_private_text(
                         out_tx,
                         &user_id,
                         &format!("投稿已提交，共 {} 条消息，请等待审核。", count),
                     )
                     .await;
-                    return Some(Command::Ingress(IngressCommand {
-                        profile_id: self_id,
-                        chat_id,
-                        user_id: user_id.clone(),
-                        sender_name,
-                        group_id,
-                        platform_msg_id: first_msg_id,
-                        message: IngressMessage {
-                            text: combined_text,
-                            attachments: combined_attachments,
-                        },
-                        route_meta: None,
-                        received_at_ms: started_at_ms,
-                        close_immediately: true,
-                    }));
+                    return Some(prepared.command);
                 }
                 if builtin_submission_command == Some(PrivateSubmissionCommand::Resume) {
                     if let Some(session) = guard.submission_sessions.get_mut(&user_id) {
@@ -4118,17 +4218,55 @@ async fn parse_inbound_event(
                     send_private_text(out_tx, &user_id, "请先发送 #确认、#取消 或 #追加。").await;
                     return None;
                 }
-                let count = guard
-                    .submission_sessions
-                    .get_mut(&user_id)
-                    .map(|session| {
+                let (count, prefetch_requests) = if let Some((next_index, started_at_ms)) =
+                    guard.submission_sessions.get(&user_id).map(|session| {
+                        (
+                            session.messages.len().saturating_add(1),
+                            session.started_at_ms,
+                        )
+                    }) {
+                    let platform_msg_id =
+                        submission_platform_msg_id(&value, started_at_ms, next_index);
+                    if consume_pending_submission_recall(
+                        &mut guard,
+                        &self_id,
+                        &user_id,
+                        &platform_msg_id,
+                        timestamp_ms,
+                    ) {
+                        debug_log!(
+                            "napcat submission session ignored recalled private message: user_id={} message_id={}",
+                            user_id,
+                            platform_msg_id
+                        );
+                        drop(guard);
+                        return None;
+                    }
+                    let ExtractedMessage { attachments, .. } =
+                        extract_message_lite(value.get("message"));
+                    if let Some(session) = guard.submission_sessions.get_mut(&user_id) {
                         session.messages.push(BufferedMessage {
                             message: value.clone(),
+                            platform_msg_id: platform_msg_id.clone(),
                         });
-                        session.messages.len()
-                    })
-                    .unwrap_or(0);
+                        let count = session.messages.len();
+                        let requests = collect_submission_prefetch_requests(
+                            &mut guard,
+                            &self_id,
+                            &user_id,
+                            started_at_ms,
+                            &platform_msg_id,
+                            &attachments,
+                        );
+                        (count, requests)
+                    } else {
+                        (0, Vec::new())
+                    }
+                } else {
+                    (0, Vec::new())
+                };
                 drop(guard);
+                start_submission_prefetches(Arc::clone(state), prefetch_requests);
                 send_private_text(
                     out_tx,
                     &user_id,
@@ -4201,6 +4339,10 @@ async fn parse_inbound_event(
                 PrivateAgentCommandMatch::IgnoredBlacklisted => return None,
                 PrivateAgentCommandMatch::NoMatch => {}
             }
+        }
+        if runtime.submission_session_required {
+            send_private_text(out_tx, &user_id, "请先发送 #开始投稿，再发送稿件内容。").await;
+            return None;
         }
         let ingress_id = derive_ingress_id(&[
             self_id.as_bytes(),
@@ -4461,28 +4603,81 @@ fn friend_request_delay_sec() -> u64 {
     (nanos % (FRIEND_APPROVE_DELAY_MAX_SEC as u128 + 1)) as u64
 }
 
-fn parse_notice_event(runtime: &NapCatRuntimeConfig, value: &Value) -> Option<Command> {
+async fn parse_notice_event(
+    runtime: &NapCatRuntimeConfig,
+    state: &Arc<Mutex<NapCatState>>,
+    out_tx: &mpsc::Sender<String>,
+    account_id: &str,
+    value: &Value,
+) -> Option<Command> {
     let notice_type = value.get("notice_type").and_then(|v| v.as_str());
     let sub_type = value.get("sub_type").and_then(|v| v.as_str());
+    debug_log!(
+        "napcat notice inbound: notice_type={:?} sub_type={:?} user_id={:?} operator_id={:?} target_id={:?} message_id={:?}",
+        notice_type,
+        sub_type,
+        notice_field_string(value, &["user_id"]),
+        notice_field_string(value, &["operator_id"]),
+        notice_field_string(value, &["target_id"]),
+        notice_field_string(
+            value,
+            &["message_id", "msg_id", "message_seq", "target_message_id"]
+        )
+    );
     if matches!(notice_type, Some("friend_recall")) || matches!(sub_type, Some("friend_recall")) {
-        let user_id = value_opt_to_string(value.get("user_id")).or_else(|| {
-            value
-                .get("data")
-                .and_then(|data| value_opt_to_string(data.get("user_id")))
-        })?;
-        let message_id = value_opt_to_string(value.get("message_id")).or_else(|| {
-            value
-                .get("data")
-                .and_then(|data| value_opt_to_string(data.get("message_id")))
-        })?;
-        let profile_id =
-            value_opt_to_string(value.get("self_id")).unwrap_or_else(|| "napcat".to_string());
-        let ingress_id = derive_ingress_id(&[
-            profile_id.as_bytes(),
-            user_id.as_bytes(),
-            user_id.as_bytes(),
-            message_id.as_bytes(),
-        ]);
+        let user_id_candidates =
+            notice_field_candidates(value, &["user_id", "operator_id", "target_id"]);
+        let message_id = notice_field_string(
+            value,
+            &["message_id", "msg_id", "message_seq", "target_message_id"],
+        )?;
+        let profile_id = value_opt_to_string(value.get("self_id"))
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| account_id.to_string());
+
+        if let Some(reply) = remove_recalled_submission_session_message(
+            state,
+            &profile_id,
+            &user_id_candidates,
+            &message_id,
+        )
+        .await
+        {
+            send_private_text(out_tx, &reply.user_id, &reply.text).await;
+            return None;
+        }
+
+        {
+            let mut guard = state.lock().await;
+            remember_pending_submission_recall(
+                &mut guard,
+                &profile_id,
+                &user_id_candidates,
+                &message_id,
+                inbound_timestamp_ms(value),
+            );
+        }
+
+        let Some(user_id) = user_id_candidates.first().cloned() else {
+            return None;
+        };
+        let ingress_id = {
+            let guard = state.lock().await;
+            user_id_candidates.iter().find_map(|candidate| {
+                guard
+                    .submitted_message_ingress
+                    .get(&submission_message_key(&profile_id, candidate, &message_id))
+                    .copied()
+            })
+        }
+        .unwrap_or_else(|| {
+            derive_ingress_id(&[
+                profile_id.as_bytes(),
+                user_id.as_bytes(),
+                user_id.as_bytes(),
+                message_id.as_bytes(),
+            ])
+        });
         return Some(Command::DriverEvent(Event::Ingress(
             IngressEvent::MessageRecalled {
                 ingress_id,
@@ -4535,6 +4730,102 @@ fn parse_notice_event(runtime: &NapCatRuntimeConfig, value: &Value) -> Option<Co
             received_at_ms: timestamp_ms,
         },
     )))
+}
+
+struct RecalledSubmissionReply {
+    user_id: String,
+    text: String,
+}
+
+async fn remove_recalled_submission_session_message(
+    state: &Arc<Mutex<NapCatState>>,
+    account_id: &str,
+    user_id_candidates: &[String],
+    message_id: &str,
+) -> Option<RecalledSubmissionReply> {
+    let mut guard = state.lock().await;
+    let user_id = user_id_candidates
+        .iter()
+        .find(|candidate| {
+            guard
+                .submission_sessions
+                .get(candidate.as_str())
+                .is_some_and(|session| session_has_recalled_message(session, message_id))
+        })
+        .cloned()
+        .or_else(|| {
+            guard
+                .submission_sessions
+                .iter()
+                .find_map(|(candidate, session)| {
+                    session_has_recalled_message(session, message_id).then(|| candidate.clone())
+                })
+        })?;
+    let (removed, count, was_confirming) = {
+        let session = guard.submission_sessions.get_mut(&user_id)?;
+        let before = session.messages.len();
+        let removed = session
+            .messages
+            .iter()
+            .filter(|buffered| buffered_message_matches_recall(buffered, message_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        session
+            .messages
+            .retain(|buffered| !buffered_message_matches_recall(buffered, message_id));
+        if session.messages.len() == before {
+            return None;
+        }
+        let count = session.messages.len();
+        let was_confirming = session.confirming;
+        if was_confirming {
+            session.confirming = false;
+        }
+        (removed, count, was_confirming)
+    };
+    for buffered in &removed {
+        let attachments = extract_message_lite(buffered.message.get("message")).attachments;
+        for attachment_index in 0..attachments.len() {
+            let key = submission_prefetch_key(
+                account_id,
+                &user_id,
+                &buffered.platform_msg_id,
+                attachment_index,
+            );
+            guard.submission_prefetch.remove(&key);
+            guard.submission_prefetch_inflight.remove(&key);
+        }
+    }
+    let text = if count == 0 {
+        "已移除撤回的投稿消息，当前没有可提交内容。请继续发送稿件内容或发送 #取消。".to_string()
+    } else if was_confirming {
+        format!(
+            "已移除撤回的投稿消息，当前共 {} 条。请重新发送 #结束投稿 生成预览。",
+            count
+        )
+    } else {
+        format!("已移除撤回的投稿消息，当前共 {} 条。", count)
+    };
+    Some(RecalledSubmissionReply { user_id, text })
+}
+
+fn session_has_recalled_message(session: &SubmissionSession, message_id: &str) -> bool {
+    session
+        .messages
+        .iter()
+        .any(|buffered| buffered_message_matches_recall(buffered, message_id))
+}
+
+fn buffered_message_matches_recall(buffered: &BufferedMessage, message_id: &str) -> bool {
+    if buffered.platform_msg_id == message_id {
+        return true;
+    }
+    notice_field_string(
+        &buffered.message,
+        &["message_id", "msg_id", "message_seq", "target_message_id"],
+    )
+    .as_deref()
+        == Some(message_id)
 }
 
 fn message_has_forward(value: Option<&Value>) -> bool {
@@ -6887,13 +7178,36 @@ fn build_agent_review_info_text(
     .join("\n"))
 }
 
-fn build_submission_session_ingress(
+#[derive(Debug, Clone)]
+struct PreparedSubmissionMessage {
+    original_message_id: Option<String>,
+    platform_msg_id: String,
+    sender_name: Option<String>,
+    received_at_ms: i64,
+    message: IngressMessage,
+    summary_text: String,
+}
+
+struct PreparedSubmissionBatch {
+    command: Command,
+    blob_events: Vec<Event>,
+}
+
+#[derive(Debug, Clone)]
+struct SubmissionPrefetchRequest {
+    key: String,
+    ingress_id: IngressId,
+    attachment_index: usize,
+    attachment: IngressAttachment,
+}
+
+fn build_submission_session_ingress_batch(
     runtime: &NapCatRuntimeConfig,
     state: &mut NapCatState,
     account_id: &str,
     user_id: &str,
     timestamp_ms: i64,
-) -> Result<Command, String> {
+) -> Result<PreparedSubmissionBatch, String> {
     let Some(session) = state.submission_sessions.remove(user_id) else {
         return Err("当前用户没有进行中的投稿会话".to_string());
     };
@@ -6906,71 +7220,426 @@ fn build_submission_session_ingress(
     if session.messages.is_empty() {
         return Err("当前投稿会话没有可提交的内容".to_string());
     }
-    let first_msg = session
+    let chat_id = submission_chat_id(user_id, session.started_at_ms);
+    let group_id = if session.group_id.trim().is_empty() {
+        runtime.group_id.clone()
+    } else {
+        session.group_id.clone()
+    };
+    let mut prepared = prepare_submission_session_messages(
+        &session,
+        user_id,
+        runtime.submission_session_merge_text_to_first_message,
+    );
+    if prepared.is_empty() {
+        return Err("当前投稿会话没有可提交的内容".to_string());
+    }
+
+    let mut entries = Vec::with_capacity(prepared.len());
+    let mut blob_events = Vec::new();
+    for item in &mut prepared {
+        for (attachment_index, attachment) in item.message.attachments.iter_mut().enumerate() {
+            let prefetch_key = submission_prefetch_key(
+                account_id,
+                user_id,
+                &item.platform_msg_id,
+                attachment_index,
+            );
+            let Some(prefetched) = state.submission_prefetch.remove(&prefetch_key) else {
+                continue;
+            };
+            state
+                .blob_paths
+                .insert(prefetched.blob_id, prefetched.path.clone());
+            attachment.reference = MediaReference::Blob {
+                blob_id: prefetched.blob_id,
+            };
+            blob_events.push(Event::Blob(BlobEvent::BlobRegistered {
+                blob_id: prefetched.blob_id,
+                size_bytes: prefetched.size_bytes,
+            }));
+            blob_events.push(Event::Blob(BlobEvent::BlobPersisted {
+                blob_id: prefetched.blob_id,
+                path: prefetched.path,
+            }));
+        }
+        let ingress_id = derive_ingress_id(&[
+            account_id.as_bytes(),
+            chat_id.as_bytes(),
+            user_id.as_bytes(),
+            item.platform_msg_id.as_bytes(),
+        ]);
+        state
+            .pending_summary
+            .insert(ingress_id, item.summary_text.clone());
+        if let Some(original_message_id) = item.original_message_id.as_ref() {
+            state.submitted_message_ingress.insert(
+                submission_message_key(account_id, user_id, original_message_id),
+                ingress_id,
+            );
+        }
+        entries.push(IngressCommand {
+            profile_id: account_id.to_string(),
+            chat_id: chat_id.clone(),
+            user_id: user_id.to_string(),
+            sender_name: item.sender_name.clone(),
+            group_id: group_id.clone(),
+            platform_msg_id: item.platform_msg_id.clone(),
+            message: item.message.clone(),
+            route_meta: None,
+            received_at_ms: item.received_at_ms,
+            close_immediately: true,
+        });
+    }
+    clear_submission_prefetch_for_session(state, account_id, user_id, &session);
+
+    Ok(PreparedSubmissionBatch {
+        command: Command::IngressBatch(IngressBatchCommand {
+            entries,
+            now_ms: timestamp_ms,
+        }),
+        blob_events,
+    })
+}
+
+fn prepare_submission_session_messages(
+    session: &SubmissionSession,
+    user_id: &str,
+    merge_text_to_first_message: bool,
+) -> Vec<PreparedSubmissionMessage> {
+    let mut items = session
         .messages
-        .first()
-        .ok_or_else(|| "当前投稿会话没有可提交的内容".to_string())?;
-    let first_msg_id = value_opt_to_string(first_msg.message.get("message_id"))
-        .unwrap_or_else(|| format!("submission-{}", session.started_at_ms));
-    let sender_name = extract_sender_name(&first_msg.message).or_else(|| Some(user_id.to_string()));
-    let chat_id = format!("{}_submission_{}", user_id, session.started_at_ms);
-    let mut combined_text = String::new();
-    let mut combined_attachments = Vec::new();
-    let mut combined_summary = String::new();
-    for buffered in &session.messages {
-        let ExtractedMessage {
-            text,
-            summary_text,
-            attachments,
-        } = extract_message_lite(buffered.message.get("message"));
-        if !text.trim().is_empty() {
-            if !combined_text.is_empty() {
-                combined_text.push_str("\n\n");
+        .iter()
+        .map(|buffered| {
+            let original_message_id = value_opt_to_string(buffered.message.get("message_id"));
+            let ExtractedMessage {
+                text,
+                summary_text,
+                attachments,
+            } = extract_message_lite(buffered.message.get("message"));
+            PreparedSubmissionMessage {
+                original_message_id,
+                platform_msg_id: buffered.platform_msg_id.clone(),
+                sender_name: extract_sender_name(&buffered.message)
+                    .or_else(|| Some(user_id.to_string())),
+                received_at_ms: message_timestamp_ms(&buffered.message, session.started_at_ms),
+                message: IngressMessage { text, attachments },
+                summary_text,
             }
-            combined_text.push_str(text.trim());
+        })
+        .collect::<Vec<_>>();
+
+    if merge_text_to_first_message && !items.is_empty() {
+        let merged_text = items
+            .iter()
+            .filter_map(|item| {
+                let text = item.message.text.trim();
+                (!text.is_empty()).then(|| text.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let merged_summary = items
+            .iter()
+            .filter_map(|item| {
+                let text = item.summary_text.trim();
+                (!text.is_empty()).then(|| text.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        for item in &mut items {
+            item.message.text.clear();
+            item.summary_text.clear();
         }
-        if !summary_text.trim().is_empty() {
-            if !combined_summary.is_empty() {
-                combined_summary.push_str("\n\n");
+        if let Some(first) = items.first_mut() {
+            first.message.text = merged_text;
+            first.summary_text = merged_summary;
+        }
+    }
+
+    items
+}
+
+async fn render_submission_session_preview_image(
+    runtime: &NapCatRuntimeConfig,
+    cmd_tx: &mpsc::Sender<Command>,
+    account_id: &str,
+    user_id: &str,
+    session: &SubmissionSession,
+    prefetched: &HashMap<String, PrefetchedMedia>,
+) -> Result<Vec<u8>, String> {
+    let mut prepared = prepare_submission_session_messages(
+        session,
+        user_id,
+        runtime.submission_session_merge_text_to_first_message,
+    );
+    apply_submission_prefetch_to_preview(&mut prepared, account_id, user_id, prefetched);
+    let messages = prepared
+        .iter()
+        .map(|item| item.message.clone())
+        .collect::<Vec<_>>();
+    if messages.is_empty() {
+        return Err("没有可预览的内容".to_string());
+    }
+    let draft = build_draft_from_messages(&messages);
+    let group_id = if session.group_id.trim().is_empty() {
+        runtime.group_id.clone()
+    } else {
+        session.group_id.clone()
+    };
+    let header = RenderPreviewHeader {
+        group_id,
+        user_id: user_id.to_string(),
+        post_id_hex: format!("session-{}", session.started_at_ms),
+        sender_name: prepared
+            .first()
+            .and_then(|item| item.sender_name.clone())
+            .filter(|name| !name.trim().is_empty()),
+        is_anonymous: false,
+    };
+    let renderer_config = RendererRuntimeConfig::default();
+    let png = render_submission_session_preview_png(
+        &draft,
+        header,
+        &renderer_config,
+        Duration::from_secs(2),
+        cmd_tx,
+    )
+    .await?;
+    Ok(png)
+}
+
+fn apply_submission_prefetch_to_preview(
+    prepared: &mut [PreparedSubmissionMessage],
+    account_id: &str,
+    user_id: &str,
+    prefetched: &HashMap<String, PrefetchedMedia>,
+) {
+    for item in prepared {
+        for (attachment_index, attachment) in item.message.attachments.iter_mut().enumerate() {
+            let key = submission_prefetch_key(
+                account_id,
+                user_id,
+                &item.platform_msg_id,
+                attachment_index,
+            );
+            if let Some(media) = prefetched.get(&key) {
+                attachment.reference = MediaReference::RemoteUrl {
+                    url: media.path.clone(),
+                };
             }
-            combined_summary.push_str(summary_text.trim());
         }
-        combined_attachments.extend(attachments);
     }
-    if combined_summary.is_empty() {
-        combined_summary = format!("[{} 条投稿消息]", session.messages.len());
+}
+
+fn message_timestamp_ms(value: &Value, fallback_ms: i64) -> i64 {
+    value
+        .get("time")
+        .and_then(|v| v.as_i64())
+        .map(|sec| sec.saturating_mul(1000))
+        .unwrap_or(fallback_ms)
+}
+
+fn submission_platform_msg_id(value: &Value, started_at_ms: i64, next_index: usize) -> String {
+    value_opt_to_string(value.get("message_id"))
+        .unwrap_or_else(|| format!("submission-{}-{}", started_at_ms, next_index))
+}
+
+fn submission_chat_id(user_id: &str, started_at_ms: i64) -> String {
+    format!("{}_submission_{}", user_id, started_at_ms)
+}
+
+fn submission_message_key(account_id: &str, user_id: &str, message_id: &str) -> String {
+    format!("{}\x1f{}\x1f{}", account_id, user_id, message_id)
+}
+
+fn prune_pending_submission_recalls(state: &mut NapCatState, now_ms: i64) {
+    state
+        .pending_submission_recalls
+        .retain(|_, expire_at_ms| *expire_at_ms > now_ms);
+}
+
+fn remember_pending_submission_recall(
+    state: &mut NapCatState,
+    account_id: &str,
+    user_id_candidates: &[String],
+    message_id: &str,
+    now_ms: i64,
+) {
+    let message_id = message_id.trim();
+    if message_id.is_empty() {
+        return;
     }
+    prune_pending_submission_recalls(state, now_ms);
+    let expire_at_ms = now_ms.saturating_add(PENDING_SUBMISSION_RECALL_TTL_MS);
+    for user_id in user_id_candidates {
+        let user_id = user_id.trim();
+        if user_id.is_empty() {
+            continue;
+        }
+        if !state.submission_sessions.contains_key(user_id) {
+            continue;
+        }
+        state.pending_submission_recalls.insert(
+            submission_message_key(account_id, user_id, message_id),
+            expire_at_ms,
+        );
+    }
+}
+
+fn consume_pending_submission_recall(
+    state: &mut NapCatState,
+    account_id: &str,
+    user_id: &str,
+    message_id: &str,
+    now_ms: i64,
+) -> bool {
+    let message_id = message_id.trim();
+    if user_id.trim().is_empty() || message_id.is_empty() {
+        return false;
+    }
+    prune_pending_submission_recalls(state, now_ms);
+    state
+        .pending_submission_recalls
+        .remove(&submission_message_key(account_id, user_id, message_id))
+        .is_some()
+}
+
+fn submission_prefetch_key(
+    account_id: &str,
+    user_id: &str,
+    platform_msg_id: &str,
+    attachment_index: usize,
+) -> String {
+    format!(
+        "{}\x1f{}\x1f{}\x1f{}",
+        account_id, user_id, platform_msg_id, attachment_index
+    )
+}
+
+fn collect_submission_prefetch_requests(
+    state: &mut NapCatState,
+    account_id: &str,
+    user_id: &str,
+    started_at_ms: i64,
+    platform_msg_id: &str,
+    attachments: &[IngressAttachment],
+) -> Vec<SubmissionPrefetchRequest> {
+    let chat_id = submission_chat_id(user_id, started_at_ms);
     let ingress_id = derive_ingress_id(&[
         account_id.as_bytes(),
         chat_id.as_bytes(),
         user_id.as_bytes(),
-        first_msg_id.as_bytes(),
+        platform_msg_id.as_bytes(),
     ]);
-    state.pending_summary.insert(ingress_id, combined_summary);
-    let received_at_ms = if session.started_at_ms > 0 {
-        session.started_at_ms
-    } else {
-        timestamp_ms
-    };
-    Ok(Command::Ingress(IngressCommand {
-        profile_id: account_id.to_string(),
-        chat_id,
-        user_id: user_id.to_string(),
-        sender_name,
-        group_id: if session.group_id.trim().is_empty() {
-            runtime.group_id.clone()
-        } else {
-            session.group_id
-        },
-        platform_msg_id: first_msg_id,
-        message: IngressMessage {
-            text: combined_text,
-            attachments: combined_attachments,
-        },
-        route_meta: None,
-        received_at_ms,
-        close_immediately: true,
-    }))
+    attachments
+        .iter()
+        .enumerate()
+        .filter_map(|(attachment_index, attachment)| {
+            if !matches!(attachment.kind, MediaKind::Image | MediaKind::Sticker) {
+                return None;
+            }
+            if !matches!(attachment.reference, MediaReference::RemoteUrl { .. }) {
+                return None;
+            }
+            let key =
+                submission_prefetch_key(account_id, user_id, platform_msg_id, attachment_index);
+            if state.submission_prefetch.contains_key(&key)
+                || !state.submission_prefetch_inflight.insert(key.clone())
+            {
+                return None;
+            }
+            Some(SubmissionPrefetchRequest {
+                key,
+                ingress_id,
+                attachment_index,
+                attachment: attachment.clone(),
+            })
+        })
+        .collect()
+}
+
+fn start_submission_prefetches(
+    state: Arc<Mutex<NapCatState>>,
+    requests: Vec<SubmissionPrefetchRequest>,
+) {
+    if requests.is_empty() {
+        return;
+    }
+    let client = submission_prefetch_client();
+    let blob_root = submission_prefetch_blob_root();
+    for request in requests {
+        let state = Arc::clone(&state);
+        let client = client.clone();
+        let blob_root = blob_root.clone();
+        tokio::spawn(async move {
+            let result = prefetch_attachment_blob(
+                &client,
+                &blob_root,
+                request.ingress_id,
+                request.attachment_index,
+                &request.attachment,
+            )
+            .await;
+            let mut guard = state.lock().await;
+            if !guard.submission_prefetch_inflight.remove(&request.key) {
+                return;
+            }
+            match result {
+                Ok(prefetched) => {
+                    guard
+                        .blob_paths
+                        .insert(prefetched.blob_id, prefetched.path.clone());
+                    guard.submission_prefetch.insert(request.key, prefetched);
+                }
+                Err(err) => {
+                    debug_log!(
+                        "submission prefetch failed: key={} err={}",
+                        request.key,
+                        err
+                    );
+                }
+            }
+        });
+    }
+}
+
+fn submission_prefetch_client() -> Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .unwrap_or_else(|_| Client::new())
+        })
+        .clone()
+}
+
+fn submission_prefetch_blob_root() -> PathBuf {
+    std::env::var("OQQWALL_BLOB_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/blobs"))
+}
+
+fn clear_submission_prefetch_for_session(
+    state: &mut NapCatState,
+    account_id: &str,
+    user_id: &str,
+    session: &SubmissionSession,
+) {
+    for buffered in &session.messages {
+        let attachments = extract_message_lite(buffered.message.get("message")).attachments;
+        for attachment_index in 0..attachments.len() {
+            let key = submission_prefetch_key(
+                account_id,
+                user_id,
+                &buffered.platform_msg_id,
+                attachment_index,
+            );
+            state.submission_prefetch.remove(&key);
+            state.submission_prefetch_inflight.remove(&key);
+        }
+    }
 }
 
 fn build_agent_review_action(
@@ -7671,7 +8340,16 @@ async fn execute_agent_command_blocks(
             }
             AgentCommandBlock::StartSubmissionSession => {
                 ensure_private_agent_block(meta.trigger)?;
+                ensure_submission_session_enabled(runtime)?;
                 let mut guard = state.lock().await;
+                if let Some(old_session) = guard.submission_sessions.remove(&meta.user_id) {
+                    clear_submission_prefetch_for_session(
+                        &mut guard,
+                        &meta.account_id,
+                        &meta.user_id,
+                        &old_session,
+                    );
+                }
                 guard.submission_sessions.insert(
                     meta.user_id.clone(),
                     SubmissionSession {
@@ -7684,6 +8362,7 @@ async fn execute_agent_command_blocks(
             }
             AgentCommandBlock::FinishSubmissionSession => {
                 ensure_private_agent_block(meta.trigger)?;
+                ensure_submission_session_enabled(runtime)?;
                 let mut guard = state.lock().await;
                 if let Some(session) = guard.submission_sessions.get_mut(&meta.user_id) {
                     session.confirming = true;
@@ -7691,6 +8370,7 @@ async fn execute_agent_command_blocks(
             }
             AgentCommandBlock::ResumeSubmissionSession => {
                 ensure_private_agent_block(meta.trigger)?;
+                ensure_submission_session_enabled(runtime)?;
                 let mut guard = state.lock().await;
                 if let Some(session) = guard.submission_sessions.get_mut(&meta.user_id) {
                     session.confirming = false;
@@ -7698,8 +8378,9 @@ async fn execute_agent_command_blocks(
             }
             AgentCommandBlock::SubmitSubmissionSession => {
                 ensure_private_agent_block(meta.trigger)?;
+                ensure_submission_session_enabled(runtime)?;
                 let mut guard = state.lock().await;
-                let command = build_submission_session_ingress(
+                let prepared = build_submission_session_ingress_batch(
                     runtime,
                     &mut guard,
                     &meta.account_id,
@@ -7707,8 +8388,14 @@ async fn execute_agent_command_blocks(
                     meta.timestamp_ms,
                 )?;
                 drop(guard);
+                for event in prepared.blob_events {
+                    cmd_tx
+                        .send(Command::DriverEvent(event))
+                        .await
+                        .map_err(|err| format!("提交投稿会话失败: {}", err))?;
+                }
                 cmd_tx
-                    .send(command)
+                    .send(prepared.command)
                     .await
                     .map_err(|err| format!("提交投稿会话失败: {}", err))?;
                 send_private_text(out_tx, &meta.user_id, "投稿会话已提交，系统正在继续处理。")
@@ -7716,8 +8403,16 @@ async fn execute_agent_command_blocks(
             }
             AgentCommandBlock::CancelSubmissionSession => {
                 ensure_private_agent_block(meta.trigger)?;
+                ensure_submission_session_enabled(runtime)?;
                 let mut guard = state.lock().await;
-                guard.submission_sessions.remove(&meta.user_id);
+                if let Some(session) = guard.submission_sessions.remove(&meta.user_id) {
+                    clear_submission_prefetch_for_session(
+                        &mut guard,
+                        &meta.account_id,
+                        &meta.user_id,
+                        &session,
+                    );
+                }
             }
             AgentCommandBlock::InsertQueuedPost {
                 moving_post_code,
@@ -7884,6 +8579,14 @@ fn ensure_private_agent_block(trigger: AgentCommandTrigger) -> Result<(), String
         Ok(())
     } else {
         Err("该积木只能用于私聊触发的 agent 指令".to_string())
+    }
+}
+
+fn ensure_submission_session_enabled(runtime: &NapCatRuntimeConfig) -> Result<(), String> {
+    if runtime.submission_session_enabled {
+        Ok(())
+    } else {
+        Err("指令式收稿未启用".to_string())
     }
 }
 
@@ -8651,6 +9354,29 @@ async fn send_private_text(out_tx: &mpsc::Sender<String>, user_id: &str, text: &
     .await;
 }
 
+async fn send_private_image_with_text(
+    out_tx: &mpsc::Sender<String>,
+    user_id: &str,
+    bytes: &[u8],
+    text: &str,
+) {
+    send_private_segments(
+        out_tx,
+        user_id,
+        vec![
+            serde_json::json!({
+                "type": "image",
+                "data": { "file": format!("base64://{}", STANDARD.encode(bytes)) }
+            }),
+            serde_json::json!({
+                "type": "text",
+                "data": { "text": text }
+            }),
+        ],
+    )
+    .await;
+}
+
 async fn send_private_segments(out_tx: &mpsc::Sender<String>, user_id: &str, message: Vec<Value>) {
     let payload = serde_json::json!({
         "action": "send_private_msg",
@@ -8672,6 +9398,45 @@ fn value_to_string(value: &Value) -> Option<String> {
 
 fn value_opt_to_string(value: Option<&Value>) -> Option<String> {
     value.and_then(value_to_string)
+}
+
+fn notice_field_string(value: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(text) =
+            value_opt_to_string(value.get(*key)).filter(|text| !text.trim().is_empty())
+        {
+            return Some(text);
+        }
+        if let Some(text) = value
+            .get("data")
+            .and_then(|data| value_opt_to_string(data.get(*key)))
+            .filter(|text| !text.trim().is_empty())
+        {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn notice_field_candidates(value: &Value, keys: &[&str]) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for key in keys {
+        for candidate in [
+            value_opt_to_string(value.get(*key)),
+            value
+                .get("data")
+                .and_then(|data| value_opt_to_string(data.get(*key))),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let candidate = candidate.trim();
+            if !candidate.is_empty() && !candidates.iter().any(|seen| seen == candidate) {
+                candidates.push(candidate.to_string());
+            }
+        }
+    }
+    candidates
 }
 
 fn value_opt_to_i64(value: Option<&Value>) -> Option<i64> {
@@ -8804,6 +9569,9 @@ mod tests {
             max_queue: 1,
             max_images_per_post: 0,
             thank_you_filter: ThankYouFilterRuntimeConfig::disabled(),
+            submission_session_enabled: true,
+            submission_session_required: false,
+            submission_session_merge_text_to_first_message: false,
             user_notifications: Arc::new(
                 std::sync::Mutex::new(UserNotificationSettings::default()),
             ),
@@ -8974,6 +9742,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_submission_session_rejects_builtin_start_command() {
+        let mut runtime = test_runtime();
+        runtime.submission_session_enabled = false;
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let value = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": "10001",
+            "user_id": "20002",
+            "message_id": "m1",
+            "time": 1001,
+            "raw_message": "#开始投稿",
+            "message": [
+                {"type": "text", "data": {"text": "#开始投稿"}}
+            ]
+        });
+
+        let command =
+            parse_inbound_event(&runtime, &state, &cmd_tx, &out_tx, "10001", &value).await;
+        assert!(command.is_none());
+        assert!(state.lock().await.submission_sessions.is_empty());
+        let reply = out_rx.try_recv().expect("disabled reply");
+        assert!(reply.contains("指令式收稿未启用"));
+    }
+
+    #[tokio::test]
+    async fn required_submission_session_blocks_plain_private_ingress() {
+        let mut runtime = test_runtime();
+        runtime.submission_session_required = true;
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let value = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": "10001",
+            "user_id": "20002",
+            "message_id": "m1",
+            "time": 1001,
+            "raw_message": "普通投稿内容",
+            "message": [
+                {"type": "text", "data": {"text": "普通投稿内容"}}
+            ]
+        });
+
+        let command =
+            parse_inbound_event(&runtime, &state, &cmd_tx, &out_tx, "10001", &value).await;
+        assert!(command.is_none());
+        let reply = out_rx.try_recv().expect("required reply");
+        assert!(reply.contains("#开始投稿"));
+    }
+
+    #[tokio::test]
     async fn private_agent_command_runs_during_confirming_submission_session() {
         let mut runtime = test_runtime();
         runtime.agent_commands = Arc::new(std::sync::Mutex::new(HashMap::from([(
@@ -9030,6 +9853,426 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(removed, "agent command should cancel the active session");
+    }
+
+    #[test]
+    fn submission_session_submit_keeps_messages_separate_by_default() {
+        let runtime = test_runtime();
+        let mut state = NapCatState::default();
+        state.submission_sessions.insert(
+            "20002".to_string(),
+            SubmissionSession {
+                messages: vec![
+                    BufferedMessage {
+                        message: serde_json::json!({
+                            "message_id": "m1",
+                            "time": 1001,
+                            "message": [{"type": "text", "data": {"text": "第一条"}}]
+                        }),
+                        platform_msg_id: "m1".to_string(),
+                    },
+                    BufferedMessage {
+                        message: serde_json::json!({
+                            "message_id": "m2",
+                            "time": 1002,
+                            "message": [{"type": "text", "data": {"text": "第二条"}}]
+                        }),
+                        platform_msg_id: "m2".to_string(),
+                    },
+                ],
+                started_at_ms: 1001000,
+                group_id: runtime.group_id.clone(),
+                confirming: true,
+            },
+        );
+
+        let prepared =
+            build_submission_session_ingress_batch(&runtime, &mut state, "10001", "20002", 2000)
+                .expect("batch command");
+        let Command::IngressBatch(batch) = prepared.command else {
+            panic!("expected ingress batch");
+        };
+        assert_eq!(batch.entries.len(), 2);
+        assert_eq!(batch.entries[0].message.text, "第一条");
+        assert_eq!(batch.entries[1].message.text, "第二条");
+        assert_eq!(state.pending_summary.len(), 2);
+        assert_eq!(state.submitted_message_ingress.len(), 2);
+    }
+
+    #[test]
+    fn submission_session_submit_can_merge_text_to_first_message() {
+        let mut runtime = test_runtime();
+        runtime.submission_session_merge_text_to_first_message = true;
+        let mut state = NapCatState::default();
+        state.submission_sessions.insert(
+            "20002".to_string(),
+            SubmissionSession {
+                messages: vec![
+                    BufferedMessage {
+                        message: serde_json::json!({
+                            "message_id": "m1",
+                            "time": 1001,
+                            "message": [{"type": "text", "data": {"text": "第一条"}}]
+                        }),
+                        platform_msg_id: "m1".to_string(),
+                    },
+                    BufferedMessage {
+                        message: serde_json::json!({
+                            "message_id": "m2",
+                            "time": 1002,
+                            "message": [{"type": "text", "data": {"text": "第二条"}}]
+                        }),
+                        platform_msg_id: "m2".to_string(),
+                    },
+                ],
+                started_at_ms: 1001000,
+                group_id: runtime.group_id.clone(),
+                confirming: true,
+            },
+        );
+
+        let prepared =
+            build_submission_session_ingress_batch(&runtime, &mut state, "10001", "20002", 2000)
+                .expect("batch command");
+        let Command::IngressBatch(batch) = prepared.command else {
+            panic!("expected ingress batch");
+        };
+        assert_eq!(batch.entries.len(), 2);
+        assert_eq!(batch.entries[0].message.text, "第一条\n\n第二条");
+        assert_eq!(batch.entries[1].message.text, "");
+    }
+
+    #[test]
+    fn submission_session_submit_uses_prefetched_image_blob() {
+        let runtime = test_runtime();
+        let mut state = NapCatState::default();
+        let user_id = "20002";
+        let account_id = "10001";
+        let platform_msg_id = "m1";
+        let chat_id = submission_chat_id(user_id, 1001000);
+        let ingress_id = derive_ingress_id(&[
+            account_id.as_bytes(),
+            chat_id.as_bytes(),
+            user_id.as_bytes(),
+            platform_msg_id.as_bytes(),
+        ]);
+        let blob_id = derive_blob_id(&[&ingress_id.to_be_bytes(), &0u64.to_be_bytes()]);
+        state.submission_prefetch.insert(
+            submission_prefetch_key(account_id, user_id, platform_msg_id, 0),
+            PrefetchedMedia {
+                blob_id,
+                path: "data/blobs/image/prefetched.jpg".to_string(),
+                size_bytes: 10,
+            },
+        );
+        state.submission_sessions.insert(
+            user_id.to_string(),
+            SubmissionSession {
+                messages: vec![BufferedMessage {
+                    message: serde_json::json!({
+                        "message_id": platform_msg_id,
+                        "time": 1001,
+                        "message": [{
+                            "type": "image",
+                            "data": {"url": "https://example.test/a.jpg", "sub_type": 0}
+                        }]
+                    }),
+                    platform_msg_id: platform_msg_id.to_string(),
+                }],
+                started_at_ms: 1001000,
+                group_id: runtime.group_id.clone(),
+                confirming: true,
+            },
+        );
+
+        let prepared =
+            build_submission_session_ingress_batch(&runtime, &mut state, account_id, user_id, 2000)
+                .expect("batch command");
+        let Command::IngressBatch(batch) = prepared.command else {
+            panic!("expected ingress batch");
+        };
+        assert_eq!(prepared.blob_events.len(), 2);
+        assert!(matches!(
+            &batch.entries[0].message.attachments[0].reference,
+            MediaReference::Blob { blob_id: id } if *id == blob_id
+        ));
+        assert!(
+            !state
+                .submission_prefetch
+                .contains_key(&submission_prefetch_key(
+                    account_id,
+                    user_id,
+                    platform_msg_id,
+                    0
+                ))
+        );
+    }
+
+    #[test]
+    fn submission_session_preview_uses_prefetched_local_path() {
+        let runtime = test_runtime();
+        let user_id = "20002";
+        let account_id = "10001";
+        let platform_msg_id = "m1";
+        let blob_id = Id128(42);
+        let session = SubmissionSession {
+            messages: vec![BufferedMessage {
+                message: serde_json::json!({
+                    "message_id": platform_msg_id,
+                    "time": 1001,
+                    "message": [{
+                        "type": "image",
+                        "data": {"url": "https://example.test/a.jpg", "sub_type": 0}
+                    }]
+                }),
+                platform_msg_id: platform_msg_id.to_string(),
+            }],
+            started_at_ms: 1001000,
+            group_id: runtime.group_id.clone(),
+            confirming: true,
+        };
+        let mut prefetched = HashMap::new();
+        prefetched.insert(
+            submission_prefetch_key(account_id, user_id, platform_msg_id, 0),
+            PrefetchedMedia {
+                blob_id,
+                path: "data/blobs/image/prefetched.jpg".to_string(),
+                size_bytes: 10,
+            },
+        );
+        let mut prepared = prepare_submission_session_messages(&session, user_id, false);
+
+        apply_submission_prefetch_to_preview(&mut prepared, account_id, user_id, &prefetched);
+
+        assert!(matches!(
+            &prepared[0].message.attachments[0].reference,
+            MediaReference::RemoteUrl { url } if url == "data/blobs/image/prefetched.jpg"
+        ));
+    }
+
+    #[tokio::test]
+    async fn friend_recall_removes_buffered_submission_message() {
+        let runtime = test_runtime();
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        {
+            let mut guard = state.lock().await;
+            guard.submission_sessions.insert(
+                "20002".to_string(),
+                SubmissionSession {
+                    messages: vec![
+                        BufferedMessage {
+                            message: serde_json::json!({
+                                "message_id": "m1",
+                                "message": [{"type": "text", "data": {"text": "保留"}}]
+                            }),
+                            platform_msg_id: "m1".to_string(),
+                        },
+                        BufferedMessage {
+                            message: serde_json::json!({
+                                "message_id": "m2",
+                                "message": [{"type": "text", "data": {"text": "撤回"}}]
+                            }),
+                            platform_msg_id: "m2".to_string(),
+                        },
+                    ],
+                    started_at_ms: 1000,
+                    group_id: runtime.group_id.clone(),
+                    confirming: true,
+                },
+            );
+        }
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        let payload = serde_json::json!({
+            "post_type": "notice",
+            "notice_type": "friend_recall",
+            "self_id": "10001",
+            "user_id": "20002",
+            "message_id": "m2",
+            "time": 1730000000
+        });
+
+        let command = parse_notice_event(&runtime, &state, &out_tx, "10001", &payload).await;
+        assert!(command.is_none());
+        let guard = state.lock().await;
+        let session = guard.submission_sessions.get("20002").expect("session");
+        assert_eq!(session.messages.len(), 1);
+        assert!(!session.confirming);
+        drop(guard);
+        let reply = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("reply timeout")
+            .expect("reply");
+        assert!(reply.contains("请重新发送 #结束投稿"));
+    }
+
+    #[tokio::test]
+    async fn friend_recall_removes_buffered_submission_message_from_data_payload() {
+        let runtime = test_runtime();
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        {
+            let mut guard = state.lock().await;
+            guard.submission_sessions.insert(
+                "20002".to_string(),
+                SubmissionSession {
+                    messages: vec![
+                        BufferedMessage {
+                            message: serde_json::json!({
+                                "message": [{"type": "text", "data": {"text": "保留"}}]
+                            }),
+                            platform_msg_id: "m1".to_string(),
+                        },
+                        BufferedMessage {
+                            message: serde_json::json!({
+                                "message": [{"type": "text", "data": {"text": "撤回"}}]
+                            }),
+                            platform_msg_id: "m2".to_string(),
+                        },
+                    ],
+                    started_at_ms: 1000,
+                    group_id: runtime.group_id.clone(),
+                    confirming: false,
+                },
+            );
+        }
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        let payload = serde_json::json!({
+            "post_type": "notice",
+            "notice_type": "friend_recall",
+            "self_id": "10001",
+            "data": {
+                "operator_id": "20002",
+                "message_id": "m2"
+            },
+            "time": 1730000000
+        });
+
+        let command = parse_notice_event(&runtime, &state, &out_tx, "10001", &payload).await;
+        assert!(command.is_none());
+        let guard = state.lock().await;
+        let session = guard.submission_sessions.get("20002").expect("session");
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].platform_msg_id, "m1");
+        drop(guard);
+        let reply = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("reply timeout")
+            .expect("reply");
+        assert!(reply.contains("当前共 1 条"));
+    }
+
+    #[tokio::test]
+    async fn friend_recall_before_submission_message_drops_late_message() {
+        let runtime = test_runtime();
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        {
+            let mut guard = state.lock().await;
+            guard.submission_sessions.insert(
+                "20002".to_string(),
+                SubmissionSession {
+                    messages: Vec::new(),
+                    started_at_ms: 1000,
+                    group_id: runtime.group_id.clone(),
+                    confirming: false,
+                },
+            );
+        }
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let recall = serde_json::json!({
+            "post_type": "notice",
+            "notice_type": "friend_recall",
+            "self_id": "10001",
+            "user_id": "20002",
+            "message_id": "m1",
+            "time": 1001
+        });
+
+        let _ = parse_notice_event(&runtime, &state, &out_tx, "10001", &recall).await;
+        assert!(out_rx.try_recv().is_err());
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let message = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": "10001",
+            "user_id": "20002",
+            "message_id": "m1",
+            "time": 1002,
+            "raw_message": "撤回前内容",
+            "message": [{"type": "text", "data": {"text": "撤回前内容"}}]
+        });
+        let command =
+            parse_inbound_event(&runtime, &state, &cmd_tx, &out_tx, "10001", &message).await;
+        assert!(command.is_none());
+        let guard = state.lock().await;
+        let session = guard.submission_sessions.get("20002").expect("session");
+        assert!(session.messages.is_empty());
+        drop(guard);
+        assert!(out_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn private_preview_image_and_confirm_text_share_one_message() {
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        send_private_image_with_text(&out_tx, "20002", &[1, 2, 3], "收到共 2 条消息。").await;
+
+        let payload = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("payload timeout")
+            .expect("payload");
+        let payload: Value = serde_json::from_str(&payload).expect("json payload");
+        assert_eq!(
+            payload.get("action").and_then(Value::as_str),
+            Some("send_private_msg")
+        );
+        let message = payload
+            .get("params")
+            .and_then(|params| params.get("message"))
+            .and_then(Value::as_array)
+            .expect("message array");
+        assert_eq!(message.len(), 2);
+        assert_eq!(
+            message[0].get("type").and_then(Value::as_str),
+            Some("image")
+        );
+        assert_eq!(message[1].get("type").and_then(Value::as_str), Some("text"));
+        assert_eq!(
+            message[1]
+                .get("data")
+                .and_then(|data| data.get("text"))
+                .and_then(Value::as_str),
+            Some("收到共 2 条消息。")
+        );
+    }
+
+    #[tokio::test]
+    async fn friend_recall_uses_submitted_message_mapping() {
+        let runtime = test_runtime();
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        let expected_ingress = Id128(12345);
+        {
+            let mut guard = state.lock().await;
+            guard.submitted_message_ingress.insert(
+                submission_message_key("10001", "20002", "m1"),
+                expected_ingress,
+            );
+        }
+        let (out_tx, _out_rx) = mpsc::channel(1);
+        let payload = serde_json::json!({
+            "post_type": "notice",
+            "notice_type": "friend_recall",
+            "self_id": "10001",
+            "user_id": "20002",
+            "message_id": "m1",
+            "time": 1730000000
+        });
+
+        let command = parse_notice_event(&runtime, &state, &out_tx, "10001", &payload).await;
+        assert!(matches!(
+            command,
+            Some(Command::DriverEvent(Event::Ingress(
+                IngressEvent::MessageRecalled { ingress_id, .. }
+            ))) if ingress_id == expected_ingress
+        ));
     }
 
     #[tokio::test]
@@ -9523,9 +10766,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_friend_recall_notice_to_driver_event() {
+    #[tokio::test]
+    async fn parse_friend_recall_notice_to_driver_event() {
         let runtime = test_runtime();
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        let (out_tx, _out_rx) = mpsc::channel(1);
         let payload = serde_json::json!({
             "post_type": "notice",
             "notice_type": "friend_recall",
@@ -9535,7 +10780,7 @@ mod tests {
             "time": 1730000000
         });
 
-        let command = parse_notice_event(&runtime, &payload);
+        let command = parse_notice_event(&runtime, &state, &out_tx, "10001", &payload).await;
         let expected_ingress = derive_ingress_id(&[b"10001", b"20002", b"20002", b"30003"]);
         assert!(matches!(
             command,

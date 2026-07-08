@@ -39,6 +39,13 @@ pub struct MediaFetcherRuntimeConfig {
     pub timeout: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PrefetchedMedia {
+    pub(crate) blob_id: BlobId,
+    pub(crate) path: String,
+    pub(crate) size_bytes: u64,
+}
+
 impl Default for MediaFetcherRuntimeConfig {
     fn default() -> Self {
         let blob_root = std::env::var("OQQWALL_BLOB_DIR")
@@ -309,6 +316,44 @@ async fn handle_fetch(
             }
         }
     }
+}
+
+pub(crate) async fn prefetch_attachment_blob(
+    client: &Client,
+    blob_root: &Path,
+    ingress_id: IngressId,
+    attachment_index: usize,
+    attachment: &IngressAttachment,
+) -> Result<PrefetchedMedia, String> {
+    let url = match &attachment.reference {
+        MediaReference::RemoteUrl { url } => url.clone(),
+        MediaReference::Blob { .. } => return Err("attachment is already a blob".to_string()),
+    };
+    let fetched = fetch_bytes(client, &url).await?;
+    let ext = choose_extension(attachment, &url, &fetched);
+    let blob_id = derive_attachment_blob_id(ingress_id, attachment_index);
+    let bytes: Arc<[u8]> = Arc::from(fetched.bytes);
+    if let Some((kind, retention)) = blob_cache::cache_policy_for_media(attachment.kind) {
+        blob_cache::store_arc(
+            blob_id,
+            bytes.clone(),
+            kind,
+            retention,
+            fetched.content_type.clone(),
+        );
+    }
+    let (path, size_bytes) = persist_blob(
+        blob_root,
+        kind_dir(&attachment.kind),
+        &ext,
+        blob_id,
+        bytes.as_ref(),
+    )?;
+    Ok(PrefetchedMedia {
+        blob_id,
+        path,
+        size_bytes,
+    })
 }
 
 struct FetchedBytes {
