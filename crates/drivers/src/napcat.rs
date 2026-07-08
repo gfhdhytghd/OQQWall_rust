@@ -3504,7 +3504,10 @@ async fn parse_inbound_event(
         } else {
             false
         };
-        if let Some(command) = parse_audit_command(&text, reply_id.is_some(), runtime) {
+        let raw_command_text =
+            raw_message.and_then(|raw| command_text_after_self_mention(raw, &self_id));
+        let command_text = raw_command_text.as_deref().unwrap_or(&text);
+        if let Some(command) = parse_audit_command(command_text, reply_id.is_some(), runtime) {
             if !command_context_allowed(&command, mentions_self, reply_bound) {
                 return None;
             }
@@ -3892,6 +3895,15 @@ async fn parse_inbound_event(
                     .await;
                 }
             }
+        }
+        if mentions_self {
+            send_group_text(
+                out_tx,
+                &chat_group_id,
+                "未识别指令，请 @本账号 发送“帮助”查看可用指令",
+            )
+            .await;
+            return None;
         }
         if is_audit_group {
             return None;
@@ -5223,6 +5235,40 @@ fn message_mentions_self(value: Option<&Value>, raw_message: Option<&str>, self_
             raw.contains("[CQ:at,") && raw.contains(&token)
         })
         .unwrap_or(false)
+}
+
+fn command_text_after_self_mention(raw_message: &str, self_id: &str) -> Option<String> {
+    if self_id.trim().is_empty() {
+        return None;
+    }
+    let token = format!("qq={}", self_id);
+    let mut rest = raw_message.trim_start();
+    let mut saw_self_mention = false;
+
+    loop {
+        let Some(segment) = rest.strip_prefix("[CQ:at,") else {
+            break;
+        };
+        let Some(end) = segment.find(']') else {
+            break;
+        };
+        let body = &segment[..end];
+        if body.split(',').any(|part| part.trim() == token) {
+            saw_self_mention = true;
+        }
+        rest = segment[end + 1..].trim_start();
+    }
+
+    if !saw_self_mention {
+        return None;
+    }
+
+    let command = rest.trim();
+    if command.is_empty() {
+        None
+    } else {
+        Some(command.to_string())
+    }
 }
 
 fn command_context_allowed(command: &AuditCommand, mentions_self: bool, reply_bound: bool) -> bool {
@@ -8808,41 +8854,53 @@ mod tests {
     #[tokio::test]
     async fn group_global_command_uses_account_id_when_self_id_missing() {
         let runtime = test_runtime();
-        register_ws_session("100", mock_session());
-        let state = Arc::new(Mutex::new(NapCatState::default()));
-        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
-        let (out_tx, mut out_rx) = mpsc::channel(4);
-        let value = serde_json::json!({
-            "post_type": "message",
-            "message_type": "group",
-            "group_id": "1",
-            "user_id": "20002",
-            "message_id": "m1",
-            "time": 1001,
-            "raw_message": "[CQ:at,qq=100] 自检",
-            "message": [
+        for (idx, message) in [
+            serde_json::json!([
                 {"type": "text", "data": {"text": "自检"}}
-            ],
-            "sender": {
-                "role": "admin"
-            }
-        });
+            ]),
+            serde_json::json!("[CQ:at,qq=100] 自检"),
+            serde_json::json!([
+                {"type": "text", "data": {"text": ""}}
+            ]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            register_ws_session("100", mock_session());
+            let state = Arc::new(Mutex::new(NapCatState::default()));
+            let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+            let (out_tx, mut out_rx) = mpsc::channel(4);
+            let value = serde_json::json!({
+                "post_type": "message",
+                "message_type": "group",
+                "group_id": "1",
+                "user_id": "20002",
+                "message_id": format!("m{}", idx),
+                "time": 1001,
+                "raw_message": "[CQ:at,qq=100] 自检",
+                "message": message,
+                "sender": {
+                    "role": "admin"
+                }
+            });
 
-        let command = parse_inbound_event(&runtime, &state, &cmd_tx, &out_tx, "100", &value).await;
-        assert!(command.is_none());
+            let command =
+                parse_inbound_event(&runtime, &state, &cmd_tx, &out_tx, "100", &value).await;
+            assert!(command.is_none());
 
-        let ack = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
-            .await
-            .expect("ack timeout")
-            .expect("ack message");
-        assert!(ack.contains("\"action\":\"send_group_msg\""));
-        assert!(ack.contains("已收到指令"));
-        let report = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
-            .await
-            .expect("report timeout")
-            .expect("selfcheck report");
-        assert!(report.contains("系统自检报告"));
-        unregister_ws_session("100");
+            let ack = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+                .await
+                .expect("ack timeout")
+                .expect("ack message");
+            assert!(ack.contains("\"action\":\"send_group_msg\""));
+            assert!(ack.contains("已收到指令"));
+            let report = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+                .await
+                .expect("report timeout")
+                .expect("selfcheck report");
+            assert!(report.contains("系统自检报告"));
+            unregister_ws_session("100");
+        }
     }
 
     #[tokio::test]
