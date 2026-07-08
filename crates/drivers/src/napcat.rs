@@ -3922,7 +3922,9 @@ async fn parse_inbound_event(
         let raw_message = value.get("raw_message").and_then(|v| v.as_str());
         let raw_trimmed = raw_message.unwrap_or("").trim();
 
-        if raw_trimmed == "#开始投稿" {
+        let builtin_submission_command = parse_builtin_private_submission_command(raw_trimmed);
+
+        if builtin_submission_command == Some(PrivateSubmissionCommand::Start) {
             {
                 let mut guard = state.lock().await;
                 guard.submission_sessions.insert(
@@ -3947,7 +3949,7 @@ async fn parse_inbound_event(
         {
             let mut guard = state.lock().await;
             if guard.submission_sessions.contains_key(&user_id) {
-                if raw_trimmed == "#结束投稿" {
+                if builtin_submission_command == Some(PrivateSubmissionCommand::Finish) {
                     let count = guard
                         .submission_sessions
                         .get_mut(&user_id)
@@ -3968,13 +3970,13 @@ async fn parse_inbound_event(
                     .await;
                     return None;
                 }
-                if raw_trimmed == "#取消" {
+                if builtin_submission_command == Some(PrivateSubmissionCommand::Cancel) {
                     guard.submission_sessions.remove(&user_id);
                     drop(guard);
                     send_private_text(out_tx, &user_id, "投稿已取消。").await;
                     return None;
                 }
-                if raw_trimmed == "#确认" {
+                if builtin_submission_command == Some(PrivateSubmissionCommand::Confirm) {
                     let Some(session_meta) = guard.submission_sessions.get(&user_id) else {
                         return None;
                     };
@@ -4059,7 +4061,7 @@ async fn parse_inbound_event(
                         close_immediately: true,
                     }));
                 }
-                if raw_trimmed == "#追加" {
+                if builtin_submission_command == Some(PrivateSubmissionCommand::Resume) {
                     if let Some(session) = guard.submission_sessions.get_mut(&user_id) {
                         session.confirming = false;
                     }
@@ -4135,6 +4137,24 @@ async fn parse_inbound_event(
                 .await;
                 return None;
             }
+        }
+
+        if matches!(
+            builtin_submission_command,
+            Some(
+                PrivateSubmissionCommand::Finish
+                    | PrivateSubmissionCommand::Confirm
+                    | PrivateSubmissionCommand::Cancel
+                    | PrivateSubmissionCommand::Resume
+            )
+        ) {
+            send_private_text(
+                out_tx,
+                &user_id,
+                "当前没有进行中的投稿会话，请先发送 #开始投稿。",
+            )
+            .await;
+            return None;
         }
 
         if let Some(raw_message) = raw_message {
@@ -7360,9 +7380,21 @@ async fn execute_agent_global_action(
         .map_err(|err| format!("发送全局指令失败: {}", err))
 }
 
-fn parse_private_agent_command_line(raw_trimmed: &str) -> Option<(String, String)> {
-    let body = raw_trimmed.trim().strip_prefix('#')?;
-    let body = body.trim();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateSubmissionCommand {
+    Start,
+    Finish,
+    Confirm,
+    Cancel,
+    Resume,
+}
+
+fn parse_private_command_parts(raw_trimmed: &str) -> Option<(&str, &str)> {
+    let trimmed = raw_trimmed.trim();
+    let body = trimmed
+        .strip_prefix('#')
+        .or_else(|| trimmed.strip_prefix('＃'))?
+        .trim_start();
     if body.is_empty() {
         return None;
     }
@@ -7371,8 +7403,25 @@ fn parse_private_agent_command_line(raw_trimmed: &str) -> Option<(String, String
     if name.is_empty() {
         return None;
     }
-    let args = iter.next().unwrap_or("").trim().to_string();
-    Some((name.to_string(), args))
+    let args = iter.next().unwrap_or("").trim();
+    Some((name, args))
+}
+
+fn parse_builtin_private_submission_command(raw_trimmed: &str) -> Option<PrivateSubmissionCommand> {
+    let (name, _) = parse_private_command_parts(raw_trimmed)?;
+    match name {
+        "开始投稿" => Some(PrivateSubmissionCommand::Start),
+        "结束投稿" => Some(PrivateSubmissionCommand::Finish),
+        "确认" => Some(PrivateSubmissionCommand::Confirm),
+        "取消" => Some(PrivateSubmissionCommand::Cancel),
+        "追加" => Some(PrivateSubmissionCommand::Resume),
+        _ => None,
+    }
+}
+
+fn parse_private_agent_command_line(raw_trimmed: &str) -> Option<(String, String)> {
+    let (name, args) = parse_private_command_parts(raw_trimmed)?;
+    Some((name.to_string(), args.to_string()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8823,6 +8872,105 @@ mod tests {
                 42
             );
         }
+    }
+
+    #[test]
+    fn private_submission_command_parser_accepts_common_hash_variants() {
+        assert_eq!(
+            parse_builtin_private_submission_command("#追加"),
+            Some(PrivateSubmissionCommand::Resume)
+        );
+        assert_eq!(
+            parse_builtin_private_submission_command("＃追加"),
+            Some(PrivateSubmissionCommand::Resume)
+        );
+        assert_eq!(
+            parse_builtin_private_submission_command("# 追加"),
+            Some(PrivateSubmissionCommand::Resume)
+        );
+        assert_eq!(
+            parse_builtin_private_submission_command("#追加 继续写"),
+            Some(PrivateSubmissionCommand::Resume)
+        );
+        assert_eq!(parse_builtin_private_submission_command("追加"), None);
+        assert_eq!(
+            parse_private_agent_command_line("＃续写 继续写"),
+            Some(("续写".to_string(), "继续写".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn builtin_resume_accepts_fullwidth_hash_in_confirming_session() {
+        let runtime = test_runtime();
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        {
+            let mut guard = state.lock().await;
+            guard.submission_sessions.insert(
+                "20002".to_string(),
+                SubmissionSession {
+                    messages: Vec::new(),
+                    started_at_ms: 1_000,
+                    group_id: runtime.group_id.clone(),
+                    confirming: true,
+                },
+            );
+        }
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let value = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": "10001",
+            "user_id": "20002",
+            "message_id": "m1",
+            "time": 1001,
+            "raw_message": "＃追加",
+            "message": [
+                {"type": "text", "data": {"text": "＃追加"}}
+            ]
+        });
+
+        let command =
+            parse_inbound_event(&runtime, &state, &cmd_tx, &out_tx, "10001", &value).await;
+        assert!(command.is_none());
+        {
+            let guard = state.lock().await;
+            assert_eq!(
+                guard
+                    .submission_sessions
+                    .get("20002")
+                    .map(|session| session.confirming),
+                Some(false)
+            );
+        }
+        let reply = out_rx.try_recv().expect("resume reply");
+        assert!(reply.contains("继续投稿"));
+    }
+
+    #[tokio::test]
+    async fn builtin_resume_without_session_does_not_become_ingress() {
+        let runtime = test_runtime();
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let value = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": "10001",
+            "user_id": "20002",
+            "message_id": "m1",
+            "time": 1001,
+            "raw_message": "#追加",
+            "message": [
+                {"type": "text", "data": {"text": "#追加"}}
+            ]
+        });
+
+        let command =
+            parse_inbound_event(&runtime, &state, &cmd_tx, &out_tx, "10001", &value).await;
+        assert!(command.is_none());
+        let reply = out_rx.try_recv().expect("no-session reply");
+        assert!(reply.contains("当前没有进行中的投稿会话"));
     }
 
     #[tokio::test]
