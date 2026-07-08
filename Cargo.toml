@@ -13,3 +13,6 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+[patch.crates-io]
+skia-bindings = { path = "vendor/skia-bindings-0.91.0" }

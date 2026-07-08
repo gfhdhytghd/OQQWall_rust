@@ -74,7 +74,8 @@ impl Engine {
             .map_err(|err| format!("journal init: {}", err))?;
         let snapshot = SnapshotStore::open(data_dir.as_ref())
             .map_err(|err| format!("snapshot init: {}", err))?;
-        let (state, last_cursor, last_snapshot_ms) = Self::restore_state(&mut journal, &snapshot)?;
+        let (state, last_cursor, last_snapshot_ms, needs_snapshot_migration) =
+            Self::restore_state(&mut journal, &snapshot)?;
         {
             if let Ok(mut guard) = handle.state.write() {
                 *guard = state.clone();
@@ -84,7 +85,7 @@ impl Engine {
             .last_event_id
             .map(|id| id.0.saturating_add(1))
             .unwrap_or(1);
-        let engine = Self {
+        let mut engine = Self {
             state,
             config,
             cmd_rx,
@@ -98,6 +99,9 @@ impl Engine {
             last_snapshot_ms,
             shared_state: handle.state.clone(),
         };
+        if needs_snapshot_migration {
+            engine.write_snapshot(now_ms());
+        }
         debug_log!("engine init: groups={}", engine.config.groups.len());
         Ok((engine, handle))
     }
@@ -145,13 +149,18 @@ impl Engine {
     fn restore_state(
         journal: &mut LocalJournal,
         snapshot: &SnapshotStore,
-    ) -> Result<(StateView, JournalCursor, i64), String> {
+    ) -> Result<(StateView, JournalCursor, i64, bool), String> {
         let mut state = StateView::default();
         let mut cursor = None;
         let mut last_snapshot_ms = 0;
+        let mut needs_snapshot_migration = false;
 
-        match snapshot.load() {
+        match snapshot.load_with_format() {
             Ok(Some(loaded)) => {
+                if loaded.legacy_format {
+                    needs_snapshot_migration = true;
+                }
+                let loaded = loaded.snapshot;
                 last_snapshot_ms = loaded.taken_at_ms;
                 cursor = loaded.journal_cursor;
                 state = loaded.state;
@@ -162,6 +171,24 @@ impl Engine {
             }
             Err(_err) => {
                 debug_log!("snapshot load failed: {}", _err);
+            }
+        }
+
+        if let Some(snapshot_cursor) = cursor {
+            let first_segment = journal
+                .first_segment_index()
+                .map_err(|err| format!("journal segment scan failed: {}", err))?;
+            if let Some(first_segment) = first_segment {
+                if snapshot_cursor.segment < first_segment {
+                    debug_log!(
+                        "snapshot cursor segment {} before first journal segment {}; ignoring snapshot",
+                        snapshot_cursor.segment,
+                        first_segment
+                    );
+                    state = StateView::default();
+                    cursor = None;
+                    last_snapshot_ms = 0;
+                }
             }
         }
 
@@ -182,6 +209,13 @@ impl Engine {
             }
             Err(_err) => return Err(format!("journal replay failed: {}", _err)),
         };
+        if outcome.legacy_records > 0 {
+            needs_snapshot_migration = true;
+            debug_log!(
+                "journal replay used {} legacy record(s); snapshot migration requested",
+                outcome.legacy_records
+            );
+        }
 
         if let Some(_corruption) = &outcome.corruption {
             debug_log!(
@@ -202,7 +236,12 @@ impl Engine {
         } else {
             last_snapshot_ms
         };
-        Ok((state, last_cursor, last_snapshot_ms))
+        Ok((
+            state,
+            last_cursor,
+            last_snapshot_ms,
+            needs_snapshot_migration,
+        ))
     }
 
     fn envelope(&mut self, event: Event) -> EventEnvelope {
@@ -224,9 +263,16 @@ impl Engine {
         {
             return;
         }
+        self.write_snapshot(now);
+    }
+
+    fn write_snapshot(&mut self, now: i64) {
         let snapshot = Snapshot::new(now, Some(self.last_cursor), self.state.clone());
         match self.snapshot.write(&snapshot) {
             Ok(()) => {
+                if let Err(_err) = self.journal.delete_segments_before(self.last_cursor) {
+                    debug_log!("journal segment gc failed: {}", _err);
+                }
                 self.last_snapshot_ms = now;
                 self.events_since_snapshot = 0;
                 debug_log!("snapshot saved: ts_ms={}", now);

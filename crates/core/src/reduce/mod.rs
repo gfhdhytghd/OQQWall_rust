@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use crate::event::{
     AccountEvent, BlobEvent, ConfigEvent, DraftEvent, Event, EventEnvelope, GroupFlushReason,
-    IngressEvent, InputStatusKind, ManualEvent, MediaEvent, RenderEvent, ReviewEvent,
-    ScheduleEvent, SendEvent, SessionEvent,
+    IngressEvent, InputStatusKind, LifecycleEvent, ManualEvent, MediaEvent, RenderEvent,
+    ReviewEvent, ScheduleEvent, SendEvent, SessionEvent,
 };
-use crate::ids::{BlobId, PostId};
+use crate::ids::{BlobId, IngressId, PostId};
 use crate::state::{
     AccountRuntime, BlobMeta, GroupRuntime, InputStatusMeta, MediaFetchKey, MediaFetchMeta,
     PostMeta, PostStage, QzonePublicationMeta, RenderMeta, ReviewMeta, SendDueKey, SendPlan,
@@ -38,6 +38,7 @@ fn reduce_in_place(state: &mut StateView, env: &EventEnvelope) {
         Event::Blob(event) => reduce_blob(state, event),
         Event::Account(event) => reduce_account(state, event),
         Event::Manual(event) => reduce_manual(state, event),
+        Event::Lifecycle(event) => reduce_lifecycle(state, event),
     }
 }
 
@@ -51,6 +52,7 @@ fn reduce_ingress(state: &mut StateView, event: &IngressEvent) {
             sender_name,
             group_id,
             platform_msg_id,
+            route_meta,
             received_at_ms,
             message,
         }
@@ -62,6 +64,7 @@ fn reduce_ingress(state: &mut StateView, event: &IngressEvent) {
             sender_name,
             group_id,
             platform_msg_id,
+            route_meta,
             received_at_ms,
             message,
         } => {
@@ -75,6 +78,7 @@ fn reduce_ingress(state: &mut StateView, event: &IngressEvent) {
                     sender_name: sender_name.clone(),
                     group_id: group_id.clone(),
                     platform_msg_id: platform_msg_id.clone(),
+                    route_meta: route_meta.clone(),
                     received_at_ms: *received_at_ms,
                 },
             );
@@ -239,6 +243,17 @@ fn reduce_draft(state: &mut StateView, event: &DraftEvent) {
             meta.is_safe = *is_safe;
             state.update_post_stage(*post_id, PostStage::Drafted);
         }
+        DraftEvent::DraftTransformsSet {
+            post_id,
+            transforms,
+            ..
+        } => {
+            if transforms.is_empty() {
+                state.draft_transforms.remove(post_id);
+            } else {
+                state.draft_transforms.insert(*post_id, transforms.clone());
+            }
+        }
     }
 }
 
@@ -339,7 +354,7 @@ fn reduce_render(state: &mut StateView, event: &RenderEvent) {
     }
 }
 
-fn reduce_png_ready(state: &mut StateView, post_id: PostId, blob_ids: &[BlobId]) {
+fn reduce_png_ready(state: &mut StateView, post_id: crate::ids::PostId, blob_ids: &[BlobId]) {
     if blob_ids.is_empty() {
         return;
     }
@@ -472,7 +487,6 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                 meta.decision = Some(*decision);
                 meta.decided_by = Some(decided_by.clone());
                 meta.decided_at_ms = Some(*decided_at_ms);
-                meta.decision_reason = None;
             }
             if let Some(post_id) = post_id {
                 let stage = match decision {
@@ -937,6 +951,116 @@ fn reduce_blob(state: &mut StateView, event: &BlobEvent) {
             state.blobs.remove(blob_id);
         }
     }
+}
+
+fn reduce_lifecycle(state: &mut StateView, event: &LifecycleEvent) {
+    match event {
+        LifecycleEvent::PostEvicted {
+            post_id,
+            ingress_ids,
+            ..
+        } => {
+            evict_post(state, *post_id, ingress_ids);
+        }
+    }
+}
+
+fn evict_post(state: &mut StateView, post_id: PostId, event_ingress_ids: &[IngressId]) {
+    if let Some(post) = state.posts.remove(&post_id) {
+        if let Some(set) = state.posts_by_stage.get_mut(&post.stage) {
+            set.remove(&post_id);
+            if set.is_empty() {
+                state.posts_by_stage.remove(&post.stage);
+            }
+        }
+    } else {
+        for set in state.posts_by_stage.values_mut() {
+            set.remove(&post_id);
+        }
+    }
+
+    state.drafts.remove(&post_id);
+    state.render.remove(&post_id);
+    state.draft_transforms.remove(&post_id);
+    state.external_code_by_post.remove(&post_id);
+    state.manual_interventions.remove(&post_id);
+    state.sending.remove(&post_id);
+    remove_send_plan(state, post_id);
+    remove_post_reviews(state, post_id);
+    remove_post_qzone_publications(state, post_id);
+
+    let ingress_ids = state
+        .post_ingress
+        .remove(&post_id)
+        .unwrap_or_else(|| event_ingress_ids.to_vec());
+    for ingress_id in ingress_ids {
+        remove_ingress_if_unreferenced(state, ingress_id);
+    }
+}
+
+fn remove_send_plan(state: &mut StateView, post_id: PostId) {
+    if let Some(prev) = state.send_plans.remove(&post_id) {
+        state.send_due.remove(&SendDueKey {
+            not_before_ms: prev.not_before_ms,
+            priority: prev.priority,
+            seq: prev.seq,
+            post_id: prev.post_id,
+        });
+    }
+}
+
+fn remove_post_reviews(state: &mut StateView, post_id: PostId) {
+    let review_ids = state
+        .reviews
+        .iter()
+        .filter_map(|(review_id, review)| (review.post_id == post_id).then_some(*review_id))
+        .collect::<Vec<_>>();
+    for review_id in review_ids {
+        if let Some(review) = state.reviews.remove(&review_id) {
+            state.review_by_code.remove(&review.review_code);
+            if let Some(audit_msg_id) = review.audit_msg_id {
+                state.review_by_audit_msg.remove(&audit_msg_id);
+            }
+        }
+    }
+}
+
+fn remove_post_qzone_publications(state: &mut StateView, post_id: PostId) {
+    state.qzone_publications_by_post.remove(&post_id);
+    let mut empty_publications = Vec::new();
+    for (key, publication) in &mut state.qzone_publications {
+        publication.items.retain(|item| item.post_id != post_id);
+        publication.withdrawn_posts.remove(&post_id);
+        publication.pending_withdrawn_posts.remove(&post_id);
+        if publication.items.is_empty() {
+            empty_publications.push(key.clone());
+        }
+    }
+    for key in &empty_publications {
+        state.qzone_publications.remove(key);
+    }
+    if !empty_publications.is_empty() {
+        for keys in state.qzone_publications_by_post.values_mut() {
+            for key in &empty_publications {
+                keys.remove(key);
+            }
+        }
+    }
+}
+
+fn remove_ingress_if_unreferenced(state: &mut StateView, ingress_id: IngressId) {
+    let still_referenced = state
+        .post_ingress
+        .values()
+        .any(|ingress_ids| ingress_ids.contains(&ingress_id));
+    if still_referenced {
+        return;
+    }
+    state.ingress_meta.remove(&ingress_id);
+    state.ingress_messages.remove(&ingress_id);
+    state
+        .media_fetch
+        .retain(|key, _| key.ingress_id != ingress_id);
 }
 
 fn reduce_account(state: &mut StateView, event: &AccountEvent) {

@@ -16,9 +16,9 @@ use oqqwall_rust_core::event::{BlobEvent, DraftEvent, IngressEvent, MediaEvent, 
 use oqqwall_rust_core::state::PostStage;
 use oqqwall_rust_core::{
     Command, GlobalAction, GlobalActionCommand, Id128, IngressAttachment, IngressCommand,
-    IngressMessage, MediaKind, MediaReference, ReplyPreview, ReviewAction, ReviewActionCommand,
-    StateView, build_draft_from_messages, derive_blob_id, derive_ingress_id, derive_post_id,
-    derive_session_id, forward_marker, json_card_marker, poke_marker, reply_marker,
+    IngressMessage, IngressRouteMeta, MediaKind, MediaReference, ReplyPreview, ReviewAction,
+    ReviewActionCommand, StateView, build_draft_from_messages, derive_blob_id, derive_ingress_id,
+    derive_post_id, derive_session_id, forward_marker, json_card_marker, poke_marker, reply_marker,
 };
 use oqqwall_rust_drivers::avatar_cache;
 use oqqwall_rust_drivers::napcat::{
@@ -62,15 +62,6 @@ const STRANGER_INFO_TIMEOUT_MS: u64 = 3_000;
 const SEND_PRIVATE_TIMEOUT_MS: u64 = 5_000;
 const AVATAR_WAIT_AFTER_FETCH_MS: i64 = 1_500;
 const AVATAR_WAIT_POLL_MS: u64 = 100;
-
-fn reply_preview_sender_label(preview: &ReplyPreview) -> &str {
-    preview
-        .meta
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("未知发送者")
-}
 
 #[derive(Clone)]
 struct ApiState {
@@ -226,7 +217,6 @@ struct PostDetailResponse {
     post_id: String,
     review_id: Option<String>,
     review_code: Option<u32>,
-    decision_reason: Option<String>,
     group_id: String,
     stage: String,
     external_code: Option<u64>,
@@ -384,34 +374,30 @@ struct CreatePostRequest {
     sender_name: Option<String>,
     #[serde(default)]
     sender_avatar_base64: Option<String>,
+    #[serde(default)]
+    source_webhook: Option<String>,
+    #[serde(default)]
+    tag: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_request_tags")]
+    tags: Vec<String>,
     messages: Vec<CreatePostMessage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CreateRenderedPostRequest {
     target_account: String,
-    #[serde(default)]
     image_base64: String,
-    #[serde(default)]
     image_mime: String,
-    #[serde(default)]
-    images: Vec<CreateRenderedImageRequest>,
     #[serde(default)]
     sender_id: Option<String>,
     #[serde(default)]
     sender_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateRenderedImageRequest {
-    image_base64: String,
-    image_mime: String,
-}
-
-#[derive(Debug)]
-struct DecodedRenderedImage {
-    bytes: Vec<u8>,
-    ext: &'static str,
+    #[serde(default)]
+    source_webhook: Option<String>,
+    #[serde(default)]
+    tag: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_request_tags")]
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -436,6 +422,95 @@ struct CreatePostResponse {
     accepted_messages: usize,
     normalization: CreatePostNormalization,
     warnings: Vec<String>,
+}
+
+fn build_ingress_route_meta(
+    source_webhook: Option<&str>,
+    tags: &[String],
+) -> Option<IngressRouteMeta> {
+    let source_webhook = source_webhook
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let tags = tags
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .fold(Vec::new(), |mut acc, value| {
+            if !acc.iter().any(|existing| existing == value) {
+                acc.push(value.to_string());
+            }
+            acc
+        });
+    if source_webhook.is_none() && tags.is_empty() {
+        return None;
+    }
+    Some(IngressRouteMeta {
+        source_webhook,
+        tags,
+    })
+}
+
+fn deserialize_request_tags<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(deserializer)?;
+    Ok(parse_request_tags_value(raw.as_ref()))
+}
+
+fn parse_request_tags_value(value: Option<&Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(value) = value {
+        append_request_tags_value(&mut out, value);
+    }
+    out
+}
+
+fn append_request_tags_value(out: &mut Vec<String>, value: &Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                append_request_tags_value(out, item);
+            }
+        }
+        Value::String(text) => {
+            for item in split_request_tag_text(text) {
+                push_request_tag(out, &item);
+            }
+        }
+        Value::Number(number) => push_request_tag(out, &number.to_string()),
+        Value::Bool(flag) => push_request_tag(out, if *flag { "true" } else { "false" }),
+        _ => {}
+    }
+}
+
+fn split_request_tag_text(value: &str) -> Vec<String> {
+    value
+        .split(|ch| matches!(ch, ',' | '，' | ';' | '；' | '|' | '\n' | '\r'))
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+        .collect()
+}
+
+fn push_request_tag(out: &mut Vec<String>, raw: &str) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || out.iter().any(|existing| existing == trimmed) {
+        return;
+    }
+    out.push(trimmed.to_string());
+}
+
+fn merge_request_tags(tags: &[String], singular_tag: Option<&Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    for tag in tags {
+        push_request_tag(&mut out, tag);
+    }
+    if let Some(value) = singular_tag {
+        append_request_tags_value(&mut out, value);
+    }
+    out
 }
 
 pub fn spawn_web_api(handle: &EngineHandle, config: &AppConfig) {
@@ -982,6 +1057,8 @@ async fn create_post(
         });
     let mut commands = Vec::new();
     let mut normalization = CreatePostNormalization::default();
+    let route_tags = merge_request_tags(&req.tags, req.tag.as_ref());
+    let route_meta = build_ingress_route_meta(req.source_webhook.as_deref(), &route_tags);
     let mut first_platform_msg_id: Option<String> = None;
     let mut platform_msg_ids = HashSet::new();
     for (idx, message) in req.messages.iter().enumerate() {
@@ -1032,6 +1109,7 @@ async fn create_post(
             group_id: group_id.to_string(),
             platform_msg_id,
             message: normalized_message,
+            route_meta: route_meta.clone(),
             received_at_ms,
             close_immediately: false,
         });
@@ -1152,10 +1230,26 @@ async fn create_rendered_post(
         return resp;
     }
 
-    let rendered_images = match decode_rendered_images(&req) {
-        Ok(images) => images,
-        Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "BAD_REQUEST", &message, request_id);
+    let image_bytes = match decode_required_base64_payload(&req.image_base64) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                &format!("image_base64 invalid: {}", reason),
+                request_id,
+            );
+        }
+    };
+    let ext = match normalize_rendered_image_extension(&req.image_mime) {
+        Some(ext) => ext,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                "image_mime must be one of image/png,image/jpeg,image/jpg,image/webp",
+                request_id,
+            );
         }
     };
 
@@ -1285,64 +1379,50 @@ async fn create_rendered_post(
         &ingress_bytes,
     ]);
     let post_id = derive_post_id(&[&session_id.to_be_bytes()]);
+    let blob_id = derive_blob_id(&[&post_id.to_be_bytes(), b"rendered"]);
+    let persisted_path = match persist_rendered_blob(blob_id, ext, &image_bytes) {
+        Ok(path) => path,
+        Err(err) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                &format!("persist rendered image failed: {}", err),
+                request_id,
+            );
+        }
+    };
+
+    let attachment_size = u64::try_from(image_bytes.len()).unwrap_or(u64::MAX);
     let received_at_ms = now_ms();
-    let rendered_image_count = rendered_images.len();
-    let mut blob_ids = Vec::with_capacity(rendered_image_count);
-    let mut ingress_attachments = Vec::with_capacity(rendered_image_count);
-    let mut draft_blocks = Vec::with_capacity(rendered_image_count);
-    let mut driver_events = Vec::with_capacity((rendered_image_count * 2) + 3);
-
-    for (idx, image) in rendered_images.into_iter().enumerate() {
-        let blob_id = rendered_blob_id(post_id, idx);
-        let persisted_path = match persist_rendered_blob(blob_id, image.ext, &image.bytes) {
-            Ok(path) => path,
-            Err(err) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "INTERNAL",
-                    &format!("persist rendered image failed: {}", err),
-                    request_id,
-                );
-            }
-        };
-        let attachment_size = u64::try_from(image.bytes.len()).unwrap_or(u64::MAX);
-        let name = if rendered_image_count == 1 {
-            format!("rendered.{}", image.ext)
-        } else {
-            format!("rendered-page-{:03}.{}", idx + 1, image.ext)
-        };
-        blob_ids.push(blob_id);
-        ingress_attachments.push(IngressAttachment {
-            kind: MediaKind::Image,
-            name: Some(name.clone()),
-            reference: MediaReference::Blob { blob_id },
-            size_bytes: Some(attachment_size),
-        });
-        draft_blocks.push(oqqwall_rust_core::draft::DraftBlock::Attachment {
-            kind: oqqwall_rust_core::draft::MediaKind::Image,
-            name: Some(name),
-            reference: oqqwall_rust_core::draft::MediaReference::Blob { blob_id },
-            size_bytes: Some(attachment_size),
-        });
-        driver_events.push(oqqwall_rust_core::Event::Blob(BlobEvent::BlobRegistered {
-            blob_id,
-            size_bytes: attachment_size,
-        }));
-        driver_events.push(oqqwall_rust_core::Event::Blob(BlobEvent::BlobPersisted {
-            blob_id,
-            path: persisted_path,
-        }));
-    }
-
+    let route_tags = merge_request_tags(&req.tags, req.tag.as_ref());
+    let route_meta = build_ingress_route_meta(req.source_webhook.as_deref(), &route_tags);
     let ingress_message = IngressMessage {
         text: String::new(),
-        attachments: ingress_attachments,
+        attachments: vec![IngressAttachment {
+            kind: MediaKind::Image,
+            name: Some(format!("rendered.{}", ext)),
+            reference: MediaReference::Blob { blob_id },
+            size_bytes: Some(attachment_size),
+        }],
     };
     let draft = oqqwall_rust_core::draft::Draft {
-        blocks: draft_blocks,
+        blocks: vec![oqqwall_rust_core::draft::DraftBlock::Attachment {
+            kind: oqqwall_rust_core::draft::MediaKind::Image,
+            name: Some(format!("rendered.{}", ext)),
+            reference: oqqwall_rust_core::draft::MediaReference::Blob { blob_id },
+            size_bytes: Some(attachment_size),
+        }],
     };
-    driver_events.push(oqqwall_rust_core::Event::Ingress(
-        IngressEvent::MessageAccepted {
+    let driver_events = [
+        oqqwall_rust_core::Event::Blob(BlobEvent::BlobRegistered {
+            blob_id,
+            size_bytes: attachment_size,
+        }),
+        oqqwall_rust_core::Event::Blob(BlobEvent::BlobPersisted {
+            blob_id,
+            path: persisted_path,
+        }),
+        oqqwall_rust_core::Event::Ingress(IngressEvent::MessageAccepted {
             ingress_id,
             profile_id: profile_id.clone(),
             chat_id: chat_id.clone(),
@@ -1350,12 +1430,11 @@ async fn create_rendered_post(
             sender_name: sender_name.clone(),
             group_id: group_id.to_string(),
             platform_msg_id,
+            route_meta,
             received_at_ms,
             message: ingress_message,
-        },
-    ));
-    driver_events.push(oqqwall_rust_core::Event::Draft(
-        DraftEvent::PostDraftCreated {
+        }),
+        oqqwall_rust_core::Event::Draft(DraftEvent::PostDraftCreated {
             post_id,
             session_id,
             group_id: group_id.to_string(),
@@ -1364,17 +1443,9 @@ async fn create_rendered_post(
             is_safe: true,
             draft,
             created_at_ms: received_at_ms,
-        },
-    ));
-    let render_event = if let [blob_id] = blob_ids.as_slice() {
-        RenderEvent::PngReady {
-            post_id,
-            blob_id: *blob_id,
-        }
-    } else {
-        RenderEvent::PngBatchReady { post_id, blob_ids }
-    };
-    driver_events.push(oqqwall_rust_core::Event::Render(render_event));
+        }),
+        oqqwall_rust_core::Event::Render(RenderEvent::PngReady { post_id, blob_id }),
+    ];
     for event in driver_events {
         if state
             .cmd_tx
@@ -1480,12 +1551,6 @@ async fn get_post(
     let review_code = meta
         .review_id
         .and_then(|id| guard.reviews.get(&id).map(|review| review.review_code));
-    let decision_reason = meta.review_id.and_then(|id| {
-        guard
-            .reviews
-            .get(&id)
-            .and_then(|review| review.decision_reason.clone())
-    });
     let sender_id = guard
         .session_ingress
         .get(&meta.session_id)
@@ -1525,18 +1590,9 @@ async fn get_post(
                             size_bytes: *size_bytes,
                         }
                     }
-                    oqqwall_rust_core::draft::DraftBlock::Reply { preview, text } => {
-                        let reply_text = text
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty());
-                        let label = reply_preview_sender_label(preview);
-                        PostBlock::Text {
-                            text: reply_text
-                                .map(|text| format!("[{}] {}\n{}", label, preview.body, text))
-                                .unwrap_or_else(|| format!("[{}] {}", label, preview.body)),
-                        }
-                    }
+                    oqqwall_rust_core::draft::DraftBlock::Reply { preview } => PostBlock::Text {
+                        text: format!("[回复] {}", preview.body),
+                    },
                     oqqwall_rust_core::draft::DraftBlock::Poke => PostBlock::Text {
                         text: "[戳一戳]".to_string(),
                     },
@@ -1554,11 +1610,7 @@ async fn get_post(
     let render_png_blob_id = guard
         .render
         .get(&post_id)
-        .and_then(|render| {
-            render
-                .png_blob
-                .or_else(|| render.png_blobs.first().copied())
-        })
+        .and_then(|render| render.png_blob)
         .map(id_to_string);
 
     (
@@ -1567,7 +1619,6 @@ async fn get_post(
             post_id: id_to_string(meta.post_id),
             review_id: meta.review_id.map(id_to_string),
             review_code,
-            decision_reason,
             group_id: meta.group_id.clone(),
             stage: stage_to_string(meta.stage),
             external_code: guard.external_code_by_post.get(&meta.post_id).copied(),
@@ -2452,7 +2503,7 @@ fn group_id_of_review(state: &StateView, review_id: Id128) -> Option<&str> {
 fn collect_blob_groups(state: &StateView, blob_id: Id128) -> HashSet<String> {
     let mut groups = HashSet::new();
     for (post_id, render) in &state.render {
-        if render.png_blob == Some(blob_id) || render.png_blobs.contains(&blob_id) {
+        if render.png_blob == Some(blob_id) {
             if let Some(post) = state.posts.get(post_id) {
                 groups.insert(post.group_id.clone());
             }
@@ -2511,41 +2562,6 @@ fn decode_required_base64_payload(raw: &str) -> Result<Vec<u8>, &'static str> {
     Ok(decoded)
 }
 
-fn decode_rendered_images(
-    req: &CreateRenderedPostRequest,
-) -> Result<Vec<DecodedRenderedImage>, String> {
-    let use_batch = !req.images.is_empty();
-    let image_count = if use_batch { req.images.len() } else { 1 };
-    let mut decoded = Vec::with_capacity(image_count);
-
-    for idx in 0..image_count {
-        let (image_base64, image_mime, prefix) = if use_batch {
-            (
-                req.images[idx].image_base64.as_str(),
-                req.images[idx].image_mime.as_str(),
-                format!("images[{}].", idx),
-            )
-        } else {
-            (
-                req.image_base64.as_str(),
-                req.image_mime.as_str(),
-                String::new(),
-            )
-        };
-        let bytes = decode_required_base64_payload(image_base64)
-            .map_err(|reason| format!("{}image_base64 invalid: {}", prefix, reason))?;
-        let ext = normalize_rendered_image_extension(image_mime).ok_or_else(|| {
-            format!(
-                "{}image_mime must be one of image/png,image/jpeg,image/jpg,image/webp",
-                prefix
-            )
-        })?;
-        decoded.push(DecodedRenderedImage { bytes, ext });
-    }
-
-    Ok(decoded)
-}
-
 fn normalize_rendered_image_extension(raw_mime: &str) -> Option<&'static str> {
     let mime = raw_mime.trim().to_ascii_lowercase();
     match mime.as_str() {
@@ -2554,15 +2570,6 @@ fn normalize_rendered_image_extension(raw_mime: &str) -> Option<&'static str> {
         "image/webp" => Some("webp"),
         _ => None,
     }
-}
-
-fn rendered_blob_id(post_id: Id128, page_index: usize) -> Id128 {
-    let post_bytes = post_id.to_be_bytes();
-    if page_index == 0 {
-        return derive_blob_id(&[&post_bytes, b"rendered"]);
-    }
-    let page = (page_index + 1).to_string();
-    derive_blob_id(&[&post_bytes, b"rendered-page", page.as_bytes()])
 }
 
 fn persist_rendered_blob(blob_id: Id128, ext: &str, bytes: &[u8]) -> Result<String, String> {
@@ -2873,7 +2880,10 @@ fn normalize_segments(
                     .and_then(|map| map.get("id"))
                     .and_then(value_to_string)
                     .filter(|value| !value.trim().is_empty());
-                let body = "引用的消息".to_string();
+                let body = reply_id
+                    .as_ref()
+                    .map(|id| format!("引用的消息 ID: {}", id))
+                    .unwrap_or_else(|| "引用的消息".to_string());
                 text.push_str(&reply_marker(&ReplyPreview {
                     id: reply_id,
                     meta: None,
@@ -3177,12 +3187,8 @@ fn parse_id128(value: &str) -> Option<Id128> {
 fn parse_review_action(req: &ReviewDecisionRequest) -> Result<ReviewAction, &'static str> {
     match req.action.as_str() {
         "approve" => Ok(ReviewAction::Approve),
-        "reject" => Ok(ReviewAction::Reject {
-            reason: req.comment.clone(),
-        }),
-        "delete" => Ok(ReviewAction::Delete {
-            reason: req.comment.clone(),
-        }),
+        "reject" => Ok(ReviewAction::Reject),
+        "delete" => Ok(ReviewAction::Delete),
         "defer" => Ok(ReviewAction::Defer {
             delay_ms: req.delay_ms.unwrap_or(0),
         }),
@@ -3328,7 +3334,6 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::header::AUTHORIZATION;
-    use oqqwall_rust_core::command::ReviewAction;
     use oqqwall_rust_core::event::ReviewDecision;
     use oqqwall_rust_core::state::{BlobMeta, PostMeta, PostStage, RenderMeta, ReviewMeta};
     use serde_json::json;
@@ -3350,11 +3355,6 @@ mod tests {
     fn parse_stage_roundtrip() {
         let value = parse_stage("review_pending").expect("stage");
         assert_eq!(stage_to_string(value), "review_pending");
-        let value = parse_stage("deleted").expect("stage");
-        assert_eq!(stage_to_string(value), "deleted");
-        let value = parse_stage("withdrawn").expect("stage");
-        assert_eq!(stage_to_string(value), "withdrawn");
-        assert!(parse_stage("unknown").is_none());
     }
 
     #[test]
@@ -3610,6 +3610,49 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json")
     }
 
+    #[test]
+    fn create_post_request_deserializes_string_and_singular_tags() {
+        let req: CreatePostRequest = serde_json::from_value(json!({
+            "target_account": "acc10001",
+            "sender_id": "user_a",
+            "source_webhook": "hook://newsroom",
+            "tag": ["manual", "3344846508"],
+            "tags": "manual, 3344846508\n编辑部",
+            "messages": [{
+                "message_id": "m1",
+                "time": 1767094033,
+                "message": []
+            }]
+        }))
+        .expect("request");
+
+        assert_eq!(
+            merge_request_tags(&req.tags, req.tag.as_ref()),
+            vec![
+                "manual".to_string(),
+                "3344846508".to_string(),
+                "编辑部".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn create_rendered_post_request_deserializes_numeric_tag() {
+        let req: CreateRenderedPostRequest = serde_json::from_value(json!({
+            "target_account": "acc10001",
+            "image_base64": "aGVsbG8=",
+            "image_mime": "image/png",
+            "tag": 3344846508u64,
+            "tags": ["manual", "3344846508"]
+        }))
+        .expect("request");
+
+        assert_eq!(
+            merge_request_tags(&req.tags, req.tag.as_ref()),
+            vec!["manual".to_string(), "3344846508".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn create_post_rejects_unknown_target_account() {
         let (state, _rx, session_id) = build_test_state(None);
@@ -3624,6 +3667,9 @@ mod tests {
                 time: json!(1767094033),
                 message: vec![json!({"type":"text","data":{"text":"hello"}})],
             }],
+            source_webhook: None,
+            tag: None,
+            tags: Vec::new(),
         };
         let response = create_post(State(state), headers, Json(req))
             .await
@@ -3648,6 +3694,9 @@ mod tests {
                 time: json!(1767094033),
                 message: vec![json!({"type":"text","data":{"text":"hello"}})],
             }],
+            source_webhook: None,
+            tag: None,
+            tags: Vec::new(),
         };
         let response = create_post(State(state), headers, Json(req))
             .await
@@ -3718,6 +3767,9 @@ mod tests {
                 time: json!(1767094033),
                 message: vec![json!({"type":"text","data":{"text":"hello"}})],
             }],
+            source_webhook: Some("hook://newsroom".to_string()),
+            tag: None,
+            tags: vec!["3344846508".to_string(), "manual".to_string()],
         };
         let response = create_post(State(state), headers, Json(req))
             .await
@@ -3733,6 +3785,15 @@ mod tests {
             Command::Ingress(cmd) => {
                 assert_eq!(cmd.group_id, "10001");
                 assert_eq!(cmd.sender_name, Some("Alice".to_string()));
+                let route_meta = cmd.route_meta.expect("route_meta");
+                assert_eq!(
+                    route_meta.source_webhook.as_deref(),
+                    Some("hook://newsroom")
+                );
+                assert_eq!(
+                    route_meta.tags,
+                    vec!["3344846508".to_string(), "manual".to_string()]
+                );
             }
             other => panic!("unexpected command: {:?}", other),
         }
@@ -3793,6 +3854,9 @@ mod tests {
                 time: json!(1767094034),
                 message: vec![json!({"type":"text","data":{"text":"hello"}})],
             }],
+            source_webhook: None,
+            tag: None,
+            tags: Vec::new(),
         };
         let response = create_post(State(state), headers, Json(req))
             .await
@@ -3869,6 +3933,9 @@ mod tests {
                 time: json!(1767094035),
                 message: vec![json!({"type":"text","data":{"text":"hello"}})],
             }],
+            source_webhook: None,
+            tag: None,
+            tags: Vec::new(),
         };
         let response = create_post(State(state), headers, Json(req))
             .await
@@ -3949,6 +4016,9 @@ mod tests {
                 time: json!(1767094036),
                 message: vec![json!({"type":"text","data":{"text":"hello"}})],
             }],
+            source_webhook: None,
+            tag: None,
+            tags: Vec::new(),
         };
         let response = create_post(State(state), headers, Json(req))
             .await
@@ -3978,9 +4048,11 @@ mod tests {
             target_account: "acc10001".to_string(),
             image_base64: "aGVsbG8=".to_string(),
             image_mime: "image/gif".to_string(),
-            images: Vec::new(),
             sender_id: None,
             sender_name: None,
+            source_webhook: None,
+            tag: None,
+            tags: Vec::new(),
         };
         let response = create_rendered_post(State(state), headers, Json(req))
             .await
@@ -4046,9 +4118,11 @@ mod tests {
             target_account: "acc10001".to_string(),
             image_base64: "aGVsbG8=".to_string(),
             image_mime: "image/png".to_string(),
-            images: Vec::new(),
             sender_id: None,
             sender_name: None,
+            source_webhook: Some("hook://render".to_string()),
+            tag: None,
+            tags: vec!["rendered".to_string(), "3344846508".to_string()],
         };
         let response = create_rendered_post(State(state), headers, Json(req))
             .await
@@ -4085,11 +4159,18 @@ mod tests {
                         user_id,
                         sender_name,
                         group_id,
+                        route_meta,
                         ..
                     }) => {
                         assert_eq!(user_id, "unknown");
                         assert_eq!(sender_name, None);
                         assert_eq!(group_id, "10001");
+                        let route_meta = route_meta.expect("route_meta");
+                        assert_eq!(route_meta.source_webhook.as_deref(), Some("hook://render"));
+                        assert_eq!(
+                            route_meta.tags,
+                            vec!["rendered".to_string(), "3344846508".to_string()]
+                        );
                         saw_ingress = true;
                     }
                     oqqwall_rust_core::Event::Draft(DraftEvent::PostDraftCreated {
@@ -4116,148 +4197,6 @@ mod tests {
         }
         assert!(saw_blob_registered);
         assert!(saw_blob_persisted);
-        assert!(saw_ingress);
-        assert!(saw_draft);
-        assert!(saw_render);
-    }
-
-    #[tokio::test]
-    async fn create_rendered_post_batch_emits_png_batch_ready() {
-        let (state, mut rx, session_id) = build_test_state(None);
-        let idem_key = "idem_rendered_batch";
-        let headers = build_headers(&session_id, Some(idem_key));
-        let expected_post =
-            expected_rendered_post_id(&session_id, "10001", "acc10001", "unknown", idem_key);
-        let expected_first = rendered_blob_id(expected_post, 0);
-        let expected_second = rendered_blob_id(expected_post, 1);
-        let shared_state = state.state.clone();
-        tokio::spawn(async move {
-            sleep(Duration::from_millis(50)).await;
-            let review_id = Id128(998105);
-            let mut guard = shared_state.write().expect("lock");
-            guard.posts.insert(
-                expected_post,
-                PostMeta {
-                    post_id: expected_post,
-                    session_id: Id128(9105),
-                    group_id: "10001".to_string(),
-                    stage: PostStage::ReviewPending,
-                    review_id: Some(review_id),
-                    created_at_ms: now_ms(),
-                    is_anonymous: true,
-                    is_safe: true,
-                    last_error: None,
-                },
-            );
-            guard.reviews.insert(
-                review_id,
-                ReviewMeta {
-                    review_id,
-                    post_id: expected_post,
-                    review_code: 505,
-                    decision: None,
-                    audit_msg_id: None,
-                    delayed_until_ms: None,
-                    needs_republish: false,
-                    decided_by: None,
-                    decided_at_ms: None,
-                    decision_reason: None,
-                    publish_retry_at_ms: None,
-                    publish_last_error: None,
-                    publish_attempt: 0,
-                },
-            );
-        });
-        let req = CreateRenderedPostRequest {
-            target_account: "acc10001".to_string(),
-            image_base64: String::new(),
-            image_mime: String::new(),
-            images: vec![
-                CreateRenderedImageRequest {
-                    image_base64: "aGVsbG8=".to_string(),
-                    image_mime: "image/png".to_string(),
-                },
-                CreateRenderedImageRequest {
-                    image_base64: "d29ybGQ=".to_string(),
-                    image_mime: "image/jpeg".to_string(),
-                },
-            ],
-            sender_id: None,
-            sender_name: None,
-        };
-        let response = create_rendered_post(State(state), headers, Json(req))
-            .await
-            .into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_json(response).await;
-        assert_eq!(body["post_id"], json!(expected_post.0.to_string()));
-        assert_eq!(body["review_code"], 505);
-
-        let mut saw_registered = 0usize;
-        let mut saw_persisted = 0usize;
-        let mut saw_ingress = false;
-        let mut saw_draft = false;
-        let mut saw_render = false;
-        for _ in 0..7 {
-            let cmd = rx.try_recv().expect("driver event");
-            match cmd {
-                Command::DriverEvent(event) => match event {
-                    oqqwall_rust_core::Event::Blob(BlobEvent::BlobRegistered {
-                        blob_id,
-                        size_bytes,
-                    }) => {
-                        assert!(blob_id == expected_first || blob_id == expected_second);
-                        assert_eq!(size_bytes, 5);
-                        saw_registered += 1;
-                    }
-                    oqqwall_rust_core::Event::Blob(BlobEvent::BlobPersisted { blob_id, path }) => {
-                        if blob_id == expected_first {
-                            assert!(path.ends_with(".png"));
-                        } else {
-                            assert_eq!(blob_id, expected_second);
-                            assert!(path.ends_with(".jpg"));
-                        }
-                        saw_persisted += 1;
-                    }
-                    oqqwall_rust_core::Event::Ingress(IngressEvent::MessageAccepted {
-                        message,
-                        ..
-                    }) => {
-                        assert_eq!(message.attachments.len(), 2);
-                        assert_eq!(
-                            message.attachments[0].name.as_deref(),
-                            Some("rendered-page-001.png")
-                        );
-                        assert_eq!(
-                            message.attachments[1].name.as_deref(),
-                            Some("rendered-page-002.jpg")
-                        );
-                        saw_ingress = true;
-                    }
-                    oqqwall_rust_core::Event::Draft(DraftEvent::PostDraftCreated {
-                        post_id,
-                        draft,
-                        ..
-                    }) => {
-                        assert_eq!(post_id, expected_post);
-                        assert_eq!(draft.blocks.len(), 2);
-                        saw_draft = true;
-                    }
-                    oqqwall_rust_core::Event::Render(RenderEvent::PngBatchReady {
-                        post_id,
-                        blob_ids,
-                    }) => {
-                        assert_eq!(post_id, expected_post);
-                        assert_eq!(blob_ids, vec![expected_first, expected_second]);
-                        saw_render = true;
-                    }
-                    other => panic!("unexpected event: {:?}", other),
-                },
-                other => panic!("unexpected command: {:?}", other),
-            }
-        }
-        assert_eq!(saw_registered, 2);
-        assert_eq!(saw_persisted, 2);
         assert!(saw_ingress);
         assert!(saw_draft);
         assert!(saw_render);
@@ -4313,9 +4252,11 @@ mod tests {
             target_account: "acc10001".to_string(),
             image_base64: "aGVsbG8=".to_string(),
             image_mime: "image/jpeg".to_string(),
-            images: Vec::new(),
             sender_id: Some("123456".to_string()),
             sender_name: Some("Alice".to_string()),
+            source_webhook: None,
+            tag: None,
+            tags: Vec::new(),
         };
         let response = create_rendered_post(State(state), headers, Json(req))
             .await
@@ -4411,9 +4352,11 @@ mod tests {
             target_account: "acc10001".to_string(),
             image_base64: "aGVsbG8=".to_string(),
             image_mime: "image/webp".to_string(),
-            images: Vec::new(),
             sender_id: Some("abc_sender".to_string()),
             sender_name: Some("Alice".to_string()),
+            source_webhook: None,
+            tag: None,
+            tags: Vec::new(),
         };
         let response = create_rendered_post(State(state), headers, Json(req))
             .await
@@ -4487,9 +4430,11 @@ mod tests {
             target_account: "acc10001".to_string(),
             image_base64: "aGVsbG8=".to_string(),
             image_mime: "image/png".to_string(),
-            images: Vec::new(),
             sender_id: None,
             sender_name: None,
+            source_webhook: None,
+            tag: None,
+            tags: Vec::new(),
         };
         let first = create_rendered_post(State(state.clone()), headers.clone(), Json(req))
             .await
@@ -4506,9 +4451,11 @@ mod tests {
             target_account: "acc10001".to_string(),
             image_base64: "aGVsbG8=".to_string(),
             image_mime: "image/png".to_string(),
-            images: Vec::new(),
             sender_id: None,
             sender_name: None,
+            source_webhook: None,
+            tag: None,
+            tags: Vec::new(),
         };
         let second = create_rendered_post(State(state), headers, Json(second_req))
             .await
@@ -4668,76 +4615,6 @@ mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn decide_review_preserves_reject_comment_as_reason() {
-        let (state, mut rx, session_id) = build_test_state(Some(vec!["10001"]));
-        let post_id = Id128(72101);
-        let review_id = Id128(72111);
-        {
-            let mut guard = state.state.write().expect("lock");
-            guard.posts.insert(
-                post_id,
-                PostMeta {
-                    post_id,
-                    session_id: Id128(4),
-                    group_id: "10001".to_string(),
-                    stage: PostStage::ReviewPending,
-                    review_id: Some(review_id),
-                    created_at_ms: 13,
-                    is_anonymous: false,
-                    is_safe: true,
-                    last_error: None,
-                },
-            );
-            guard.reviews.insert(
-                review_id,
-                ReviewMeta {
-                    review_id,
-                    post_id,
-                    review_code: 84,
-                    decision: None,
-                    audit_msg_id: None,
-                    delayed_until_ms: None,
-                    needs_republish: false,
-                    decided_by: None,
-                    decided_at_ms: None,
-                    decision_reason: None,
-                    publish_retry_at_ms: None,
-                    publish_last_error: None,
-                    publish_attempt: 0,
-                },
-            );
-        }
-        let response = decide_review(
-            State(state),
-            Path(review_id.0.to_string()),
-            build_headers(&session_id, None),
-            Json(ReviewDecisionRequest {
-                action: "reject".to_string(),
-                comment: Some("  广告  ".to_string()),
-                delay_ms: None,
-                text: None,
-                quick_reply_key: None,
-                target_review_code: None,
-            }),
-        )
-        .await
-        .into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-        let sent = rx.try_recv().expect("review cmd");
-        match sent {
-            Command::ReviewAction(cmd) => {
-                assert_eq!(cmd.review_id, Some(review_id));
-                assert!(matches!(
-                    cmd.action,
-                    ReviewAction::Reject { reason } if reason.as_deref() == Some("  广告  ")
-                ));
-            }
-            other => panic!("unexpected command: {:?}", other),
-        }
         assert!(rx.try_recv().is_err());
     }
 
@@ -5055,7 +4932,7 @@ mod tests {
                 post_id,
                 RenderMeta {
                     png_blob: Some(blob_id),
-                    png_blobs: vec![blob_id],
+                    png_blobs: Vec::new(),
                     last_error: None,
                     last_attempt: 0,
                     retry_at_ms: None,
@@ -5263,7 +5140,7 @@ mod tests {
                 post_id,
                 RenderMeta {
                     png_blob: Some(blob_id),
-                    png_blobs: vec![blob_id],
+                    png_blobs: Vec::new(),
                     last_error: None,
                     last_attempt: 0,
                     retry_at_ms: None,

@@ -1,7 +1,5 @@
 use oqqwall_rust_core::decide::decide;
-use oqqwall_rust_core::event::{
-    DraftEvent, Event, RenderEvent, ReviewDecision, ReviewEvent, ReviewSubmitterNoticeKind,
-};
+use oqqwall_rust_core::event::{DraftEvent, Event, RenderEvent, ReviewDecision, ReviewEvent};
 use oqqwall_rust_core::{
     Command, CoreConfig, Draft, EventEnvelope, Id128, ReviewAction, ReviewActionBatchCommand,
     StateView, derive_review_id,
@@ -97,7 +95,7 @@ fn review_batch_reject_then_blacklist_keeps_followup_action() {
         review_code: Some(review_code),
         audit_msg_id: None,
         actions: vec![
-            ReviewAction::Reject { reason: None },
+            ReviewAction::Reject,
             ReviewAction::Blacklist {
                 reason: Some("spam".to_string()),
             },
@@ -120,78 +118,6 @@ fn review_batch_reject_then_blacklist_keeps_followup_action() {
         event,
         Event::Review(ReviewEvent::ReviewBlacklistRequested { review_id: rid, reason })
             if *rid == review_id && reason.as_deref() == Some("spam")
-    )));
-}
-
-#[test]
-fn reject_with_reason_records_structured_reason_and_notice() {
-    let (state, _, review_code, review_id) = seed_review_state();
-    let cmd = Command::ReviewActionBatch(ReviewActionBatchCommand {
-        review_id: None,
-        review_code: Some(review_code),
-        audit_msg_id: None,
-        actions: vec![ReviewAction::Reject {
-            reason: Some("  广告  ".to_string()),
-        }],
-        operator_id: "admin".to_string(),
-        now_ms: 1_025,
-        tz_offset_minutes: 0,
-    });
-
-    let events = decide(&state, &cmd, &CoreConfig::default());
-    assert!(events.iter().any(|event| matches!(
-        event,
-        Event::Review(ReviewEvent::ReviewDecisionRecorded {
-            review_id: rid,
-            decision: ReviewDecision::Rejected,
-            ..
-        }) if *rid == review_id
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        Event::Review(ReviewEvent::ReviewDecisionReasonRecorded {
-            review_id: rid,
-            decision: ReviewDecision::Rejected,
-            reason,
-        }) if *rid == review_id && reason.as_deref() == Some("广告")
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        Event::Review(ReviewEvent::ReviewSubmitterNoticeRequested {
-            review_id: rid,
-            kind: ReviewSubmitterNoticeKind::Rejected,
-            reason,
-        }) if *rid == review_id && reason.as_deref() == Some("广告")
-    )));
-}
-
-#[test]
-fn delete_with_reason_records_reason_without_submitter_notice() {
-    let (state, _, review_code, review_id) = seed_review_state();
-    let cmd = Command::ReviewActionBatch(ReviewActionBatchCommand {
-        review_id: None,
-        review_code: Some(review_code),
-        audit_msg_id: None,
-        actions: vec![ReviewAction::Delete {
-            reason: Some("  重复投稿  ".to_string()),
-        }],
-        operator_id: "admin".to_string(),
-        now_ms: 1_026,
-        tz_offset_minutes: 0,
-    });
-
-    let events = decide(&state, &cmd, &CoreConfig::default());
-    assert!(events.iter().any(|event| matches!(
-        event,
-        Event::Review(ReviewEvent::ReviewDecisionReasonRecorded {
-            review_id: rid,
-            decision: ReviewDecision::Deleted,
-            reason,
-        }) if *rid == review_id && reason.as_deref() == Some("重复投稿")
-    )));
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        Event::Review(ReviewEvent::ReviewSubmitterNoticeRequested { .. })
     )));
 }
 

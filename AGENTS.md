@@ -44,9 +44,17 @@
 - Debug builds mirror stderr logs to `data/logs/debug.log` (base `OQQWALL_DATA_DIR`), override with `OQQWALL_DEBUG_LOG`.
 - Persistent data and snapshots belong under `data/`; do not commit generated files in `target/`.
 
+## Event/Snapshot Schema Evolution
+- Journal and snapshot records use a versioned outer frame, but the payload remains bincode 1.x. `#[serde(default)]` does not make missing bincode fields safe; do not rely on it for persisted compatibility.
+- Safe changes: append enum variants at the end, append struct fields at the end, initialize new state fields through `Default`, update reducers for new events, and bump `SNAPSHOT_VERSION` when `StateView` shape changes.
+- Dangerous changes: inserting enum variants in the middle, deleting variants, reordering fields, changing persisted field types, or assuming JSON-style defaults during bincode decode.
+- State-field checklist: append the field, add a deterministic `Default`, bump `SNAPSHOT_VERSION`, handle replay/reduce behavior, and add a replay or migration test that covers old data.
+
 ## Container Build Environment
+- On this machine, prefer **WSL Linux filesystem builds** over Windows-side `cargo`.
+- Read `WSL_BUILD_NOTE.md` before running Rust compilation commands from a Windows-hosted checkout.
 - Use `Dockerfile.rust-glibc231-toolchain` to build a fixed toolchain image based on `rust-glibc231:20.04`.
-- The image includes required build deps: `python3`, `pkg-config`, `libfreetype6-dev`, `libfontconfig1-dev`, `ffmpeg`, `ca-certificates`.
+- The image includes required build deps: `python3`, `pkg-config`, `libfreetype6-dev`, `libfontconfig1-dev`, `ca-certificates`.
 - `cargo build`, `cargo test`, and `cargo check` should all run in this container environment for consistency.
 - Build image:
   - `docker build --network host -t rust-glibc231:20.04-oqqwall -f Dockerfile.rust-glibc231-toolchain .`

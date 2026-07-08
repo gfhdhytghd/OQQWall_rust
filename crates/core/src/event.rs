@@ -1,4 +1,5 @@
-use crate::draft::{Draft, IngressMessage};
+use crate::draft::{Draft, IngressMessage, IngressRouteMeta};
+use crate::draft_transform::DraftTransform;
 use crate::ids::{
     AccountId, ActorId, AuditMsgId, BlobId, CorrelationId, EventId, ExternalCode, GroupId,
     IngressId, PostId, RemotePostId, ReviewCode, ReviewId, SessionId, TimestampMs,
@@ -29,6 +30,7 @@ pub enum Event {
     Blob(BlobEvent),
     Account(AccountEvent),
     Manual(ManualEvent),
+    Lifecycle(LifecycleEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +66,8 @@ pub enum IngressEvent {
         sender_name: Option<String>,
         group_id: GroupId,
         platform_msg_id: String,
+        #[serde(default)]
+        route_meta: Option<IngressRouteMeta>,
         received_at_ms: TimestampMs,
         message: IngressMessage,
     },
@@ -75,6 +79,8 @@ pub enum IngressEvent {
         sender_name: Option<String>,
         group_id: GroupId,
         platform_msg_id: String,
+        #[serde(default)]
+        route_meta: Option<IngressRouteMeta>,
         received_at_ms: TimestampMs,
         message: IngressMessage,
     },
@@ -136,6 +142,11 @@ pub enum DraftEvent {
         is_safe: bool,
         draft: Draft,
         created_at_ms: TimestampMs,
+    },
+    DraftTransformsSet {
+        post_id: PostId,
+        transforms: Vec<DraftTransform>,
+        set_at_ms: TimestampMs,
     },
 }
 
@@ -358,6 +369,7 @@ pub struct QzonePublicationItem {
     pub external_code: ExternalCode,
     #[serde(default)]
     pub image_offset: usize,
+    #[serde(default)]
     pub image_count: usize,
 }
 
@@ -420,7 +432,6 @@ pub enum SendEvent {
         account_id: AccountId,
         remote_id: RemotePostId,
         text: String,
-        #[serde(default)]
         withdrawn_post_ids: Vec<PostId>,
         withdrawn_at_ms: TimestampMs,
     },
@@ -428,7 +439,6 @@ pub enum SendEvent {
         post_id: PostId,
         account_id: AccountId,
         remote_id: RemotePostId,
-        #[serde(default)]
         withdrawn_post_ids: Vec<PostId>,
         error: String,
     },
@@ -440,6 +450,16 @@ pub enum BlobEvent {
     BlobPersisted { blob_id: BlobId, path: String },
     BlobReleased { blob_id: BlobId },
     BlobGcRequested { blob_id: BlobId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LifecycleEvent {
+    PostEvicted {
+        post_id: PostId,
+        evicted_at_ms: TimestampMs,
+        blob_ids: Vec<BlobId>,
+        ingress_ids: Vec<IngressId>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

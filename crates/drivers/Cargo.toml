@@ -7,7 +7,7 @@ build = "build.rs"
 [dependencies]
 futures-util = "0.3.31"
 base64 = "0.22.1"
-image = { version = "0.25.8", default-features = false, features = ["gif", "jpeg", "png"] }
+image = { version = "0.25.8", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 imagesize = "0.13.0"
 sha2 = "0.10"
 oqqwall_rust_core = { path = "../core" }

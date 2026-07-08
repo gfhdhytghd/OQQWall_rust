@@ -29,8 +29,6 @@ pub enum DraftBlock {
     },
     Reply {
         preview: ReplyPreview,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
     },
     Poke,
     JsonCard {
@@ -64,6 +62,14 @@ pub struct ForwardItem {
 pub struct IngressMessage {
     pub text: String,
     pub attachments: Vec<IngressAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IngressRouteMeta {
+    #[serde(default)]
+    pub source_webhook: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,15 +138,7 @@ pub fn parse_special_marker(input: &str) -> Option<(DraftBlock, usize)> {
         .and_then(|(payload, consumed)| {
             serde_json::from_slice::<ReplyPreview>(&payload)
                 .ok()
-                .map(|preview| {
-                    (
-                        DraftBlock::Reply {
-                            preview,
-                            text: None,
-                        },
-                        consumed,
-                    )
-                })
+                .map(|preview| (DraftBlock::Reply { preview }, consumed))
         })
         .or_else(|| {
             parse_payload_marker(input, JSON_CARD_MARKER_PREFIX).and_then(|(payload, consumed)| {

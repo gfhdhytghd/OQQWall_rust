@@ -23,6 +23,7 @@ fn ingress_blacklisted_is_ignored() {
             attachments: Vec::new(),
         },
         received_at_ms: 1_000,
+        route_meta: None,
         close_immediately: false,
     };
 

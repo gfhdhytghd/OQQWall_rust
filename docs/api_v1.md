@@ -139,8 +139,6 @@
   - `sending`
   - `sent`
   - `rejected`
-  - `deleted`
-  - `withdrawn`
   - `skipped`
   - `manual`
   - `failed`
@@ -317,7 +315,6 @@
   "post_id": "123",
   "review_id": "456",
   "review_code": 102,
-  "decision_reason": null,
   "group_id": "10001",
   "stage": "review_pending",
   "external_code": 1193,

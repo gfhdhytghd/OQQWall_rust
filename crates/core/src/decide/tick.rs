@@ -1,18 +1,19 @@
 use crate::anonymous::detect_anonymous;
 use crate::command::TickCommand;
 use crate::config::CoreConfig;
-use crate::decide::builder::build_draft_from_messages;
+use crate::decide::builder::build_draft_for_post;
 use crate::decide::flush::build_group_flush_events;
 use crate::decide::scheduler::{day_index, minute_of_day};
 use crate::decide::sender::{AccountChoice, choose_account};
-use crate::draft::MediaReference;
+use crate::draft::{Draft, MediaReference};
 use crate::event::{
-    DraftEvent, Event, GroupFlushReason, InputStatusKind, MediaEvent, RenderEvent, ReviewEvent,
-    ScheduleEvent, SendEvent, SendPriority, SessionEvent,
+    BlobEvent, DraftEvent, Event, GroupFlushReason, InputStatusKind, LifecycleEvent, MediaEvent,
+    RenderEvent, ReviewEvent, ScheduleEvent, SendEvent, SendPriority, SessionEvent,
 };
-use crate::ids::{TimestampMs, derive_post_id};
+use crate::ids::{BlobId, IngressId, PostId, TimestampMs, derive_post_id};
 use crate::safety::detect_safe;
 use crate::state::{PostStage, SessionMeta, StateView};
+use std::collections::BTreeSet;
 
 const INPUT_STATUS_ACTIVE_MAX_MS: i64 = 30 * 60 * 1000;
 const SEND_TIMEOUT_RETRY_DELAY_MS: i64 = 30 * 1000;
@@ -28,6 +29,8 @@ pub fn decide_tick(state: &StateView, cmd: &TickCommand, config: &CoreConfig) ->
     events.extend(trigger_group_flush(state, cmd, config));
     events.extend(recover_stuck_sends(state, cmd, config));
     events.extend(maybe_start_send(state, cmd, config));
+    events.extend(evict_expired_posts(state, cmd, config));
+    events.extend(request_unreferenced_blob_gc(state));
 
     events
 }
@@ -60,9 +63,11 @@ fn close_due_sessions(state: &StateView, cmd: &TickCommand, config: &CoreConfig)
         }
         let is_anonymous = detect_anonymous(&messages);
         let is_safe = detect_safe(&messages);
-        let draft = build_draft_from_messages(&messages);
         let session_bytes = session_id.to_be_bytes();
         let post_id = derive_post_id(&[&session_bytes]);
+        let Some(draft) = build_draft_for_post(state, post_id, ingress_ids) else {
+            continue;
+        };
 
         events.push(Event::Session(SessionEvent::Closed {
             session_id,
@@ -331,5 +336,141 @@ fn maybe_start_send(state: &StateView, cmd: &TickCommand, config: &CoreConfig) -
             priority: SendPriority::Normal,
             seq: state.next_send_seq,
         })],
+    }
+}
+
+fn evict_expired_posts(state: &StateView, cmd: &TickCommand, config: &CoreConfig) -> Vec<Event> {
+    if config.eviction_retention_ms <= 0 {
+        return Vec::new();
+    }
+
+    let mut candidates = state
+        .posts
+        .values()
+        .filter(|post| is_evictable_stage(post.stage))
+        .filter(|post| {
+            cmd.now_ms.saturating_sub(post.created_at_ms) >= config.eviction_retention_ms
+        })
+        .map(|post| (post.created_at_ms, post.post_id))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.cmp(right));
+
+    candidates
+        .into_iter()
+        .take(10)
+        .map(|(_, post_id)| {
+            let ingress_ids = state
+                .post_ingress
+                .get(&post_id)
+                .cloned()
+                .unwrap_or_default();
+            let blob_ids = collect_post_blob_ids(state, post_id, &ingress_ids);
+            Event::Lifecycle(LifecycleEvent::PostEvicted {
+                post_id,
+                evicted_at_ms: cmd.now_ms,
+                blob_ids,
+                ingress_ids,
+            })
+        })
+        .collect()
+}
+
+fn request_unreferenced_blob_gc(state: &StateView) -> Vec<Event> {
+    if state.blobs.is_empty() {
+        return Vec::new();
+    }
+
+    let referenced = collect_referenced_blob_ids(state);
+    let mut blob_ids = state
+        .blobs
+        .keys()
+        .copied()
+        .filter(|blob_id| !referenced.contains(blob_id))
+        .collect::<Vec<_>>();
+    blob_ids.sort();
+    blob_ids
+        .into_iter()
+        .map(|blob_id| Event::Blob(BlobEvent::BlobGcRequested { blob_id }))
+        .collect()
+}
+
+fn is_evictable_stage(stage: PostStage) -> bool {
+    matches!(
+        stage,
+        PostStage::Sent
+            | PostStage::Withdrawn
+            | PostStage::Rejected
+            | PostStage::Deleted
+            | PostStage::Skipped
+    )
+}
+
+fn collect_post_blob_ids(
+    state: &StateView,
+    post_id: PostId,
+    ingress_ids: &[IngressId],
+) -> Vec<BlobId> {
+    let mut blob_ids = BTreeSet::new();
+    if let Some(render) = state.render.get(&post_id) {
+        if let Some(blob_id) = render.png_blob {
+            blob_ids.insert(blob_id);
+        }
+        blob_ids.extend(render.png_blobs.iter().copied());
+    }
+    if let Some(draft) = state.drafts.get(&post_id) {
+        collect_draft_blob_ids(draft, &mut blob_ids);
+    }
+    for ingress_id in ingress_ids {
+        if let Some(message) = state.ingress_messages.get(ingress_id) {
+            for attachment in &message.attachments {
+                if let MediaReference::Blob { blob_id } = attachment.reference {
+                    blob_ids.insert(blob_id);
+                }
+            }
+        }
+    }
+    blob_ids.into_iter().collect()
+}
+
+fn collect_referenced_blob_ids(state: &StateView) -> BTreeSet<BlobId> {
+    let mut blob_ids = BTreeSet::new();
+    for render in state.render.values() {
+        if let Some(blob_id) = render.png_blob {
+            blob_ids.insert(blob_id);
+        }
+        blob_ids.extend(render.png_blobs.iter().copied());
+    }
+    for draft in state.drafts.values() {
+        collect_draft_blob_ids(draft, &mut blob_ids);
+    }
+    for message in state.ingress_messages.values() {
+        for attachment in &message.attachments {
+            if let MediaReference::Blob { blob_id } = attachment.reference {
+                blob_ids.insert(blob_id);
+            }
+        }
+    }
+    blob_ids
+}
+
+fn collect_draft_blob_ids(draft: &Draft, out: &mut BTreeSet<BlobId>) {
+    for block in &draft.blocks {
+        match block {
+            crate::draft::DraftBlock::Attachment {
+                reference: MediaReference::Blob { blob_id },
+                ..
+            } => {
+                out.insert(*blob_id);
+            }
+            crate::draft::DraftBlock::Forward { items } => {
+                for item in items {
+                    let nested = Draft {
+                        blocks: item.blocks.clone(),
+                    };
+                    collect_draft_blob_ids(&nested, out);
+                }
+            }
+            _ => {}
+        }
     }
 }
