@@ -3492,7 +3492,8 @@ async fn parse_inbound_event(
         if runtime.audit_group_id.is_some() && !is_audit_group {
             return None;
         }
-        let mentions_self = message_mentions_self(message_value, &self_id);
+        let raw_message = value.get("raw_message").and_then(|v| v.as_str());
+        let mentions_self = message_mentions_self(message_value, raw_message, &self_id);
         let reply_bound = if let Some(reply_msg_id) = reply_id.as_ref() {
             let guard = state.lock().await;
             guard
@@ -5188,11 +5189,11 @@ async fn parse_review_command(
     Some(command)
 }
 
-fn message_mentions_self(value: Option<&Value>, self_id: &str) -> bool {
+fn message_mentions_self(value: Option<&Value>, raw_message: Option<&str>, self_id: &str) -> bool {
     if self_id.trim().is_empty() {
         return false;
     }
-    match value {
+    let message_mentions = match value {
         Some(Value::Array(items)) => items.iter().any(|item| {
             if item.get("type").and_then(|v| v.as_str()) != Some("at") {
                 return false;
@@ -5209,7 +5210,17 @@ fn message_mentions_self(value: Option<&Value>, self_id: &str) -> bool {
             raw.contains("[CQ:at,") && raw.contains(&token)
         }
         _ => false,
+    };
+    if message_mentions {
+        return true;
     }
+
+    raw_message
+        .map(|raw| {
+            let token = format!("qq={}", self_id);
+            raw.contains("[CQ:at,") && raw.contains(&token)
+        })
+        .unwrap_or(false)
 }
 
 fn command_context_allowed(command: &AuditCommand, mentions_self: bool, reply_bound: bool) -> bool {
@@ -9251,10 +9262,16 @@ mod tests {
             {"type":"at","data":{"qq":"10001"}},
             {"type":"text","data":{"text":" 帮助"}}
         ]);
-        assert!(message_mentions_self(Some(&msg), "10001"));
-        assert!(!message_mentions_self(Some(&msg), "10002"));
+        assert!(message_mentions_self(Some(&msg), None, "10001"));
+        assert!(!message_mentions_self(Some(&msg), None, "10002"));
         assert!(!message_mentions_self(
             Some(&serde_json::json!("帮助")),
+            None,
+            "10001"
+        ));
+        assert!(message_mentions_self(
+            Some(&serde_json::json!("帮助")),
+            Some("[CQ:at,qq=10001] 帮助"),
             "10001"
         ));
     }
