@@ -19,8 +19,22 @@ permissions:
   contents: write
 
 jobs:
-  linux-release:
-    runs-on: ubuntu-22.04
+  linux-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs_on: ubuntu-22.04
+            binary_name: OQQWall_RUST
+            checksum_name: SHA256SUMS-amd64.txt
+            upload_res: true
+          - arch: aarch64-unknown-linux-gnu
+            runs_on: ubuntu-24.04-arm
+            binary_name: OQQWall_RUST-aarch64-unknown-linux-gnu
+            checksum_name: SHA256SUMS-aarch64-unknown-linux-gnu.txt
+            upload_res: false
+    runs-on: ${{ matrix.runs_on }}
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
@@ -38,8 +52,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-cargo-
             ${{ runner.os }}-cargo-
 
       - name: 构建 WebView 前端
@@ -57,21 +72,71 @@ jobs:
           export OQQWALL_DOCKER_DATA_DIR="$(dirname "$GITHUB_WORKSPACE")"
           bash ./scripts/package_split_release.sh
 
-      - name: 生成校验文件
+      - name: 重命名架构产物
+        if: ${{ matrix.binary_name != 'OQQWall_RUST' }}
         run: |
-          sha256sum dist/OQQWall_RUST dist/OQQWall_RUST-res-*.tar.gz > dist/SHA256SUMS.txt
+          mv dist/OQQWall_RUST "dist/${{ matrix.binary_name }}"
 
-      - name: 上传构建产物
+      - name: 生成二进制校验文件
+        run: |
+          sha256sum "dist/${{ matrix.binary_name }}" > "dist/${{ matrix.checksum_name }}"
+
+      - name: 上传二进制产物
         uses: actions/upload-artifact@v4
         with:
-          name: OQQWall_RUST-split-release
+          name: ${{ matrix.binary_name }}
           path: |
-            dist/OQQWall_RUST
+            dist/${{ matrix.binary_name }}
+            dist/${{ matrix.checksum_name }}
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: 生成资源校验文件
+        if: ${{ matrix.upload_res }}
+        run: |
+          sha256sum dist/OQQWall_RUST-res-*.tar.gz > dist/SHA256SUMS-res.txt
+
+      - name: 上传资源包
+        if: ${{ matrix.upload_res }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: OQQWall_RUST-res
+          path: |
             dist/OQQWall_RUST-res-*.tar.gz
-            dist/SHA256SUMS.txt
+            dist/SHA256SUMS-res.txt
+          compression-level: 0
+          if-no-files-found: error
+
+  publish-release:
+    needs: linux-build
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 下载 amd64 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: OQQWall_RUST
+          path: release-dist
+
+      - name: 下载 arm64 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: OQQWall_RUST-aarch64-unknown-linux-gnu
+          path: release-dist
+
+      - name: 下载资源包
+        uses: actions/download-artifact@v4
+        with:
+          name: OQQWall_RUST-res
+          path: release-dist
+
+      - name: 汇总校验文件
+        run: |
+          cat release-dist/SHA256SUMS-amd64.txt \
+            release-dist/SHA256SUMS-aarch64-unknown-linux-gnu.txt \
+            release-dist/SHA256SUMS-res.txt > release-dist/SHA256SUMS.txt
 
       - name: 发布到 GitHub Release
-        if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
@@ -79,7 +144,11 @@ jobs:
           body: ${{ github.event_name == 'workflow_dispatch' && inputs.release_notes || '' }}
           generate_release_notes: ${{ github.event_name != 'workflow_dispatch' || inputs.release_notes == '' }}
           target_commitish: ${{ github.sha }}
+          overwrite_files: true
+          fail_on_unmatched_files: true
           files: |
-            dist/OQQWall_RUST
-            dist/OQQWall_RUST-res-*.tar.gz
-            dist/SHA256SUMS.txt
+            release-dist/OQQWall_RUST
+            release-dist/OQQWall_RUST-aarch64-unknown-linux-gnu
+            release-dist/OQQWall_RUST-res-*.tar.gz
+            release-dist/SHA256SUMS.txt
+            release-dist/SHA256SUMS-aarch64-unknown-linux-gnu.txt
