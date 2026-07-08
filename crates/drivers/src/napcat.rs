@@ -3445,7 +3445,9 @@ async fn parse_inbound_event(
         message_type
     );
     let user_id = value_opt_to_string(value.get("user_id"))?;
-    let self_id = value_opt_to_string(value.get("self_id")).unwrap_or_else(|| "napcat".to_string());
+    let self_id = value_opt_to_string(value.get("self_id"))
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| account_id.to_string());
     let message_id =
         value_opt_to_string(value.get("message_id")).unwrap_or_else(|| "0".to_string());
     let sender_name = extract_sender_name(value);
@@ -3492,7 +3494,13 @@ async fn parse_inbound_event(
         if runtime.audit_group_id.is_some() && !is_audit_group {
             return None;
         }
-        let mentions_self = message_mentions_self(message_value, &self_id);
+        let raw_message = value.get("raw_message").and_then(|v| v.as_str());
+        let raw_command_text = raw_message.and_then(|raw| {
+            command_text_after_self_mention(raw, &self_id)
+                .or_else(|| command_text_after_plain_mention(raw))
+        });
+        let mentions_self = message_mentions_self(message_value, raw_message, &self_id)
+            || raw_command_text.is_some();
         let reply_bound = if let Some(reply_msg_id) = reply_id.as_ref() {
             let guard = state.lock().await;
             guard
@@ -3501,7 +3509,8 @@ async fn parse_inbound_event(
         } else {
             false
         };
-        if let Some(command) = parse_audit_command(&text, reply_id.is_some(), runtime) {
+        let command_text = raw_command_text.as_deref().unwrap_or(&text);
+        if let Some(command) = parse_audit_command(command_text, reply_id.is_some(), runtime) {
             if !command_context_allowed(&command, mentions_self, reply_bound) {
                 return None;
             }
@@ -3889,6 +3898,15 @@ async fn parse_inbound_event(
                     .await;
                 }
             }
+        }
+        if mentions_self {
+            send_group_text(
+                out_tx,
+                &chat_group_id,
+                "未识别指令，请 @本账号 发送“帮助”查看可用指令",
+            )
+            .await;
+            return None;
         }
         if is_audit_group {
             return None;
@@ -5188,11 +5206,11 @@ async fn parse_review_command(
     Some(command)
 }
 
-fn message_mentions_self(value: Option<&Value>, self_id: &str) -> bool {
+fn message_mentions_self(value: Option<&Value>, raw_message: Option<&str>, self_id: &str) -> bool {
     if self_id.trim().is_empty() {
         return false;
     }
-    match value {
+    let message_mentions = match value {
         Some(Value::Array(items)) => items.iter().any(|item| {
             if item.get("type").and_then(|v| v.as_str()) != Some("at") {
                 return false;
@@ -5209,6 +5227,64 @@ fn message_mentions_self(value: Option<&Value>, self_id: &str) -> bool {
             raw.contains("[CQ:at,") && raw.contains(&token)
         }
         _ => false,
+    };
+    if message_mentions {
+        return true;
+    }
+
+    raw_message
+        .map(|raw| {
+            let token = format!("qq={}", self_id);
+            raw.contains("[CQ:at,") && raw.contains(&token)
+        })
+        .unwrap_or(false)
+}
+
+fn command_text_after_self_mention(raw_message: &str, self_id: &str) -> Option<String> {
+    if self_id.trim().is_empty() {
+        return None;
+    }
+    let token = format!("qq={}", self_id);
+    let mut rest = raw_message.trim_start();
+    let mut saw_self_mention = false;
+
+    loop {
+        let Some(segment) = rest.strip_prefix("[CQ:at,") else {
+            break;
+        };
+        let Some(end) = segment.find(']') else {
+            break;
+        };
+        let body = &segment[..end];
+        if body.split(',').any(|part| part.trim() == token) {
+            saw_self_mention = true;
+        }
+        rest = segment[end + 1..].trim_start();
+    }
+
+    if !saw_self_mention {
+        return None;
+    }
+
+    let command = rest.trim();
+    if command.is_empty() {
+        None
+    } else {
+        Some(command.to_string())
+    }
+}
+
+fn command_text_after_plain_mention(raw_message: &str) -> Option<String> {
+    let rest = raw_message.trim_start().strip_prefix('@')?;
+    let split_idx = rest
+        .char_indices()
+        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))?;
+    let mention_text = rest[..split_idx].trim();
+    let command = rest[split_idx..].trim();
+    if mention_text.is_empty() || command.is_empty() {
+        None
+    } else {
+        Some(command.to_string())
     }
 }
 
@@ -8793,6 +8869,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_global_command_uses_account_id_when_self_id_missing() {
+        let account_id = "99887766";
+        let mut runtime = test_runtime();
+        runtime.accounts = vec![account_id.to_string()];
+        for (idx, (raw_message, message)) in [
+            (
+                "[CQ:at,qq=99887766] 自检",
+                serde_json::json!([
+                    {"type": "text", "data": {"text": "自检"}}
+                ]),
+            ),
+            (
+                "[CQ:at,qq=99887766] 自检",
+                serde_json::json!("[CQ:at,qq=99887766] 自检"),
+            ),
+            (
+                "[CQ:at,qq=99887766] 自检",
+                serde_json::json!([
+                    {"type": "text", "data": {"text": ""}}
+                ]),
+            ),
+            (
+                "@AI接稿竹溪第一建材批发墙 自检",
+                serde_json::json!([
+                    {"type": "text", "data": {"text": "@AI接稿竹溪第一建材批发墙 自检"}}
+                ]),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            register_ws_session(account_id, mock_session());
+            let state = Arc::new(Mutex::new(NapCatState::default()));
+            let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+            let (out_tx, mut out_rx) = mpsc::channel(4);
+            let value = serde_json::json!({
+                "post_type": "message",
+                "message_type": "group",
+                "group_id": "1",
+                "user_id": "20002",
+                "message_id": format!("m{}", idx),
+                "time": 1001,
+                "raw_message": raw_message,
+                "message": message,
+                "sender": {
+                    "role": "admin"
+                }
+            });
+
+            let command =
+                parse_inbound_event(&runtime, &state, &cmd_tx, &out_tx, account_id, &value).await;
+            assert!(command.is_none());
+
+            let ack = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+                .await
+                .expect("ack timeout")
+                .expect("ack message");
+            assert!(ack.contains("\"action\":\"send_group_msg\""));
+            assert!(ack.contains("已收到指令"));
+            let report = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+                .await
+                .expect("report timeout")
+                .expect("selfcheck report");
+            assert!(report.contains("系统自检报告"));
+            unregister_ws_session(account_id);
+        }
+    }
+
+    #[tokio::test]
     async fn submission_agent_triggers_only_for_new_post() {
         let mut runtime = test_runtime();
         runtime.accounts = vec!["sub-agent-100".to_string()];
@@ -9251,10 +9396,16 @@ mod tests {
             {"type":"at","data":{"qq":"10001"}},
             {"type":"text","data":{"text":" 帮助"}}
         ]);
-        assert!(message_mentions_self(Some(&msg), "10001"));
-        assert!(!message_mentions_self(Some(&msg), "10002"));
+        assert!(message_mentions_self(Some(&msg), None, "10001"));
+        assert!(!message_mentions_self(Some(&msg), None, "10002"));
         assert!(!message_mentions_self(
             Some(&serde_json::json!("帮助")),
+            None,
+            "10001"
+        ));
+        assert!(message_mentions_self(
+            Some(&serde_json::json!("帮助")),
+            Some("[CQ:at,qq=10001] 帮助"),
             "10001"
         ));
     }
