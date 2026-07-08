@@ -26,13 +26,13 @@ jobs:
         include:
           - arch: amd64
             runs_on: ubuntu-22.04
-            binary_name: OQQWall_RUST
-            checksum_name: SHA256SUMS-amd64.txt
+            binary_name: OQQWall_RUST-x86
+            checksum_name: SHA256SUMS-x86.txt
             upload_res: true
           - arch: aarch64-unknown-linux-gnu
             runs_on: ubuntu-24.04-arm
-            binary_name: OQQWall_RUST-aarch64-unknown-linux-gnu
-            checksum_name: SHA256SUMS-aarch64-unknown-linux-gnu.txt
+            binary_name: OQQWall_RUST-arm
+            checksum_name: SHA256SUMS-arm.txt
             upload_res: false
     runs-on: ${{ matrix.runs_on }}
     steps:
@@ -73,7 +73,6 @@ jobs:
           bash ./scripts/package_split_release.sh
 
       - name: 重命名架构产物
-        if: ${{ matrix.binary_name != 'OQQWall_RUST' }}
         run: |
           mv dist/OQQWall_RUST "dist/${{ matrix.binary_name }}"
 
@@ -115,13 +114,13 @@ jobs:
       - name: 下载 amd64 产物
         uses: actions/download-artifact@v4
         with:
-          name: OQQWall_RUST
+          name: OQQWall_RUST-x86
           path: release-dist
 
       - name: 下载 arm64 产物
         uses: actions/download-artifact@v4
         with:
-          name: OQQWall_RUST-aarch64-unknown-linux-gnu
+          name: OQQWall_RUST-arm
           path: release-dist
 
       - name: 下载资源包
@@ -132,8 +131,8 @@ jobs:
 
       - name: 汇总校验文件
         run: |
-          cat release-dist/SHA256SUMS-amd64.txt \
-            release-dist/SHA256SUMS-aarch64-unknown-linux-gnu.txt \
+          cat release-dist/SHA256SUMS-x86.txt \
+            release-dist/SHA256SUMS-arm.txt \
             release-dist/SHA256SUMS-res.txt > release-dist/SHA256SUMS.txt
 
       - name: 发布到 GitHub Release
@@ -147,8 +146,8 @@ jobs:
           overwrite_files: true
           fail_on_unmatched_files: true
           files: |
-            release-dist/OQQWall_RUST
-            release-dist/OQQWall_RUST-aarch64-unknown-linux-gnu
+            release-dist/OQQWall_RUST-x86
+            release-dist/OQQWall_RUST-arm
             release-dist/OQQWall_RUST-res-*.tar.gz
             release-dist/SHA256SUMS.txt
-            release-dist/SHA256SUMS-aarch64-unknown-linux-gnu.txt
+            release-dist/SHA256SUMS-arm.txt
