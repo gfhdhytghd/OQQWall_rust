@@ -24,6 +24,7 @@ import {
 } from '@heroui/react'
 import {
   AlertCircle,
+  ArrowLeft,
   BarChart3,
   Ban,
   Check,
@@ -1475,8 +1476,13 @@ function RuntimeConfigWorkbench({
   const [settings, setSettings] = useState<AppConfigSettingsResponse | null>(null)
   const [selectedGroup, setSelectedGroup] = useState('')
   const [selectedMenu, setSelectedMenu] = useState<ConfigMenuKey>('common_runtime')
+  const [mobileConfigDetailOpen, setMobileConfigDetailOpen] = useState(false)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
+  const compactRuntimeConfig = useMediaQuery('(max-width: 640px)')
+  const runtimeConfigPages = buildRuntimeConfigPages()
+  const selectedRuntimeConfigPage =
+    runtimeConfigPages.find((page) => page.value === selectedMenu) ?? runtimeConfigPages[0]
 
   useEffect(() => {
     void loadSettings()
@@ -1521,6 +1527,25 @@ function RuntimeConfigWorkbench({
     } finally {
       setSaving(false)
     }
+  }
+
+  function scrollRuntimeConfigTop() {
+    window.requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+    })
+  }
+
+  function selectRuntimeConfigPage(value: ConfigMenuKey) {
+    setSelectedMenu(value)
+    if (compactRuntimeConfig && mode === 'full') {
+      setMobileConfigDetailOpen(true)
+      scrollRuntimeConfigTop()
+    }
+  }
+
+  function returnToRuntimeConfigMenu() {
+    setMobileConfigDetailOpen(false)
+    scrollRuntimeConfigTop()
   }
 
   function updateCommon<K extends keyof AppConfigCommonSettings>(
@@ -1844,34 +1869,74 @@ function RuntimeConfigWorkbench({
     )
   }
 
+  function renderRuntimeConfigActions() {
+    return (
+      <div className="head-actions">
+        <Button
+          size="sm"
+          variant="secondary"
+          isDisabled={loading || saving}
+          onClick={() => void loadSettings()}
+        >
+          <RefreshCcw size={16} />
+          刷新
+        </Button>
+        <Button size="sm" isDisabled={loading || saving} onClick={() => void saveSettings()}>
+          {saving ? <Spinner size="sm" /> : <Check size={16} />}
+          保存
+        </Button>
+      </div>
+    )
+  }
+
+  const showMobileConfigDetail = compactRuntimeConfig && mobileConfigDetailOpen
+  const showRuntimeConfigMenu = !showMobileConfigDetail
+  const showRuntimeConfigContent = !compactRuntimeConfig || mobileConfigDetailOpen
+
   return (
-    <div className="workspace settings-workspace">
-      <header className="page-head">
-        <div>
-          <h1>运行配置</h1>
-          <p>把不同运行板块拆到独立菜单里，便于单独配置。</p>
-        </div>
-        <div className="head-actions">
-          <Button size="sm" variant="secondary" isDisabled={loading || saving} onClick={() => void loadSettings()}>
-            <RefreshCcw size={16} />
-            刷新
-          </Button>
-          <Button size="sm" isDisabled={loading || saving} onClick={() => void saveSettings()}>
-            {saving ? <Spinner size="sm" /> : <Check size={16} />}
-            保存
-          </Button>
-        </div>
-      </header>
+    <div
+      className={`workspace settings-workspace ${
+        showMobileConfigDetail ? 'is-mobile-config-detail' : ''
+      }`}
+    >
+      {!showMobileConfigDetail ? (
+        <header className="page-head">
+          <div>
+            <h1>运行配置</h1>
+            <p>把不同运行板块拆到独立菜单里，便于单独配置。</p>
+          </div>
+          {renderRuntimeConfigActions()}
+        </header>
+      ) : null}
 
-      <section className="settings-layout">
-        <SettingsMenuCard
-          title="运行配置页面"
-          options={buildRuntimeConfigPages()}
-          activeKey={selectedMenu}
-          onSelect={setSelectedMenu}
-        />
+      <section className="settings-layout runtime-settings-layout">
+        {showRuntimeConfigMenu ? (
+          <SettingsMenuCard
+            title="运行配置页面"
+            options={runtimeConfigPages}
+            activeKey={selectedMenu}
+            onSelect={selectRuntimeConfigPage}
+          />
+        ) : null}
 
-        <div className="settings-content-stack">
+        {showRuntimeConfigContent ? (
+          <div className="settings-content-stack">
+            {showMobileConfigDetail ? (
+              <div className="settings-mobile-detail-head">
+                <div className="settings-mobile-detail-top">
+                  <Button size="sm" variant="secondary" onClick={returnToRuntimeConfigMenu}>
+                    <ArrowLeft size={16} />
+                    返回
+                  </Button>
+                  {renderRuntimeConfigActions()}
+                </div>
+                <div>
+                  <strong>{selectedRuntimeConfigPage.label}</strong>
+                  <span>{selectedRuntimeConfigPage.description}</span>
+                </div>
+              </div>
+            ) : null}
+
           {selectedMenu === 'common_runtime' ? (
             <Card className="panel-card">
               <Card.Header>
@@ -2384,7 +2449,8 @@ function RuntimeConfigWorkbench({
               </Card.Content>
             </Card>
           ) : null}
-        </div>
+          </div>
+        ) : null}
       </section>
     </div>
   )

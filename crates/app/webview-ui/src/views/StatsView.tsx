@@ -152,7 +152,7 @@ export function StatsView({ notify }: { notify: (kind: ToastKind, text: string) 
   const maxHourly = Math.max(1, ...stats.hourly_distribution.map((item) => item.count))
 
   return (
-    <div className="workspace">
+    <div className="workspace stats-workspace">
       <header className="page-head">
         <div>
           <h1>运行统计</h1>

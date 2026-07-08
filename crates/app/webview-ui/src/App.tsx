@@ -6,9 +6,12 @@ import {
   FileText,
   LayoutGrid,
   LogOut,
+  PanelLeftClose,
+  PanelLeftOpen,
   Send,
   Settings2,
   ShieldCheck,
+  type LucideIcon,
 } from 'lucide-react'
 import { api } from './api/client'
 import { MeResponse } from './api/types'
@@ -18,10 +21,29 @@ import { AgentView, SettingsView } from './views/SettingsView'
 import { TagMappingView } from './views/TagMappingView'
 import { StatsView } from './views/StatsView'
 
+type NavItem = {
+  key: ViewKey
+  label: string
+  Icon: LucideIcon
+  globalOnly?: boolean
+}
+
+const NAV_ITEMS: NavItem[] = [
+  { key: 'review', label: '审核', Icon: Eye },
+  { key: 'sent', label: '已发送', Icon: Send },
+  { key: 'stats', label: '统计', Icon: BarChart3 },
+  { key: 'agent', label: 'Agent', Icon: FileText, globalOnly: true },
+  { key: 'settings', label: '设置', Icon: Settings2 },
+  { key: 'tag-mapping', label: '标签映射', Icon: LayoutGrid },
+]
+
 function App() {
   const [me, setMe] = useState<MeResponse | null>(null)
   const [authChecked, setAuthChecked] = useState(false)
   const [view, setView] = useState<ViewKey>('review')
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  const navItems = NAV_ITEMS.filter((item) => !item.globalOnly || me?.role === 'global_admin')
+  const activeNavItem = navItems.find((item) => item.key === view) ?? navItems[0]
   const navClass = (key: ViewKey) => `nav-button ${view === key ? 'is-active' : ''}`
 
   useEffect(() => {
@@ -31,9 +53,58 @@ function App() {
       .finally(() => setAuthChecked(true))
   }, [])
 
+  useEffect(() => {
+    if (me?.role !== 'global_admin' && view === 'agent') {
+      setView('review')
+    }
+  }, [me?.role, view])
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia('(max-width: 980px)')
+    const closeOnDesktop = () => {
+      if (!mediaQuery.matches) {
+        setMobileNavOpen(false)
+      }
+    }
+
+    closeOnDesktop()
+    mediaQuery.addEventListener('change', closeOnDesktop)
+    return () => mediaQuery.removeEventListener('change', closeOnDesktop)
+  }, [])
+
+  useEffect(() => {
+    if (!mobileNavOpen) {
+      return
+    }
+
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setMobileNavOpen(false)
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [mobileNavOpen])
+
   async function logout() {
     await api('/auth/logout', { method: 'POST' }).catch(() => undefined)
     setMe(null)
+    setMobileNavOpen(false)
+  }
+
+  function selectView(nextView: ViewKey) {
+    setView(nextView)
+    setMobileNavOpen(false)
+    window.requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+    })
   }
 
   const notify = (kind: ToastKind, text: string) => showToast(kind, text)
@@ -58,72 +129,72 @@ function App() {
 
   return (
     <HeroShell>
-      <div className="app-shell">
-        <aside className="sidebar">
-          <Brand />
-          <nav className="nav" aria-label="主导航">
-            <Button
-              className={navClass('review')}
-              variant={view === 'review' ? 'primary' : 'tertiary'}
-              fullWidth
-              aria-current={view === 'review' ? 'page' : undefined}
-              onClick={() => setView('review')}
-            >
-              <Eye size={18} />
-              审核
-            </Button>
-            <Button
-              className={navClass('sent')}
-              variant={view === 'sent' ? 'primary' : 'tertiary'}
-              fullWidth
-              aria-current={view === 'sent' ? 'page' : undefined}
-              onClick={() => setView('sent')}
-            >
-              <Send size={18} />
-              已发送
-            </Button>
-            <Button
-              className={navClass('stats')}
-              variant={view === 'stats' ? 'primary' : 'tertiary'}
-              fullWidth
-              aria-current={view === 'stats' ? 'page' : undefined}
-              onClick={() => setView('stats')}
-            >
-              <BarChart3 size={18} />
-              统计
-            </Button>
-            {me.role === 'global_admin' ? (
-              <Button
-                className={navClass('agent')}
-                variant={view === 'agent' ? 'primary' : 'tertiary'}
-                fullWidth
-                aria-current={view === 'agent' ? 'page' : undefined}
-                onClick={() => setView('agent')}
+      <div className={`app-shell ${mobileNavOpen ? 'is-mobile-nav-open' : ''}`}>
+        <div className="mobile-nav-rail" aria-label="主导航快捷入口">
+          <button
+            className="mobile-nav-rail-action"
+            type="button"
+            aria-label="展开导航"
+            aria-controls="app-sidebar"
+            aria-expanded={mobileNavOpen}
+            onClick={() => setMobileNavOpen(true)}
+          >
+            <PanelLeftOpen size={20} />
+          </button>
+          <div className="mobile-nav-rail-tabs" role="navigation" aria-label="主导航快捷入口">
+            {navItems.map(({ key, label, Icon }) => (
+              <button
+                key={key}
+                className={`mobile-nav-rail-tab ${view === key ? 'is-active' : ''}`}
+                type="button"
+                aria-label={label}
+                aria-current={view === key ? 'page' : undefined}
+                title={label}
+                onClick={() => selectView(key)}
               >
-                <FileText size={18} />
-                Agent
+                <Icon size={20} />
+              </button>
+            ))}
+          </div>
+          <span className="mobile-nav-rail-label">{activeNavItem?.label}</span>
+        </div>
+
+        <button
+          className="mobile-nav-backdrop"
+          type="button"
+          aria-label="收起导航"
+          aria-hidden={!mobileNavOpen}
+          tabIndex={mobileNavOpen ? 0 : -1}
+          onClick={() => setMobileNavOpen(false)}
+        />
+
+        <aside id="app-sidebar" className="sidebar" aria-label="主导航">
+          <div className="sidebar-head">
+            <Brand />
+            <Button
+              className="sidebar-close-button"
+              variant="tertiary"
+              isIconOnly
+              aria-label="收起导航"
+              onClick={() => setMobileNavOpen(false)}
+            >
+              <PanelLeftClose size={18} />
+            </Button>
+          </div>
+          <nav className="nav" aria-label="主导航">
+            {navItems.map(({ key, label, Icon }) => (
+              <Button
+                key={key}
+                className={navClass(key)}
+                variant={view === key ? 'primary' : 'tertiary'}
+                fullWidth
+                aria-current={view === key ? 'page' : undefined}
+                onClick={() => selectView(key)}
+              >
+                <Icon size={18} />
+                {label}
               </Button>
-            ) : null}
-            <Button
-              className={navClass('settings')}
-              variant={view === 'settings' ? 'primary' : 'tertiary'}
-              fullWidth
-              aria-current={view === 'settings' ? 'page' : undefined}
-              onClick={() => setView('settings')}
-            >
-              <Settings2 size={18} />
-              设置
-            </Button>
-            <Button
-              className={navClass('tag-mapping')}
-              variant={view === 'tag-mapping' ? 'primary' : 'tertiary'}
-              fullWidth
-              aria-current={view === 'tag-mapping' ? 'page' : undefined}
-              onClick={() => setView('tag-mapping')}
-            >
-              <LayoutGrid size={18} />
-              标签映射
-            </Button>
+            ))}
           </nav>
           <Card className="account-card" variant="secondary">
             <Card.Content>
