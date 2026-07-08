@@ -3445,7 +3445,9 @@ async fn parse_inbound_event(
         message_type
     );
     let user_id = value_opt_to_string(value.get("user_id"))?;
-    let self_id = value_opt_to_string(value.get("self_id")).unwrap_or_else(|| "napcat".to_string());
+    let self_id = value_opt_to_string(value.get("self_id"))
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| account_id.to_string());
     let message_id =
         value_opt_to_string(value.get("message_id")).unwrap_or_else(|| "0".to_string());
     let sender_name = extract_sender_name(value);
@@ -8801,6 +8803,46 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(removed, "agent command should cancel the active session");
+    }
+
+    #[tokio::test]
+    async fn group_global_command_uses_account_id_when_self_id_missing() {
+        let runtime = test_runtime();
+        register_ws_session("100", mock_session());
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let value = serde_json::json!({
+            "post_type": "message",
+            "message_type": "group",
+            "group_id": "1",
+            "user_id": "20002",
+            "message_id": "m1",
+            "time": 1001,
+            "raw_message": "[CQ:at,qq=100] 自检",
+            "message": [
+                {"type": "text", "data": {"text": "自检"}}
+            ],
+            "sender": {
+                "role": "admin"
+            }
+        });
+
+        let command = parse_inbound_event(&runtime, &state, &cmd_tx, &out_tx, "100", &value).await;
+        assert!(command.is_none());
+
+        let ack = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("ack timeout")
+            .expect("ack message");
+        assert!(ack.contains("\"action\":\"send_group_msg\""));
+        assert!(ack.contains("已收到指令"));
+        let report = tokio::time::timeout(Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("report timeout")
+            .expect("selfcheck report");
+        assert!(report.contains("系统自检报告"));
+        unregister_ws_session("100");
     }
 
     #[tokio::test]
