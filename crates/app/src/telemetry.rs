@@ -53,8 +53,8 @@ pub fn spawn_submission_telemetry(
     let local_dir = resolve_local_dir(data_dir, &telemetry.local_dir);
     let store = match TelemetryStore::open(local_dir, telemetry.upload_batch_size) {
         Ok(store) => store,
-        Err(err) => {
-            debug_log!("telemetry disabled: init failed: {}", err);
+        Err(_err) => {
+            debug_log!("telemetry disabled: init failed: {}", _err);
             return None;
         }
     };
@@ -90,9 +90,10 @@ struct TelemetryRuntime {
 
 impl TelemetryRuntime {
     async fn run(mut self) {
+        let _telemetry_root = self.store.root.as_path();
         debug_log!(
             "telemetry started: dir={} upload_enabled={} endpoint_present={} interval_sec={} batch_size={}",
-            self.store.root.display(),
+            _telemetry_root.display(),
             self.config.upload_enabled,
             self.config.upload_endpoint.is_some(),
             self.config.upload_interval_sec,
@@ -105,8 +106,8 @@ impl TelemetryRuntime {
                     match recv {
                         Ok(env) => self.handle_event(&env.event).await,
                         Err(RecvError::Closed) => break,
-                        Err(RecvError::Lagged(skipped)) => {
-                            debug_log!("telemetry lagged: skipped={}", skipped);
+                        Err(RecvError::Lagged(_skipped)) => {
+                            debug_log!("telemetry lagged: skipped={}", _skipped);
                         }
                     }
                 }
@@ -134,8 +135,8 @@ impl TelemetryRuntime {
             return;
         }
         for (sample, chat_record) in samples {
-            if let Err(err) = self.store.enqueue(sample, &chat_record) {
-                debug_log!("telemetry enqueue failed: {}", err);
+            if let Err(_err) = self.store.enqueue(sample, &chat_record) {
+                debug_log!("telemetry enqueue failed: {}", _err);
             }
         }
     }
@@ -708,11 +709,11 @@ impl TelemetryStore {
             if needed.contains(stem) {
                 continue;
             }
-            if let Err(err) = fs::remove_file(&path) {
+            if let Err(_err) = fs::remove_file(&path) {
                 debug_log!(
                     "cleanup telemetry object failed: {}: {}",
                     path.display(),
-                    err
+                    _err
                 );
             }
         }

@@ -321,8 +321,8 @@ fn delete_persisted_blob_file(path: &str) {
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            debug_log!("blob gc remove failed: path={} error={}", path, err);
+        Err(_err) => {
+            debug_log!("blob gc remove failed: path={} error={}", path, _err);
         }
     }
 }
@@ -1479,11 +1479,12 @@ impl QzoneClient {
 
     async fn upload_image(&self, image: &[u8]) -> Result<Value, QzoneError> {
         let prepared = prepare_upload_image(image)?;
+        let _upload_strategy = prepared.strategy;
         debug_log!(
             "qzone upload image: original_size_bytes={} prepared_size_bytes={} strategy={}",
             image.len(),
             prepared.bytes.len(),
-            prepared.strategy
+            _upload_strategy
         );
         let cookie_header = build_cookie_header(&self.cookies);
         let skey = self

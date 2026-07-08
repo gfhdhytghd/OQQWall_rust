@@ -1168,30 +1168,30 @@ fn refresh_runtime_agent_commands(root: &Value) {
     for (group_id, group_obj) in collect_config_group_objects(root) {
         let commands = match parse_agent_commands(group_obj.get("agent_commands")) {
             Ok(commands) => commands,
-            Err(err) => {
+            Err(_err) => {
                 debug_log!(
                     "skip runtime agent_commands refresh: group_id={} err={}",
                     group_id,
-                    err
+                    _err
                 );
                 continue;
             }
         };
-        if let Err(err) = update_group_agent_commands(&group_id, commands) {
+        if let Err(_err) = update_group_agent_commands(&group_id, commands) {
             debug_log!(
                 "runtime agent_commands refresh failed: group_id={} err={}",
                 group_id,
-                err
+                _err
             );
         }
-        if let Err(err) = update_group_agent_command_admins(
+        if let Err(_err) = update_group_agent_command_admins(
             &group_id,
             cfg_string_list(group_obj.get("agent_command_admins")),
         ) {
             debug_log!(
                 "runtime agent_command_admins refresh failed: group_id={} err={}",
                 group_id,
-                err
+                _err
             );
         }
     }

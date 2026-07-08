@@ -77,8 +77,8 @@ async fn main() {
             debug_log!("blob orphan sweep removed {} file(s)", removed);
         }
         Ok(_) => {}
-        Err(err) => {
-            debug_log!("blob orphan sweep failed: {}", err);
+        Err(_err) => {
+            debug_log!("blob orphan sweep failed: {}", _err);
         }
     }
     let _status = status::spawn_status_logger(&handle);

@@ -1769,13 +1769,16 @@ fn render_png(
                     _name_lines.len()
                 );
             }
-            BlockKind::Reply { body_lines, .. } => {
+            BlockKind::Reply {
+                body_lines: _body_lines,
+                ..
+            } => {
                 debug_log!(
                     "layout block: idx={} kind=reply width={} height={} body_lines={}",
                     block_idx,
                     layout.width,
                     layout.height,
-                    body_lines.len()
+                    _body_lines.len()
                 );
             }
             BlockKind::Poke { image } => {
@@ -1788,22 +1791,22 @@ fn render_png(
                     _size
                 );
             }
-            BlockKind::JsonCard { view, .. } => {
+            BlockKind::JsonCard { view: _view, .. } => {
                 debug_log!(
                     "layout block: idx={} kind=json_card view={} width={} height={}",
                     block_idx,
-                    view.view_kind,
+                    _view.view_kind,
                     layout.width,
                     layout.height
                 );
             }
-            BlockKind::Forward { items } => {
+            BlockKind::Forward { items: _items } => {
                 debug_log!(
                     "layout block: idx={} kind=forward width={} height={} items={}",
                     block_idx,
                     layout.width,
                     layout.height,
-                    items.len()
+                    _items.len()
                 );
             }
         }
@@ -4606,18 +4609,18 @@ fn resolve_res_dir_from_exe() -> Option<PathBuf> {
                     "res dir missing near executable, try extract archive: {}",
                     archive.display()
                 );
-                if let Err(err) = verify_res_archive_sha256(&archive) {
-                    debug_log!("res archive sha256 verify failed: {}", err);
+                if let Err(_err) = verify_res_archive_sha256(&archive) {
+                    debug_log!("res archive sha256 verify failed: {}", _err);
                     return None;
                 }
                 match extract_res_archive(exe_dir, &archive) {
                     Ok(()) => {
                         if !exe_res_dir.exists() {
-                            if let Err(err) = fs::create_dir_all(&exe_res_dir) {
+                            if let Err(_err) = fs::create_dir_all(&exe_res_dir) {
                                 debug_log!(
                                     "res auto-create failed: path={} err={}",
                                     exe_res_dir.display(),
-                                    err
+                                    _err
                                 );
                             }
                         }
@@ -4633,8 +4636,8 @@ fn resolve_res_dir_from_exe() -> Option<PathBuf> {
                             exe_res_dir.display()
                         );
                     }
-                    Err(err) => {
-                        debug_log!("res archive extract failed: {}", err);
+                    Err(_err) => {
+                        debug_log!("res archive extract failed: {}", _err);
                     }
                 }
             }

@@ -48,11 +48,11 @@ pub fn sweep_orphan_blobs(
     while let Some(dir) = stack.pop() {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(err) => {
+            Err(_err) => {
                 debug_log!(
                     "blob orphan sweep read_dir failed: path={:?} error={}",
                     dir,
-                    err
+                    _err
                 );
                 continue;
             }
@@ -81,11 +81,11 @@ pub fn sweep_orphan_blobs(
             match fs::remove_file(&path) {
                 Ok(()) => removed = removed.saturating_add(1),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
+                Err(_err) => {
                     debug_log!(
                         "blob orphan sweep remove failed: path={:?} error={}",
                         path,
-                        err
+                        _err
                     );
                 }
             }

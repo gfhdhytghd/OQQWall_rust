@@ -1409,8 +1409,8 @@ fn delete_persisted_blob_file(path: &str) {
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            debug_log!("blob gc remove failed: path={} error={}", path, err);
+        Err(_err) => {
+            debug_log!("blob gc remove failed: path={} error={}", path, _err);
         }
     }
 }
@@ -4206,7 +4206,7 @@ async fn parse_inbound_event(
             current_thank_you_feedback(&guard, runtime, &user_id, timestamp_ms)
         };
         if let Some(feedback) = thank_you_feedback {
-            if let Some(matched) = thankyou_filter::evaluate_message(
+            if let Some(_matched) = thankyou_filter::evaluate_message(
                 &runtime.thank_you_filter,
                 feedback.kind,
                 value.get("message"),
@@ -4221,7 +4221,7 @@ async fn parse_inbound_event(
                     debug_log!(
                         "napcat inbound private thank-you silenced: user_id={} rule={}",
                         user_id,
-                        matched.rule
+                        _matched.rule
                     );
                     return None;
                 }
@@ -7553,13 +7553,13 @@ fn spawn_submission_agent_command(
             timestamp_ms,
         )
         .await;
-        if let Err(err) = result {
+        if let Err(_err) = result {
             debug_log!(
                 "submission agent command failed group_id={} post_id={} command={} err={}",
                 runtime.group_id,
                 post_id.0,
                 command_name,
-                err
+                _err
             );
         }
     });
