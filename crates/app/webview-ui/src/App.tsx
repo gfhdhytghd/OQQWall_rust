@@ -219,7 +219,7 @@ function App() {
               description="选择左侧稿件后可在右侧处理详情"
               emptyText="没有符合条件的稿件"
               stageOptions={REVIEW_STAGE_OPTIONS}
-              initialStage="__active__"
+              initialStage="review_pending"
               allowSelection
               allowActions
               allowBatchActions

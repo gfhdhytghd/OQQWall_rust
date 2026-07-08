@@ -3319,6 +3319,7 @@ fn is_active_stage(stage: PostStage) -> bool {
         PostStage::Rejected
             | PostStage::Deleted
             | PostStage::Skipped
+            | PostStage::Sent
             | PostStage::Failed
             | PostStage::Withdrawn
     )
@@ -3429,4 +3430,21 @@ fn random_hex32() -> String {
     let mut bytes = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_stage_excludes_sent_and_terminal_review_states() {
+        assert!(is_active_stage(PostStage::ReviewPending));
+        assert!(is_active_stage(PostStage::Scheduled));
+        assert!(!is_active_stage(PostStage::Sent));
+        assert!(!is_active_stage(PostStage::Rejected));
+        assert!(!is_active_stage(PostStage::Deleted));
+        assert!(!is_active_stage(PostStage::Skipped));
+        assert!(!is_active_stage(PostStage::Failed));
+        assert!(!is_active_stage(PostStage::Withdrawn));
+    }
 }
