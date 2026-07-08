@@ -25,7 +25,6 @@ import {
 import {
   AlertCircle,
   ArrowLeft,
-  BarChart3,
   Ban,
   Check,
   CheckCircle2,
@@ -43,9 +42,7 @@ import {
   Send,
   ShieldCheck,
   Trash2,
-  UserRound,
   X,
-  Zap,
 } from 'lucide-react'
 import { api } from '../api/client'
 import {
@@ -596,6 +593,13 @@ export function AgentView({
   return <RuntimeConfigWorkbench notify={notify} mode="agent" />
 }
 
+type OperationGroupPageKey =
+  | 'operation_basic'
+  | 'operation_inbox'
+  | 'operation_delivery'
+  | 'operation_agent'
+  | 'operation_misc'
+
 function buildRuntimeConfigPages(): Array<{
   value: RuntimeConfigPageKey
   label: string
@@ -604,64 +608,62 @@ function buildRuntimeConfigPages(): Array<{
 }> {
   return [
     {
-      value: 'common_runtime',
-      label: '基础运行',
-      description: '处理间隔、超时、缓存和时区。',
+      value: 'runtime_settings',
+      label: '运行设置',
+      description: '服务端口、默认运行参数和遥测。',
       icon: <Clock3 size={16} />,
     },
     {
-      value: 'common_services',
-      label: '服务端口',
-      description: 'Web API、WebUI 和管理员入口。',
-      icon: <LayoutGrid size={16} />,
-    },
-    {
-      value: 'common_telemetry',
-      label: '遥测',
-      description: '遥测目录、上传和批量参数。',
-      icon: <BarChart3 size={16} />,
-    },
-    {
-      value: 'global_admins',
-      label: '全局管理员',
-      description: 'WebUI 全局管理员账号。',
-      icon: <ShieldCheck size={16} />,
-    },
-    {
-      value: 'group_basic',
-      label: '分组基础',
-      description: '当前分组基础信息和 NapCat 接入。',
+      value: 'operation_settings',
+      label: '运营设置',
+      description: '进入组卡片，再维护具体组配置。',
       icon: <Inbox size={16} />,
     },
     {
-      value: 'group_delivery',
-      label: '分组发稿',
+      value: 'operation_global_misc',
+      label: '全局杂项',
+      description: '全局 WebUI 管理员。',
+      icon: <ShieldCheck size={16} />,
+    },
+  ]
+}
+
+function buildOperationGroupPages(): Array<{
+  value: OperationGroupPageKey
+  label: string
+  description: string
+  icon: ReactNode
+}> {
+  return [
+    {
+      value: 'operation_basic',
+      label: '基础配置',
+      description: '组标识、审核群和 NapCat 接入。',
+      icon: <Inbox size={16} />,
+    },
+    {
+      value: 'operation_inbox',
+      label: '收件设置',
+      description: '收件等待、好友申请和自动私信。',
+      icon: <MessageSquare size={16} />,
+    },
+    {
+      value: 'operation_delivery',
+      label: '发件设置',
       description: '账号池、定时发稿、队列和图片限制。',
       icon: <Send size={16} />,
     },
     {
-      value: 'group_quick_replies',
-      label: '快捷回复',
-      description: '管理用户快捷回复映射。',
-      icon: <MessageSquare size={16} />,
-    },
-    {
-      value: 'group_shortcuts',
-      label: '快捷指令',
-      description: '审核快捷指令和全局快捷指令。',
-      icon: <Zap size={16} />,
-    },
-    {
-      value: 'group_agent_commands',
-      label: 'Agent 指令',
-      description: '独立 Agent 页面入口。',
+      value: 'operation_agent',
+      label: 'Agent',
+      description: 'Agent 指令和触发管理员。',
       icon: <FileText size={16} />,
     },
     {
-      value: 'group_admins',
-      label: '分组管理员',
-      description: '当前分组 WebUI 管理员。',
-      icon: <UserRound size={16} />,
+      value: 'operation_misc',
+      label: '杂项',
+      description: '快捷回复、快捷指令、水印和组管理员。',
+      icon: <MoreHorizontal size={16} />,
     },
   ]
 }
@@ -1475,12 +1477,16 @@ function RuntimeConfigWorkbench({
 }) {
   const [settings, setSettings] = useState<AppConfigSettingsResponse | null>(null)
   const [selectedGroup, setSelectedGroup] = useState('')
-  const [selectedMenu, setSelectedMenu] = useState<ConfigMenuKey>('common_runtime')
+  const [selectedMenu, setSelectedMenu] = useState<ConfigMenuKey>('runtime_settings')
+  const [selectedOperationPage, setSelectedOperationPage] =
+    useState<OperationGroupPageKey>('operation_basic')
+  const [operationGroupDetailOpen, setOperationGroupDetailOpen] = useState(false)
   const [mobileConfigDetailOpen, setMobileConfigDetailOpen] = useState(false)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const compactRuntimeConfig = useMediaQuery('(max-width: 640px)')
   const runtimeConfigPages = buildRuntimeConfigPages()
+  const operationGroupPages = buildOperationGroupPages()
   const selectedRuntimeConfigPage =
     runtimeConfigPages.find((page) => page.value === selectedMenu) ?? runtimeConfigPages[0]
 
@@ -1537,10 +1543,25 @@ function RuntimeConfigWorkbench({
 
   function selectRuntimeConfigPage(value: ConfigMenuKey) {
     setSelectedMenu(value)
+    if (value === 'operation_settings') {
+      setOperationGroupDetailOpen(false)
+    }
     if (compactRuntimeConfig && mode === 'full') {
       setMobileConfigDetailOpen(true)
       scrollRuntimeConfigTop()
     }
+  }
+
+  function openOperationGroup(groupId: string) {
+    setSelectedGroup(groupId)
+    setSelectedOperationPage('operation_basic')
+    setOperationGroupDetailOpen(true)
+    scrollRuntimeConfigTop()
+  }
+
+  function returnToOperationGroups() {
+    setOperationGroupDetailOpen(false)
+    scrollRuntimeConfigTop()
   }
 
   function returnToRuntimeConfigMenu() {
@@ -1737,7 +1758,13 @@ function RuntimeConfigWorkbench({
         groups: [...prev.groups, buildDefaultConfigGroup(nextGroupId, prev.common)],
       }
     })
-    if (nextGroupId) setSelectedGroup(nextGroupId)
+    if (nextGroupId) {
+      setSelectedGroup(nextGroupId)
+      if (mode === 'full' && selectedMenu === 'operation_settings') {
+        setSelectedOperationPage('operation_basic')
+        setOperationGroupDetailOpen(true)
+      }
+    }
   }
 
   function removeCurrentGroup() {
@@ -1754,6 +1781,7 @@ function RuntimeConfigWorkbench({
     const remainingGroups = settings.groups.filter((group) => group.group_id !== activeGroup.group_id)
     setSettings((prev) => (prev ? { ...prev, groups: remainingGroups } : prev))
     setSelectedGroup(remainingGroups[0]?.group_id ?? '')
+    setOperationGroupDetailOpen(false)
   }
 
   if (loading && !settings) {
@@ -1784,6 +1812,7 @@ function RuntimeConfigWorkbench({
 
   const groups = settings.groups
   const activeGroup = groups.find((group) => group.group_id === selectedGroup) ?? groups[0] ?? null
+  const groupSpecificRuntimeSummary = describeGroupSpecificRuntimeSettings(groups)
   if (mode === 'agent') {
     return (
       <div className="workspace settings-workspace agent-workspace">
@@ -1869,6 +1898,101 @@ function RuntimeConfigWorkbench({
     )
   }
 
+  function renderOperationGroupCards() {
+    return (
+      <Card className="panel-card operation-groups-card">
+        <Card.Header>
+          <Card.Title>组</Card.Title>
+          <div className="head-actions">
+            <Button size="sm" variant="secondary" onClick={addGroup}>
+              新增分组
+            </Button>
+          </div>
+        </Card.Header>
+        <Card.Content>
+          {groups.length > 0 ? (
+            <div className="operation-group-grid">
+              {groups.map((group, index) => (
+                <button
+                  key={`${group.group_id || 'group'}-${index}`}
+                  type="button"
+                  className={`settings-stage-button operation-group-card ${
+                    selectedGroup === group.group_id ? 'is-active' : ''
+                  }`}
+                  onClick={() => openOperationGroup(group.group_id)}
+                >
+                  <span className="settings-stage-icon">
+                    <Inbox size={16} />
+                  </span>
+                  <strong>{group.group_id || '未命名分组'}</strong>
+                  <span>审核群：{group.audit_group_id || '未填写'}</span>
+                  <span>发件账号：{group.accounts.length} 个</span>
+                  <span>定时发稿：{group.send_schedule.length} 个时间点</span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <EmptyPanel icon={<LayoutGrid size={28} />} text="当前没有可用的分组配置" />
+          )}
+        </Card.Content>
+      </Card>
+    )
+  }
+
+  function renderOperationGroupDetailHead() {
+    if (!activeGroup) return null
+    return (
+      <Card className="panel-card operation-group-detail-card">
+        <Card.Content>
+          <div className="operation-group-detail-head">
+            <Button size="sm" variant="secondary" onClick={returnToOperationGroups}>
+              <ArrowLeft size={16} />
+              返回组列表
+            </Button>
+            <div className="operation-group-detail-title">
+              <span className="field-label">当前组</span>
+              <strong>{activeGroup.group_id || '未命名分组'}</strong>
+              <span>审核群：{activeGroup.audit_group_id || '未填写'}</span>
+            </div>
+            <div className="head-actions">
+              <Button size="sm" variant="secondary" onClick={addGroup}>
+                新增分组
+              </Button>
+              <Button size="sm" variant="secondary" onClick={removeCurrentGroup}>
+                删除当前组
+              </Button>
+            </div>
+          </div>
+        </Card.Content>
+      </Card>
+    )
+  }
+
+  function renderOperationGroupPageCards() {
+    return (
+      <Card className="panel-card operation-group-pages-card">
+        <Card.Content>
+          <div className="settings-stage-grid operation-setting-grid">
+            {operationGroupPages.map((page) => (
+              <button
+                key={page.value}
+                type="button"
+                className={`settings-stage-button ${
+                  selectedOperationPage === page.value ? 'is-active' : ''
+                }`}
+                onClick={() => setSelectedOperationPage(page.value)}
+              >
+                <span className="settings-stage-icon">{page.icon}</span>
+                <strong>{page.label}</strong>
+                <span>{page.description}</span>
+              </button>
+            ))}
+          </div>
+        </Card.Content>
+      </Card>
+    )
+  }
+
   function renderRuntimeConfigActions() {
     return (
       <div className="head-actions">
@@ -1892,6 +2016,9 @@ function RuntimeConfigWorkbench({
   const showMobileConfigDetail = compactRuntimeConfig && mobileConfigDetailOpen
   const showRuntimeConfigMenu = !showMobileConfigDetail
   const showRuntimeConfigContent = !compactRuntimeConfig || mobileConfigDetailOpen
+  const showOperationGroupDetail =
+    selectedMenu === 'operation_settings' && operationGroupDetailOpen && Boolean(activeGroup)
+  const showOperationGroupList = selectedMenu === 'operation_settings' && !showOperationGroupDetail
 
   return (
     <div
@@ -1902,8 +2029,8 @@ function RuntimeConfigWorkbench({
       {!showMobileConfigDetail ? (
         <header className="page-head">
           <div>
-            <h1>运行配置</h1>
-            <p>把不同运行板块拆到独立菜单里，便于单独配置。</p>
+            <h1>设置</h1>
+            <p>按运行设置和运营设置分组维护 config.json。</p>
           </div>
           {renderRuntimeConfigActions()}
         </header>
@@ -1937,10 +2064,10 @@ function RuntimeConfigWorkbench({
               </div>
             ) : null}
 
-          {selectedMenu === 'common_runtime' ? (
+          {selectedMenu === 'runtime_settings' ? (
             <Card className="panel-card">
               <Card.Header>
-                <Card.Title>基础运行</Card.Title>
+                <Card.Title>运行设置</Card.Title>
               </Card.Header>
               <Card.Content>
                 <div className="settings-panel">
@@ -1996,6 +2123,7 @@ function RuntimeConfigWorkbench({
                     <div className="field-stack config-span-2">
                       <span className="field-label">NapCat 反向 WS 地址</span>
                       <Input
+                        placeholder={groupSpecificRuntimeSummary ? '留空表示只使用分组配置' : undefined}
                         value={settings.common.napcat_base_url}
                         onChange={(event) => updateCommon('napcat_base_url', event.target.value)}
                       />
@@ -2003,6 +2131,7 @@ function RuntimeConfigWorkbench({
                     <div className="field-stack config-span-2">
                       <span className="field-label">NapCat Access Token</span>
                       <Input
+                        placeholder={groupSpecificRuntimeSummary ? '留空表示只使用分组配置' : undefined}
                         value={settings.common.napcat_access_token}
                         onChange={(event) =>
                           updateCommon('napcat_access_token', event.target.value)
@@ -2012,12 +2141,18 @@ function RuntimeConfigWorkbench({
                     <div className="field-stack config-span-2">
                       <span className="field-label">好友通过自动私信</span>
                       <TextArea
+                        placeholder={groupSpecificRuntimeSummary ? '留空表示只使用分组配置' : undefined}
                         value={settings.common.friend_add_message}
                         onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) =>
                           updateCommon('friend_add_message', event.target.value)
                         }
                       />
                     </div>
+                    {groupSpecificRuntimeSummary ? (
+                      <div className="field-hint config-span-2">
+                        公共 NapCat 和好友私信留空不会清空分组配置；{groupSpecificRuntimeSummary}
+                      </div>
+                    ) : null}
                     <div className="field-stack config-switch-row">
                       <span className="field-label">私密空间时 @ 投稿人</span>
                       <Switch
@@ -2034,7 +2169,7 @@ function RuntimeConfigWorkbench({
             </Card>
           ) : null}
 
-          {selectedMenu === 'common_services' ? (
+          {selectedMenu === 'runtime_settings' ? (
             <Card className="panel-card">
               <Card.Header>
                 <Card.Title>服务端口</Card.Title>
@@ -2115,7 +2250,7 @@ function RuntimeConfigWorkbench({
             </Card>
           ) : null}
 
-          {selectedMenu === 'common_telemetry' ? (
+          {selectedMenu === 'runtime_settings' ? (
             <Card className="panel-card">
               <Card.Header>
                 <Card.Title>遥测</Card.Title>
@@ -2184,10 +2319,10 @@ function RuntimeConfigWorkbench({
             </Card>
           ) : null}
 
-          {selectedMenu === 'global_admins' ? (
+          {selectedMenu === 'operation_global_misc' ? (
             <Card className="panel-card">
               <Card.Header>
-                <Card.Title>全局 WebUI 管理员</Card.Title>
+                <Card.Title>全局杂项</Card.Title>
               </Card.Header>
               <Card.Content>
                 <ConfigAdminListEditor
@@ -2201,12 +2336,19 @@ function RuntimeConfigWorkbench({
             </Card>
           ) : null}
 
-          {selectedMenu.startsWith('group_') && activeGroup ? renderGroupSelectionCard() : null}
+          {showOperationGroupList ? renderOperationGroupCards() : null}
 
-          {selectedMenu === 'group_basic' && activeGroup ? (
+          {showOperationGroupDetail ? (
+            <>
+              {renderOperationGroupDetailHead()}
+              {renderOperationGroupPageCards()}
+            </>
+          ) : null}
+
+          {showOperationGroupDetail && selectedOperationPage === 'operation_basic' && activeGroup ? (
             <Card className="panel-card">
               <Card.Header>
-                <Card.Title>分组基础</Card.Title>
+                <Card.Title>基础配置</Card.Title>
               </Card.Header>
               <Card.Content>
                 <div className="config-form-grid">
@@ -2224,12 +2366,114 @@ function RuntimeConfigWorkbench({
                       onChange={(event) => updateGroupField('audit_group_id', event.target.value)}
                     />
                   </div>
+                  <div className="field-stack config-span-2">
+                    <span className="field-label">NapCat 反向 WS 地址</span>
+                    <Input
+                      value={activeGroup.napcat_base_url}
+                      onChange={(event) => updateGroupField('napcat_base_url', event.target.value)}
+                    />
+                  </div>
+                  <div className="field-stack config-span-2">
+                    <span className="field-label">NapCat Access Token</span>
+                    <Input
+                      value={activeGroup.napcat_access_token}
+                      onChange={(event) =>
+                        updateGroupField('napcat_access_token', event.target.value)
+                      }
+                    />
+                  </div>
+                </div>
+              </Card.Content>
+            </Card>
+          ) : null}
+
+          {showOperationGroupDetail && selectedOperationPage === 'operation_inbox' && activeGroup ? (
+            <Card className="panel-card">
+              <Card.Header>
+                <Card.Title>收件设置</Card.Title>
+              </Card.Header>
+              <Card.Content>
+                <div className="config-form-grid">
                   <ConfigNumberField
                     label="处理等待（秒）"
                     value={activeGroup.process_waittime_sec}
                     min={0}
                     onChange={(value) => updateGroupField('process_waittime_sec', value)}
                   />
+                  <ConfigNumberField
+                    label="好友请求窗口（秒）"
+                    value={activeGroup.friend_request_window_sec}
+                    min={0}
+                    onChange={(value) => updateGroupField('friend_request_window_sec', value)}
+                  />
+                  <div className="field-stack config-switch-row">
+                    <span className="field-label">启用指令式收稿</span>
+                    <Switch
+                      isSelected={activeGroup.submission_session_enabled}
+                      size="sm"
+                      onChange={(value) =>
+                        updateSelectedGroup((group) => ({
+                          ...group,
+                          submission_session_enabled: value,
+                          submission_session_required: value
+                            ? group.submission_session_required
+                            : false,
+                        }))
+                      }
+                    >
+                      {activeGroup.submission_session_enabled ? '已启用' : '已关闭'}
+                    </Switch>
+                  </div>
+                  <div className="field-stack config-switch-row">
+                    <span className="field-label">仅指令式收稿</span>
+                    <Switch
+                      isSelected={activeGroup.submission_session_required}
+                      isDisabled={!activeGroup.submission_session_enabled}
+                      size="sm"
+                      onChange={(value) =>
+                        updateSelectedGroup((group) => ({
+                          ...group,
+                          submission_session_enabled: value ? true : group.submission_session_enabled,
+                          submission_session_required: value,
+                        }))
+                      }
+                    >
+                      {activeGroup.submission_session_required ? '已启用' : '已关闭'}
+                    </Switch>
+                  </div>
+                  <div className="field-stack config-switch-row">
+                    <span className="field-label">合并文本到首条消息</span>
+                    <Switch
+                      isSelected={activeGroup.submission_session_merge_text_to_first_message}
+                      isDisabled={!activeGroup.submission_session_enabled}
+                      size="sm"
+                      onChange={(value) =>
+                        updateGroupField('submission_session_merge_text_to_first_message', value)
+                      }
+                    >
+                      {activeGroup.submission_session_merge_text_to_first_message
+                        ? '已启用'
+                        : '已关闭'}
+                    </Switch>
+                  </div>
+                  <div className="field-stack config-span-2">
+                    <span className="field-label">好友通过自动私信</span>
+                    <TextArea
+                      value={activeGroup.friend_add_message}
+                      onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) =>
+                        updateGroupField('friend_add_message', event.target.value)
+                      }
+                    />
+                  </div>
+                </div>
+              </Card.Content>
+            </Card>
+          ) : null}
+
+          {showOperationGroupDetail && selectedOperationPage === 'operation_delivery' && activeGroup ? (
+            <div className="config-card-grid">
+              <div className="config-subcard">
+                <div className="settings-panel">
                   <ConfigNumberField
                     label="最小发送间隔（毫秒）"
                     value={activeGroup.min_interval_ms}
@@ -2248,53 +2492,6 @@ function RuntimeConfigWorkbench({
                     min={0}
                     onChange={(value) => updateGroupField('send_max_attempts', value)}
                   />
-                  <ConfigNumberField
-                    label="好友请求窗口（秒）"
-                    value={activeGroup.friend_request_window_sec}
-                    min={0}
-                    onChange={(value) => updateGroupField('friend_request_window_sec', value)}
-                  />
-                  <div className="field-stack config-span-2">
-                    <span className="field-label">NapCat 反向 WS 地址</span>
-                    <Input
-                      value={activeGroup.napcat_base_url}
-                      onChange={(event) => updateGroupField('napcat_base_url', event.target.value)}
-                    />
-                  </div>
-                  <div className="field-stack config-span-2">
-                    <span className="field-label">NapCat Access Token</span>
-                    <Input
-                      value={activeGroup.napcat_access_token}
-                      onChange={(event) =>
-                        updateGroupField('napcat_access_token', event.target.value)
-                      }
-                    />
-                  </div>
-                  <div className="field-stack config-span-2">
-                    <span className="field-label">渲染水印文本</span>
-                    <Input
-                      value={activeGroup.watermark_text}
-                      onChange={(event) => updateGroupField('watermark_text', event.target.value)}
-                    />
-                  </div>
-                  <div className="field-stack config-span-2">
-                    <span className="field-label">好友通过自动私信</span>
-                    <TextArea
-                      value={activeGroup.friend_add_message}
-                      onChange={(event: React.ChangeEvent<HTMLTextAreaElement>) =>
-                        updateGroupField('friend_add_message', event.target.value)
-                      }
-                    />
-                  </div>
-                </div>
-              </Card.Content>
-            </Card>
-          ) : null}
-
-          {selectedMenu === 'group_delivery' && activeGroup ? (
-            <div className="config-card-grid">
-              <div className="config-subcard">
-                <div className="settings-panel">
                   <ConfigNumberField
                     label="队列编组上限"
                     value={activeGroup.max_post_stack}
@@ -2320,6 +2517,13 @@ function RuntimeConfigWorkbench({
                     >
                       {activeGroup.individual_image_in_posts ? '已启用' : '已关闭'}
                     </Switch>
+                  </div>
+                  <div className="field-stack">
+                    <span className="field-label">渲染水印文本</span>
+                    <Input
+                      value={activeGroup.watermark_text}
+                      onChange={(event) => updateGroupField('watermark_text', event.target.value)}
+                    />
                   </div>
                 </div>
               </div>
@@ -2352,7 +2556,41 @@ function RuntimeConfigWorkbench({
             </div>
           ) : null}
 
-          {selectedMenu === 'group_quick_replies' && activeGroup ? (
+          {showOperationGroupDetail && selectedOperationPage === 'operation_agent' && activeGroup ? (
+            <>
+              <Card className="panel-card agent-workbench-card">
+                <Card.Header>
+                  <Card.Title>Agent</Card.Title>
+                </Card.Header>
+                <Card.Content>
+                  <AgentCommandWorkbench
+                    commands={activeGroup.agent_commands}
+                    variables={settings.agent_command_variables}
+                    onChange={(commands) => updateGroupField('agent_commands', commands)}
+                  />
+                </Card.Content>
+              </Card>
+              <Card className="panel-card">
+                <Card.Header>
+                  <Card.Title>Agent 管理员</Card.Title>
+                </Card.Header>
+                <Card.Content>
+                  <StringListEditor
+                    label="Agent 指令管理员 QQ"
+                    hint="开启“仅管理员”的 Agent 指令只允许这些 QQ 号触发。"
+                    addLabel="新增 QQ"
+                    placeholder="QQ 号"
+                    values={activeGroup.agent_command_admins}
+                    onAdd={addAgentCommandAdmin}
+                    onChange={updateAgentCommandAdmin}
+                    onRemove={removeAgentCommandAdmin}
+                  />
+                </Card.Content>
+              </Card>
+            </>
+          ) : null}
+
+          {showOperationGroupDetail && selectedOperationPage === 'operation_misc' && activeGroup ? (
             <Card className="panel-card">
               <Card.Header>
                 <Card.Title>快捷回复</Card.Title>
@@ -2374,7 +2612,7 @@ function RuntimeConfigWorkbench({
             </Card>
           ) : null}
 
-          {selectedMenu === 'group_shortcuts' && activeGroup ? (
+          {showOperationGroupDetail && selectedOperationPage === 'operation_misc' && activeGroup ? (
             <div className="config-card-grid">
               <div className="config-subcard">
                 <MappingListEditor
@@ -2406,39 +2644,13 @@ function RuntimeConfigWorkbench({
               </div>
             </div>
           ) : null}
-          {selectedMenu === 'group_agent_commands' && activeGroup ? (
-            <Card className="panel-card agent-legacy-card">
-              <Card.Header>
-                <Card.Title>Agent 指令</Card.Title>
-              </Card.Header>
-              <Card.Content>
-                <div className="settings-panel">
-                  <div className="settings-empty">
-                    <FileText size={20} />
-                    <span>Agent 积木编辑器已移动到左侧导航的独立页面。</span>
-                  </div>
-                  <p className="field-hint">在独立页面中可以拖拽积木、拼接，并保存到当前分组。</p>
-                </div>
-              </Card.Content>
-            </Card>
-          ) : null}
 
-          {selectedMenu === 'group_admins' && activeGroup ? (
+          {showOperationGroupDetail && selectedOperationPage === 'operation_misc' && activeGroup ? (
             <Card className="panel-card">
               <Card.Header>
                 <Card.Title>分组 WebUI 管理员</Card.Title>
               </Card.Header>
               <Card.Content>
-                <StringListEditor
-                  label="Agent 指令管理员 QQ"
-                  hint="开启“仅管理员”的 Agent 指令只允许这些 QQ 号触发。"
-                  addLabel="新增 QQ"
-                  placeholder="QQ 号"
-                  values={activeGroup.agent_command_admins}
-                  onAdd={addAgentCommandAdmin}
-                  onChange={updateAgentCommandAdmin}
-                  onRemove={removeAgentCommandAdmin}
-                />
                 <ConfigAdminListEditor
                   entries={activeGroup.webview_admins}
                   emptyText="当前分组还没有专属 WebUI 管理员。"
@@ -2608,6 +2820,21 @@ function ConfigAdminListEditor({
   )
 }
 
+function describeGroupSpecificRuntimeSettings(groups: AppConfigGroupSettings[]) {
+  const configuredGroups = groups
+    .filter(
+      (group) =>
+        group.napcat_base_url.trim() ||
+        group.napcat_access_token.trim() ||
+        group.friend_add_message.trim()
+    )
+    .map((group) => group.group_id.trim() || '未命名分组')
+  if (!configuredGroups.length) return ''
+  const shown = configuredGroups.slice(0, 3).join('、')
+  const extra = configuredGroups.length > 3 ? ` 等 ${configuredGroups.length} 个分组` : ''
+  return `已在分组 ${shown}${extra} 中配置接入。`
+}
+
 function buildDefaultConfigGroup(
   groupId: string,
   common: AppConfigCommonSettings
@@ -2629,6 +2856,9 @@ function buildDefaultConfigGroup(
     watermark_text: '',
     friend_add_message: common.friend_add_message,
     friend_request_window_sec: common.friend_request_window_sec,
+    submission_session_enabled: true,
+    submission_session_required: false,
+    submission_session_merge_text_to_first_message: false,
     quick_replies: [],
     review_shortcuts: [],
     global_shortcuts: [],

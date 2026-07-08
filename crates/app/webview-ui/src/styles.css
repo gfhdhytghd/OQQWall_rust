@@ -904,6 +904,7 @@ a {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: var(--inset-panel);
+  align-items: start;
   min-width: 0;
 }
 
@@ -963,6 +964,63 @@ a {
 .agent-group-selector {
   display: grid;
   gap: 12px;
+}
+
+.operation-group-grid {
+  columns: 220px;
+  column-gap: var(--inset-nested);
+}
+
+.operation-group-card {
+  min-height: 150px;
+  align-content: start;
+  width: 100%;
+  margin: 0 0 var(--inset-nested);
+  break-inside: avoid;
+  display: inline-grid;
+}
+
+@supports (display: grid-lanes) {
+  .operation-group-grid {
+    display: grid-lanes;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: var(--inset-nested);
+    columns: initial;
+  }
+
+  .operation-group-card {
+    margin: 0;
+    display: grid;
+  }
+}
+
+.operation-group-detail-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+}
+
+.operation-group-detail-title {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.operation-group-detail-title strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 17px;
+  line-height: 1.25;
+}
+
+.operation-group-detail-title span:last-child {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.operation-setting-grid {
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
 }
 
 .agent-workbench {
@@ -2887,6 +2945,7 @@ a {
   .batch-row,
   .pager,
   .action-box,
+  .operation-group-detail-head,
   .settings-toolbar,
   .settings-section-head,
   .settings-image-meta,
@@ -2922,6 +2981,7 @@ a {
   .metrics,
   .stats-grid,
   .kv,
+  .operation-group-detail-head,
   .settings-tab-list,
   .settings-stage-grid,
   .settings-inline-grid {

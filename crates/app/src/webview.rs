@@ -438,6 +438,12 @@ struct AppConfigGroupPayload {
     #[serde(default)]
     friend_add_message: String,
     friend_request_window_sec: u32,
+    #[serde(default = "default_true")]
+    submission_session_enabled: bool,
+    #[serde(default)]
+    submission_session_required: bool,
+    #[serde(default)]
+    submission_session_merge_text_to_first_message: bool,
     #[serde(default)]
     quick_replies: Vec<MappingEntryPayload>,
     #[serde(default)]
@@ -468,6 +474,10 @@ struct UpdateAppConfigSettingsRequest {
     global_admins: Vec<ConfigAdminPayload>,
     #[serde(default)]
     groups: Vec<AppConfigGroupPayload>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize)]
@@ -1440,6 +1450,14 @@ fn build_app_config_settings_response(root: &Value) -> AppConfigSettingsResponse
                 .unwrap_or_else(|| common.friend_add_message.clone()),
             friend_request_window_sec: cfg_u32(group_obj.get("friend_request_window_sec"))
                 .unwrap_or(common.friend_request_window_sec),
+            submission_session_enabled: cfg_bool(group_obj.get("submission_session_enabled"))
+                .unwrap_or(true),
+            submission_session_required: cfg_bool(group_obj.get("submission_session_required"))
+                .unwrap_or(false),
+            submission_session_merge_text_to_first_message: cfg_bool(
+                group_obj.get("submission_session_merge_text_to_first_message"),
+            )
+            .unwrap_or(false),
             quick_replies: payload_entries_from_map(&cfg_string_map(
                 group_obj.get("quick_replies"),
             )),
@@ -1647,6 +1665,12 @@ fn apply_group_config_payload(
     if accounts.is_empty() {
         return Err(format!("分组 '{}' 至少需要一个发送账号。", group_id));
     }
+    if payload.submission_session_required && !payload.submission_session_enabled {
+        return Err(format!(
+            "分组 '{}' 启用仅指令式收稿前，必须先启用指令式收稿。",
+            group_id
+        ));
+    }
 
     set_string_field(obj, "mangroupid", audit_group_id);
     set_string_list_field(obj, "accounts", &accounts);
@@ -1678,6 +1702,21 @@ fn apply_group_config_payload(
         obj,
         "friend_request_window_sec",
         payload.friend_request_window_sec,
+    );
+    set_bool_field(
+        obj,
+        "submission_session_enabled",
+        payload.submission_session_enabled,
+    );
+    set_bool_field(
+        obj,
+        "submission_session_required",
+        payload.submission_session_required,
+    );
+    set_bool_field(
+        obj,
+        "submission_session_merge_text_to_first_message",
+        payload.submission_session_merge_text_to_first_message,
     );
     set_mapping_entries_field(obj, "quick_replies", &payload.quick_replies);
     set_mapping_entries_field(obj, "review_shortcuts", &payload.review_shortcuts);

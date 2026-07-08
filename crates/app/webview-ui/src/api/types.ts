@@ -438,6 +438,9 @@ export interface AppConfigGroupSettings {
   watermark_text: string
   friend_add_message: string
   friend_request_window_sec: number
+  submission_session_enabled: boolean
+  submission_session_required: boolean
+  submission_session_merge_text_to_first_message: boolean
   quick_replies: MappingEntry[]
   review_shortcuts: MappingEntry[]
   global_shortcuts: MappingEntry[]

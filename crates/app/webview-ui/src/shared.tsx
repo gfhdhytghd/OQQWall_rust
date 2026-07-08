@@ -41,17 +41,7 @@ export type ViewKey = 'review' | 'sent' | 'stats' | 'settings' | 'tag-mapping' |
 export type PostsWorkspaceMode = 'review' | 'sent'
 export type RuntimeConfigWorkbenchMode = 'full' | 'agent'
 export type SettingsTabKey = 'config' | 'notifications'
-export type ConfigMenuKey =
-  | 'common_runtime'
-  | 'common_services'
-  | 'common_telemetry'
-  | 'global_admins'
-  | 'group_basic'
-  | 'group_delivery'
-  | 'group_quick_replies'
-  | 'group_shortcuts'
-  | 'group_agent_commands'
-  | 'group_admins'
+export type ConfigMenuKey = 'runtime_settings' | 'operation_settings' | 'operation_global_misc'
 export type NotificationMenuKey = 'stages' | 'webhooks' | 'variables'
 export type TagMappingMenuKey = 'groups' | 'webhooks'
 export type PostViewMode = 'cards' | 'list'
@@ -147,16 +137,9 @@ export type AgentBlockDragPayload =
   | AgentVariableDragPayload
 
 export type RuntimeConfigPageKey =
-  | 'common_runtime'
-  | 'common_services'
-  | 'common_telemetry'
-  | 'global_admins'
-  | 'group_basic'
-  | 'group_delivery'
-  | 'group_quick_replies'
-  | 'group_shortcuts'
-  | 'group_agent_commands'
-  | 'group_admins'
+  | 'runtime_settings'
+  | 'operation_settings'
+  | 'operation_global_misc'
 
 export const ACTIVE_EXCLUDED = new Set(['sent', 'rejected', 'deleted', 'skipped', 'failed', 'withdrawn'])
 export const PAGE_SIZES = [20, 50, 100, 200]

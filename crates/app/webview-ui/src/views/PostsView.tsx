@@ -1169,8 +1169,15 @@ function DetailContent({
     onTextChange('')
   }, [action])
 
-  const needsText = ['comment', 'reply', 'blacklist', 'quick_reply', 'merge'].includes(action)
-  const textPlaceholder = action === 'merge' ? '目标审核编号' : action === 'quick_reply' ? '快捷回复键名' : '内容'
+  const needsText = ['reject', 'comment', 'reply', 'blacklist', 'quick_reply', 'merge'].includes(action)
+  const textPlaceholder =
+    action === 'merge'
+      ? '目标审核编号'
+      : action === 'quick_reply'
+        ? '快捷回复键名'
+        : action === 'reject'
+          ? '拒稿原因（可选）'
+          : '内容'
 
   if (loading || !detail) {
     return <EmptyPanel icon={<Spinner />} text="正在加载详情" />
@@ -1254,7 +1261,10 @@ function DetailContent({
                 <DelayField value={actionDelay} onChange={onDelayChange} className="delay-field" />
               )}
               {needsText &&
-                (action === 'comment' || action === 'reply' || action === 'blacklist' ? (
+                (action === 'reject' ||
+                action === 'comment' ||
+                action === 'reply' ||
+                action === 'blacklist' ? (
                   <TextArea
                     className="action-text"
                     placeholder={textPlaceholder}
