@@ -11,6 +11,7 @@ use crate::renderer::{
     RenderPreviewHeader, RendererRuntimeConfig, render_submission_session_preview_png,
 };
 use futures_util::{SinkExt, StreamExt};
+use oqqwall_rust_core::anonymous::detect_anonymous;
 use oqqwall_rust_core::command::{
     GlobalAction, GlobalActionBatchCommand, GlobalActionCommand, PostAction, PostActionCommand,
     ReviewAction, ReviewActionBatchCommand, ReviewActionCommand, ShortcutScope,
@@ -7653,6 +7654,30 @@ fn prepare_submission_session_messages(
     items
 }
 
+fn build_submission_session_preview_header(
+    runtime: &NapCatRuntimeConfig,
+    user_id: &str,
+    session: &SubmissionSession,
+    prepared: &[PreparedSubmissionMessage],
+    messages: &[IngressMessage],
+) -> RenderPreviewHeader {
+    let group_id = if session.group_id.trim().is_empty() {
+        runtime.group_id.clone()
+    } else {
+        session.group_id.clone()
+    };
+    RenderPreviewHeader {
+        group_id,
+        user_id: user_id.to_string(),
+        post_id_hex: format!("session-{}", session.started_at_ms),
+        sender_name: prepared
+            .first()
+            .and_then(|item| item.sender_name.clone())
+            .filter(|name| !name.trim().is_empty()),
+        is_anonymous: detect_anonymous(messages),
+    }
+}
+
 async fn render_submission_session_preview_image(
     runtime: &NapCatRuntimeConfig,
     cmd_tx: &mpsc::Sender<Command>,
@@ -7675,21 +7700,8 @@ async fn render_submission_session_preview_image(
         return Err("没有可预览的内容".to_string());
     }
     let draft = build_draft_from_messages(&messages);
-    let group_id = if session.group_id.trim().is_empty() {
-        runtime.group_id.clone()
-    } else {
-        session.group_id.clone()
-    };
-    let header = RenderPreviewHeader {
-        group_id,
-        user_id: user_id.to_string(),
-        post_id_hex: format!("session-{}", session.started_at_ms),
-        sender_name: prepared
-            .first()
-            .and_then(|item| item.sender_name.clone())
-            .filter(|name| !name.trim().is_empty()),
-        is_anonymous: false,
-    };
+    let header =
+        build_submission_session_preview_header(runtime, user_id, session, &prepared, &messages);
     let renderer_config = RendererRuntimeConfig::default();
     let png = render_submission_session_preview_png(
         &draft,
@@ -10342,6 +10354,49 @@ mod tests {
             &prepared[0].message.attachments[0].reference,
             MediaReference::RemoteUrl { url } if url == "data/blobs/image/prefetched.jpg"
         ));
+    }
+
+    #[test]
+    fn submission_session_preview_header_detects_anonymous_messages() {
+        let runtime = test_runtime();
+        let user_id = "20002";
+        let session = SubmissionSession {
+            messages: vec![
+                BufferedMessage {
+                    message: serde_json::json!({
+                        "message_id": "m1",
+                        "time": 1001,
+                        "sender": {"nickname": "投稿人"},
+                        "message": [{"type": "text", "data": {"text": "匿名"}}]
+                    }),
+                    platform_msg_id: "m1".to_string(),
+                },
+                BufferedMessage {
+                    message: serde_json::json!({
+                        "message_id": "m2",
+                        "time": 1002,
+                        "sender": {"nickname": "投稿人"},
+                        "message": [{"type": "text", "data": {"text": "测试内容"}}]
+                    }),
+                    platform_msg_id: "m2".to_string(),
+                },
+            ],
+            started_at_ms: 1001000,
+            group_id: runtime.group_id.clone(),
+            confirming: true,
+        };
+        let prepared = prepare_submission_session_messages(&session, user_id, false);
+        let messages = prepared
+            .iter()
+            .map(|item| item.message.clone())
+            .collect::<Vec<_>>();
+
+        let header = build_submission_session_preview_header(
+            &runtime, user_id, &session, &prepared, &messages,
+        );
+
+        assert!(header.is_anonymous);
+        assert_eq!(header.sender_name.as_deref(), Some("投稿人"));
     }
 
     #[tokio::test]
