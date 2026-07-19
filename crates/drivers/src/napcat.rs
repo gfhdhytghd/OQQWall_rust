@@ -6079,12 +6079,6 @@ fn validate_withdraw_action(
     if info.group_id != group_id {
         return Err("无权限操作该稿件");
     }
-    let Some(plan) = state.send_plans.get(&info.post_id) else {
-        return Err("该稿件不在暂存区");
-    };
-    if plan.group_id != group_id {
-        return Err("无权限操作该稿件");
-    }
     if !state.post_external_code.contains_key(&info.post_id) {
         return Err("该稿件缺少外部编号");
     }
@@ -9490,7 +9484,7 @@ const HELP_TEXT: &str = r#"全局指令:
 用法：调出 <review_code>
 
 撤回:
-将暂存区中的稿件撤回到待处理，并重排后续待发送稿件的外部编号
+撤回指定稿件；暂存稿件会退回待处理，已发布稿件会从QQ空间动态中撤回
 用法：撤回 <review_code>
 
 信息:
@@ -11576,7 +11570,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_withdraw_requires_queued_post_with_external_code() {
+    fn validate_withdraw_accepts_global_post_with_external_code() {
         let review_id = ReviewId::from_u128(10);
         let post_id = PostId::from_u128(20);
         let mut state = NapCatState::default();
@@ -11593,20 +11587,6 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            validate_withdraw_action(&state, "group-a", 42),
-            Err("该稿件不在暂存区")
-        );
-
-        state.send_plans.insert(
-            post_id,
-            SendPlanInfo {
-                group_id: "group-a".to_string(),
-                not_before_ms: 0,
-                priority: SendPriority::Normal,
-                seq: 1,
-            },
-        );
         assert_eq!(
             validate_withdraw_action(&state, "group-a", 42),
             Err("该稿件缺少外部编号")
