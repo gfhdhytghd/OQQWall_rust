@@ -43,6 +43,12 @@ struct FieldSpec {
 
 const COMMON_FIELDS: &[FieldSpec] = &[
     FieldSpec {
+        key: "qzone_trpc_experimental",
+        kind: FieldKind::Bool { default: false },
+        hint: "Experimental TRPC publishing (CGI image upload; no automatic fallback)",
+        aliases: &[],
+    },
+    FieldSpec {
         key: "web_api.enabled",
         kind: FieldKind::Bool { default: false },
         hint: "Enable root-token API service",
@@ -2966,6 +2972,7 @@ fn parse_input_value(input: &str) -> Value {
 
 fn field_summary_text(spec: FieldSpec) -> &'static str {
     match spec.key {
+        "qzone_trpc_experimental" => "实验性 TRPC 发布",
         "web_api.enabled" => "启用 HTTP 审核 API",
         "web_api.port" => "HTTP API 监听端口",
         "web_api.root_token" => "HTTP API 根令牌",
@@ -3013,6 +3020,7 @@ fn field_summary_text(spec: FieldSpec) -> &'static str {
 
 fn field_detail_text(spec: FieldSpec) -> String {
     match spec.key {
+        "qzone_trpc_experimental" => "实验性：发布使用 TRPC，图片传输和撤回编辑仍使用 CGI。默认关闭，失败不自动回退；真实账号兼容性尚未验证。修改后重启生效。".to_string(),
         "web_api.enabled" => "是否启用根令牌 API。仅当你需要脚本/外部系统远程审核时开启。".to_string(),
         "web_api.port" => "Web API 监听端口。建议与 WebView 端口不同，默认 10923。".to_string(),
         "web_api.root_token" => "Web API 认证令牌。建议使用 32 位以上随机串，可通过 OQQWALL_API_TOKEN 覆盖。".to_string(),

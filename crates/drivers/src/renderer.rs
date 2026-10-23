@@ -600,6 +600,7 @@ fn forward_item_summary(item: &ForwardItem) -> String {
 fn draft_block_summary(block: &DraftBlock) -> String {
     match block {
         DraftBlock::Paragraph { text } => text.trim().to_string(),
+        DraftBlock::Comment { text } => format!("[评论] {}", text.trim()),
         DraftBlock::Attachment { kind, name, .. } => name
             .as_deref()
             .map(str::trim)
@@ -992,7 +993,8 @@ async fn resolve_forward_draft(
                 let mut expanded = expand_forward_in_text(text, &mut context, 0).await;
                 blocks.append(&mut expanded);
             }
-            DraftBlock::Attachment { .. }
+            DraftBlock::Comment { .. }
+            | DraftBlock::Attachment { .. }
             | DraftBlock::Reply { .. }
             | DraftBlock::Poke
             | DraftBlock::JsonCard { .. }
@@ -1345,7 +1347,14 @@ fn render_png(
 
     for (block_idx, block) in draft.blocks.iter().enumerate() {
         let layout = match block {
-            DraftBlock::Paragraph { text } => {
+            DraftBlock::Paragraph { text } | DraftBlock::Comment { text } => {
+                let comment_text;
+                let text = if matches!(block, DraftBlock::Comment { .. }) {
+                    comment_text = format!("[评论] {}", text);
+                    comment_text.as_str()
+                } else {
+                    text.as_str()
+                };
                 let max_text_w = content_width
                     .saturating_sub(bubble_pad_left + bubble_pad_right)
                     .max(1);

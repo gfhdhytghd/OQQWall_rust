@@ -127,6 +127,7 @@ pub fn spawn_napcat_drivers(handle: &EngineHandle, config: &AppConfig) -> Result
         default_napcat: config.fallback_napcat.clone(),
         accounts_by_group,
         at_unprived_sender: config.at_unprived_sender,
+        qzone_trpc_experimental: config.qzone_trpc_experimental,
         max_queue_by_group,
         max_images_per_post_by_group,
         individual_images_by_group,

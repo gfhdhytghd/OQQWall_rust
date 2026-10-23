@@ -37,6 +37,11 @@ pub enum DraftBlock {
     Forward {
         items: Vec<ForwardItem>,
     },
+    // Appended for persisted enum compatibility. Kept separate from ingress text
+    // so rebuilding a draft preserves moderator comments.
+    Comment {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -2383,6 +2383,9 @@ async fn webview_get_post(
                             size_bytes: *size_bytes,
                         }
                     }
+                    oqqwall_rust_core::draft::DraftBlock::Comment { text } => PostBlock::Text {
+                        text: format!("[评论] {}", text),
+                    },
                     oqqwall_rust_core::draft::DraftBlock::Reply { preview } => PostBlock::Text {
                         text: format!("[回复] {}", preview.body),
                     },
@@ -3197,7 +3200,8 @@ fn post_keyword_matches(
         .get(post_id)
         .map(|draft| {
             draft.blocks.iter().any(|block| match block {
-                oqqwall_rust_core::draft::DraftBlock::Paragraph { text } => {
+                oqqwall_rust_core::draft::DraftBlock::Paragraph { text }
+                | oqqwall_rust_core::draft::DraftBlock::Comment { text } => {
                     text.to_ascii_lowercase().contains(keyword_lower)
                 }
                 oqqwall_rust_core::draft::DraftBlock::Attachment { kind, .. } => {

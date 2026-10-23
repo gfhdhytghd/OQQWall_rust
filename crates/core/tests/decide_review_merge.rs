@@ -130,6 +130,23 @@ fn merge_reviews_from_same_sender() {
         state = state.reduce(&env);
     }
 
+    state
+        .drafts
+        .get_mut(&post_a)
+        .unwrap()
+        .blocks
+        .push(DraftBlock::Comment {
+            text: "评论 A".into(),
+        });
+    state
+        .drafts
+        .get_mut(&post_b)
+        .unwrap()
+        .blocks
+        .push(DraftBlock::Comment {
+            text: "评论 B".into(),
+        });
+
     let cmd = Command::ReviewAction(ReviewActionCommand {
         review_id: None,
         review_code: Some(review_code_a),
@@ -155,6 +172,26 @@ fn merge_reviews_from_same_sender() {
         _ => None,
     });
     assert_eq!(merged, Some((vec![ingress_a, ingress_b], true, false)));
+    let draft = out
+        .iter()
+        .find_map(|event| match event {
+            Event::Draft(DraftEvent::PostDraftCreated { draft, .. }) => Some(draft),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        draft.blocks,
+        vec![
+            DraftBlock::Paragraph { text: "a".into() },
+            DraftBlock::Paragraph { text: "b".into() },
+            DraftBlock::Comment {
+                text: "评论 A".into()
+            },
+            DraftBlock::Comment {
+                text: "评论 B".into()
+            },
+        ]
+    );
 
     let skipped = out.iter().any(|event| {
         matches!(

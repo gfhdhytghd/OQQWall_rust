@@ -98,6 +98,7 @@ pub struct AppConfig {
     pub max_cache_mb: u64,
     pub auto_gc_orphan_blobs: bool,
     pub at_unprived_sender: bool,
+    pub qzone_trpc_experimental: bool,
     pub web_api_enabled: bool,
     pub web_api_port: u16,
     pub web_api_root_token: Option<String>,
@@ -160,6 +161,11 @@ impl AppConfig {
             .unwrap_or(256);
         let auto_gc_orphan_blobs = parse_bool(common.get("auto_gc_orphan_blobs")).unwrap_or(true);
         let at_unprived_sender = parse_bool(common.get("at_unprived_sender")).unwrap_or(false);
+        let qzone_trpc_experimental = match common.get("qzone_trpc_experimental") {
+            None => false,
+            Some(value) => parse_bool(Some(value))
+                .ok_or_else(|| "common.qzone_trpc_experimental must be a boolean".to_string())?,
+        };
         let default_friend_request_window_sec =
             parse_u32(common.get("friend_request_window_sec")).unwrap_or(300);
         let default_friend_add_message = parse_string(common.get("friend_add_message"));
@@ -414,6 +420,7 @@ impl AppConfig {
             max_cache_mb,
             auto_gc_orphan_blobs,
             at_unprived_sender,
+            qzone_trpc_experimental,
             web_api_enabled,
             web_api_port,
             web_api_root_token,
@@ -1702,6 +1709,30 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         std::env::temp_dir().join(format!("oqqwall_{name}_{nanos}.json"))
+    }
+
+    #[test]
+    fn qzone_trpc_is_opt_in_and_rejects_invalid_values() {
+        let mut root = json!({"common": {"napcat_base_url": "127.0.0.1:3001/oqqwall/ws"}});
+        assert!(
+            !AppConfig::from_value(&root)
+                .unwrap()
+                .qzone_trpc_experimental
+        );
+        root["common"]["qzone_trpc_experimental"] = json!(true);
+        assert!(
+            AppConfig::from_value(&root)
+                .unwrap()
+                .qzone_trpc_experimental
+        );
+        root["common"]["qzone_trpc_experimental"] = json!(false);
+        assert!(
+            !AppConfig::from_value(&root)
+                .unwrap()
+                .qzone_trpc_experimental
+        );
+        root["common"]["qzone_trpc_experimental"] = json!({});
+        assert!(AppConfig::from_value(&root).is_err());
     }
 
     fn sha256_hex(text: &str) -> String {

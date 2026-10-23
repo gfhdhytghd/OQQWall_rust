@@ -4,7 +4,7 @@ use crate::config::CoreConfig;
 use crate::decide::builder::build_draft_for_post;
 use crate::decide::flush::build_group_flush_events;
 use crate::decide::scheduler::{compute_not_before, day_index, minute_of_day};
-use crate::draft::MediaKind;
+use crate::draft::{DraftBlock, MediaKind};
 use crate::event::{
     DraftEvent, Event, EventEnvelope, IngressEvent, RenderEvent, ReviewDecision, ReviewEvent,
     ScheduleEvent, SendPriority,
@@ -154,10 +154,46 @@ pub fn decide_review_action(
         ReviewAction::Show => vec![Event::Review(ReviewEvent::ReviewDisplayRequested {
             review_id,
         })],
-        ReviewAction::Comment { text } => vec![Event::Review(ReviewEvent::ReviewCommentAdded {
-            review_id,
-            text: text.clone(),
-        })],
+        ReviewAction::Comment { text } => {
+            let text = text.trim();
+            if text.is_empty() {
+                return Vec::new();
+            }
+            let Some(post) = state.posts.get(&post_id) else {
+                return Vec::new();
+            };
+            let Some(mut draft) = state.drafts.get(&post_id).cloned() else {
+                return Vec::new();
+            };
+            draft.blocks.push(DraftBlock::Comment {
+                text: text.to_string(),
+            });
+            vec![
+                Event::Draft(DraftEvent::PostDraftCreated {
+                    post_id,
+                    session_id: post.session_id,
+                    group_id: post.group_id.clone(),
+                    ingress_ids: state
+                        .post_ingress
+                        .get(&post_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    is_anonymous: post.is_anonymous,
+                    is_safe: post.is_safe,
+                    draft,
+                    created_at_ms: post.created_at_ms,
+                }),
+                Event::Review(ReviewEvent::ReviewCommentAdded {
+                    review_id,
+                    text: text.to_string(),
+                }),
+                Event::Render(RenderEvent::RenderRequested {
+                    post_id,
+                    attempt: 1,
+                    requested_at_ms: cmd.now_ms,
+                }),
+            ]
+        }
         ReviewAction::Reply { text } => vec![Event::Review(ReviewEvent::ReviewReplyRequested {
             review_id,
             text: text.clone(),
@@ -482,9 +518,18 @@ fn build_merge_events(
     let Some(ingress_ids) = merge_ingress_ids(state, post_id, target_post_id) else {
         return Vec::new();
     };
-    let Some(draft) = build_draft_for_post(state, post_id, &ingress_ids) else {
+    let Some(mut draft) = build_draft_for_post(state, post_id, &ingress_ids) else {
         return Vec::new();
     };
+    if let Some(target_draft) = state.drafts.get(&target_post_id) {
+        draft.blocks.extend(
+            target_draft
+                .blocks
+                .iter()
+                .filter(|block| matches!(block, DraftBlock::Comment { .. }))
+                .cloned(),
+        );
+    }
     let is_anonymous =
         post_is_anonymous(state, post_id) || post_is_anonymous(state, target_post_id);
     let is_safe = post_is_safe(state, post_id) && post_is_safe(state, target_post_id);

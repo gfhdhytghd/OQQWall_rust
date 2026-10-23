@@ -1591,6 +1591,9 @@ async fn get_post(
                             size_bytes: *size_bytes,
                         }
                     }
+                    oqqwall_rust_core::draft::DraftBlock::Comment { text } => PostBlock::Text {
+                        text: format!("[评论] {}", text),
+                    },
                     oqqwall_rust_core::draft::DraftBlock::Reply { preview } => PostBlock::Text {
                         text: format!("[回复] {}", preview.body),
                     },

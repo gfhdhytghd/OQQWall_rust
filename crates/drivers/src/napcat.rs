@@ -2266,6 +2266,10 @@ async fn build_action_from_event(
     if !is_effective_primary_account(runtime, account_id) {
         return None;
     }
+    let display_only = matches!(
+        &event,
+        Event::Review(ReviewEvent::ReviewDisplayRequested { .. })
+    );
     match event {
         Event::Ingress(IngressEvent::InputStatusUpdated { .. }) => None,
         Event::Ingress(IngressEvent::MessageAccepted {
@@ -3337,7 +3341,26 @@ async fn build_action_from_event(
             });
             Some(payload.to_string())
         }
-        Event::Review(ReviewEvent::ReviewPublishRequested { review_id }) => {
+        Event::Review(ReviewEvent::ReviewExpandRequested { review_id }) => {
+            let guard = state.lock().await;
+            let info = guard.review_info.get(&review_id)?;
+            if info.group_id != runtime.group_id {
+                return None;
+            }
+            let group_id = runtime.audit_group_id.as_ref()?;
+            Some(
+                serde_json::json!({
+                    "action": "send_group_msg",
+                    "params": {
+                        "group_id": json_id(group_id),
+                        "message": message_segments_from_text("扩列审查暂未实现，请人工核查。")
+                    }
+                })
+                .to_string(),
+            )
+        }
+        Event::Review(ReviewEvent::ReviewPublishRequested { review_id })
+        | Event::Review(ReviewEvent::ReviewDisplayRequested { review_id }) => {
             let Some(group_id) = runtime.audit_group_id.as_ref() else {
                 return None;
             };
@@ -3346,7 +3369,12 @@ async fn build_action_from_event(
                 debug_log!("napcat review publish requested but missing review info");
                 return None;
             };
-            let attempt = {
+            if info.group_id != runtime.group_id {
+                return None;
+            }
+            let attempt = if display_only {
+                0
+            } else {
                 let entry = guard
                     .review_publish_attempts
                     .entry(review_id)
@@ -3364,7 +3392,7 @@ async fn build_action_from_event(
             }
             let preview = rendered_png_preview(info.post_id);
             let is_safe = guard.post_safe.get(&info.post_id).copied().unwrap_or(true);
-            let summary = build_audit_message(
+            let mut summary = build_audit_message(
                 info.review_code,
                 info.post_id,
                 &ingress_ids,
@@ -3373,11 +3401,23 @@ async fn build_action_from_event(
                 &guard.blob_paths,
                 is_safe,
             );
-            let echo = next_echo(&mut guard);
-            guard.pending.insert(
-                echo.clone(),
-                PendingAction::SendAuditMessage { review_id, attempt },
-            );
+            if let Some(draft) = guard.post_draft.get(&info.post_id) {
+                for block in &draft.blocks {
+                    if let oqqwall_rust_core::DraftBlock::Comment { text } = block {
+                        summary.text.push_str(&format!("\n[评论] {}", text));
+                    }
+                }
+            }
+            let echo = if display_only {
+                None
+            } else {
+                let echo = next_echo(&mut guard);
+                guard.pending.insert(
+                    echo.clone(),
+                    PendingAction::SendAuditMessage { review_id, attempt },
+                );
+                Some(echo)
+            };
 
             let mut message = message_segments_from_text(&summary.text);
             for image in summary.images {
@@ -3386,14 +3426,16 @@ async fn build_action_from_event(
                     "data": { "file": image }
                 }));
             }
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "action": "send_group_msg",
                 "params": {
                     "group_id": json_id(group_id),
                     "message": message
-                },
-                "echo": echo
+                }
             });
+            if let Some(echo) = echo {
+                payload["echo"] = serde_json::Value::String(echo);
+            }
             Some(payload.to_string())
         }
         _ => None,
@@ -3913,6 +3955,35 @@ async fn parse_inbound_event(
                         build_selfcheck_report(runtime, &guard)
                     };
                     send_group_text(out_tx, &chat_group_id, &report).await;
+                    return None;
+                }
+                AuditCommand::Global(ParsedGlobalAction::Builtin(GlobalAction::Info {
+                    review_code,
+                })) => {
+                    let report = {
+                        let guard = state.lock().await;
+                        build_agent_review_info_text(
+                            &guard,
+                            &runtime.group_id,
+                            review_code,
+                            runtime.tz_offset_minutes,
+                        )
+                    };
+                    let report = report.unwrap_or_else(|err| err);
+                    send_group_text(out_tx, &chat_group_id, &report).await;
+                    return None;
+                }
+                AuditCommand::Global(ParsedGlobalAction::Builtin(
+                    GlobalAction::ManualRelogin
+                    | GlobalAction::AutoRelogin
+                    | GlobalAction::SystemRepair,
+                )) => {
+                    send_group_text(
+                        out_tx,
+                        &chat_group_id,
+                        "当前版本暂未实现此运维指令，请通过运维流程执行。",
+                    )
+                    .await;
                     return None;
                 }
                 AuditCommand::Global(ParsedGlobalAction::Builtin(action)) => {
@@ -5729,6 +5800,12 @@ async fn parse_review_command(
 
     if is_processed {
         send_group_text(out_tx, group_id, "此稿件已被处理").await;
+        return None;
+    }
+
+    if matches!(&action, ParsedReviewAction::Builtin(ReviewAction::Comment { text }) if text.trim().is_empty())
+    {
+        send_group_text(out_tx, group_id, "用法：评论 <文本>").await;
         return None;
     }
 
@@ -11026,6 +11103,183 @@ mod tests {
         };
 
         assert!(validate_agent_command_config("规则", &config).is_err());
+    }
+
+    #[tokio::test]
+    async fn group_info_and_unsupported_operations_return_explanations() {
+        let _globals = lock_globals_for_test();
+        let mut runtime = test_runtime();
+        runtime.accounts = vec!["operation-test".into()];
+        register_ws_session("operation-test", mock_session());
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        for (command, expected) in [
+            ("信息 123", "找不到审核编号 #123"),
+            ("手动重新登录", "暂未实现此运维指令"),
+            ("自动重新登录", "暂未实现此运维指令"),
+            ("系统修复", "暂未实现此运维指令"),
+        ] {
+            let value = serde_json::json!({
+                "post_type": "message", "message_type": "group", "group_id": "1",
+                "self_id": "operation-test", "user_id": "20002", "message_id": "m1",
+                "sender": { "role": "admin" },
+                "message": [
+                    { "type": "at", "data": { "qq": "operation-test" } },
+                    { "type": "text", "data": { "text": format!(" {}", command) } }
+                ]
+            });
+            assert!(
+                parse_inbound_event(&runtime, &state, &cmd_tx, &out_tx, "operation-test", &value)
+                    .await
+                    .is_none()
+            );
+            let payload: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+            assert!(
+                payload["params"]["message"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|part| {
+                        part["data"]["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(expected))
+                    })
+            );
+        }
+        assert!(cmd_rx.try_recv().is_err());
+        unregister_ws_session("operation-test");
+    }
+
+    #[test]
+    fn parse_comment_preserves_multiline_text_in_both_forms() {
+        for (text, has_reply, review_code) in [
+            ("123 评论 已核实 多词\n第二行", false, Some(123)),
+            ("评论 已核实 多词\n第二行", true, None),
+        ] {
+            assert_eq!(
+                parse_cmd(text, has_reply),
+                Some(AuditCommand::Review {
+                    review_code,
+                    action: ParsedReviewAction::Builtin(ReviewAction::Comment {
+                        text: "已核实 多词\n第二行".into(),
+                    }),
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn display_and_expand_events_respond_without_changing_review_binding() {
+        let _globals = lock_globals_for_test();
+        let mut runtime = test_runtime();
+        runtime.accounts = vec!["review-event-test".into()];
+        register_ws_session("review-event-test", mock_session());
+        let review_id = Id128(500);
+        let post_id = Id128(501);
+        let state = Arc::new(Mutex::new(NapCatState::default()));
+        {
+            let mut guard = state.lock().await;
+            guard.review_info.insert(
+                review_id,
+                ReviewInfo {
+                    review_code: 123,
+                    post_id,
+                    group_id: runtime.group_id.clone(),
+                    decision: None,
+                    decided_by: None,
+                    decided_at_ms: None,
+                },
+            );
+            guard.post_draft.insert(
+                post_id,
+                Draft {
+                    blocks: vec![oqqwall_rust_core::DraftBlock::Comment {
+                        text: "已核实 多词\n第二行".into(),
+                    }],
+                },
+            );
+        }
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        for (event, expected) in [
+            (
+                ReviewEvent::ReviewDisplayRequested { review_id },
+                "[评论] 已核实 多词\n第二行",
+            ),
+            (
+                ReviewEvent::ReviewExpandRequested { review_id },
+                "扩列审查暂未实现",
+            ),
+        ] {
+            let payload = build_action_from_event(
+                &runtime,
+                &state,
+                &cmd_tx,
+                &out_tx,
+                "review-event-test",
+                1_000,
+                Event::Review(event.clone()),
+            )
+            .await
+            .unwrap();
+            let value: Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(value["action"], "send_group_msg");
+            assert_eq!(value["params"]["group_id"], json_id("1"));
+            let message = &value["params"]["message"];
+            assert!(message.as_array().unwrap().iter().any(|part| {
+                part["data"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(expected))
+            }));
+            assert!(value.get("echo").is_none());
+            assert!(state.lock().await.pending.is_empty());
+            assert!(state.lock().await.review_publish_attempts.is_empty());
+            state
+                .lock()
+                .await
+                .review_info
+                .get_mut(&review_id)
+                .unwrap()
+                .group_id = "other-group".into();
+            assert!(
+                build_action_from_event(
+                    &runtime,
+                    &state,
+                    &cmd_tx,
+                    &out_tx,
+                    "review-event-test",
+                    1_000,
+                    Event::Review(event)
+                )
+                .await
+                .is_none()
+            );
+            state
+                .lock()
+                .await
+                .review_info
+                .get_mut(&review_id)
+                .unwrap()
+                .group_id = runtime.group_id.clone();
+        }
+        let payload = build_action_from_event(
+            &runtime,
+            &state,
+            &cmd_tx,
+            &out_tx,
+            "review-event-test",
+            1_000,
+            Event::Review(ReviewEvent::ReviewPublishRequested { review_id }),
+        )
+        .await
+        .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        assert!(value["echo"].is_string());
+        assert_eq!(state.lock().await.pending.len(), 1);
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(out_rx.try_recv().is_err());
+        unregister_ws_session("review-event-test");
     }
 
     #[test]

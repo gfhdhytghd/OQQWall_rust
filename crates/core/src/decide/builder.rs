@@ -49,7 +49,17 @@ pub fn build_draft_for_post_with_transforms(
     let transforms = transforms
         .or_else(|| state.draft_transforms.get(&post_id).map(Vec::as_slice))
         .unwrap_or(&[]);
-    Some(apply_transforms(&draft, transforms))
+    let mut draft = apply_transforms(&draft, transforms);
+    if let Some(previous) = state.drafts.get(&post_id) {
+        draft.blocks.extend(
+            previous
+                .blocks
+                .iter()
+                .filter(|block| matches!(block, DraftBlock::Comment { .. }))
+                .cloned(),
+        );
+    }
+    Some(draft)
 }
 
 fn append_blocks_from_text(text: &str, blocks: &mut Vec<DraftBlock>) {

@@ -39,6 +39,8 @@ use tokio::task::JoinHandle;
 use crate::blob_cache;
 use crate::napcat::{NapCatConfig, napcat_ws_request};
 
+mod trpc;
+
 #[cfg(debug_assertions)]
 macro_rules! debug_log {
     ($($arg:tt)*) => {
@@ -75,6 +77,7 @@ pub struct QzoneRuntimeConfig {
     pub default_napcat: Option<NapCatConfig>,
     pub accounts_by_group: HashMap<String, Vec<String>>,
     pub at_unprived_sender: bool,
+    pub qzone_trpc_experimental: bool,
     pub max_queue_by_group: HashMap<String, usize>,
     pub max_images_per_post_by_group: HashMap<String, usize>,
     pub individual_images_by_group: HashMap<String, bool>,
@@ -1011,7 +1014,12 @@ async fn publish_batch_for_account(
 
     let mut published = Vec::new();
     for (chunk, items) in images.chunks(chunk_size).zip(item_chunks) {
-        match client.publish_emotion(publish_text, chunk).await {
+        let result = if runtime.qzone_trpc_experimental {
+            client.publish_trpc(publish_text, chunk).await
+        } else {
+            client.publish_emotion(publish_text, chunk).await
+        };
+        match result {
             Ok(tid) => {
                 let remote_id = require_remote_id(&tid)?;
                 published.push(PublishedQzonePost { remote_id, items });
@@ -1478,6 +1486,16 @@ impl QzoneClient {
     }
 
     async fn upload_image(&self, image: &[u8]) -> Result<Value, QzoneError> {
+        self.upload_image_in_batch(image, None)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    async fn upload_image_in_batch(
+        &self,
+        image: &[u8],
+        batch: Option<(&str, &str)>,
+    ) -> Result<(Value, usize), QzoneError> {
         let prepared = prepare_upload_image(image)?;
         let _upload_strategy = prepared.strategy;
         debug_log!(
@@ -1504,6 +1522,10 @@ impl QzoneClient {
         form.insert("zzpanelkey", "".to_string());
         form.insert("uploadtype", "1".to_string());
         form.insert("albumtype", "7".to_string());
+        if let Some((album_id, batch_id)) = batch {
+            form.insert("albumid", album_id.to_string());
+            form.insert("batchid", batch_id.to_string());
+        }
         form.insert("exttype", "0".to_string());
         form.insert("skey", skey);
         form.insert("zzpaneluin", self.uin.to_string());
@@ -1585,7 +1607,7 @@ impl QzoneClient {
         if let Some(err) = classify_response_error(&json) {
             return Err(err.with_context("upload response"));
         }
-        Ok(json)
+        Ok((json, prepared.bytes.len()))
     }
 }
 

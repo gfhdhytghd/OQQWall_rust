@@ -51,9 +51,30 @@
 | `napcat_base_url` | string | 无 | 所有组默认 NapCat 反向 WS base url |
 | `napcat_access_token` | string | 无 | 所有组默认 NapCat access token |
 | `at_unprived_sender` | bool/string/number | `false` | 发件时是否 @ 非匿名且空间不可访问的投稿人 |
+| `qzone_trpc_experimental` | bool/string/number | `false` | 实验性 TRPC 发布说说，修改后重启生效；仅支持全局设置，见下节 |
 | `friend_request_window_sec` | number/string | `300` | 好友申请去重/限频窗口，组内可覆盖 |
 | `friend_add_message` | string | 无 | 通过好友申请后自动发送的默认文本，组内可覆盖 |
 | `thank_you_filter` | object | 关闭 | 投稿反馈后的纯感谢静默过滤，见下节；当前版本运行时强制关闭 |
+
+### 实验性 TRPC 发布
+
+在 `common` 中设置：
+
+```json
+{
+  "common": {
+    "qzone_trpc_experimental": true
+  }
+}
+```
+
+也可在 TUI 的 common 设置中切换“实验性 TRPC 发布”。默认关闭；设为 `false` 或删除该字段即可恢复原有 CGI 发布，重启后生效。debug 和 release 均支持；debug 的虚拟 Qzone 模式优先于此选项。
+
+启用后依次调用 TRPC `ApplyBatch`、现有 CGI 图片上传、TRPC `FinishBatch` 和 `PublishFeed`。Cookie 仍由 NapCat 提供；不会向 Apifox 文档站发送 Cookie。图片处理、分条发送与账号调度沿用现有逻辑，撤回时的说说编辑仍使用 CGI；此选项不是完整的 TRPC 上传或编辑后端。
+
+这是基于 [PublishFeed](https://qzone.apifox.cn/522044942e0.md)、[ApplyBatch](https://qzone.apifox.cn/522044950e0.md) 和 [FinishBatch](https://qzone.apifox.cn/522044951e0.md) 文档的实验适配。文档中的媒体结构有省略，CGI 上传与 TRPC 批次的兼容性、返回的 `feed_id` 能否用于 CGI 撤回编辑均尚未经过真实账号验证。媒体字段映射目前属于实验实现，不能视为已验证的线上协议。
+
+TRPC 请求失败不会自动改用 CGI 发布。原有 `send_max_attempts` 重试机制仍然生效；若请求超时或发布响应缺少 `feed_id`，远端结果可能不确定，重试可能导致重复发布。试用时建议设置 `send_max_attempts: 1`，遇到此类错误先检查 QQ 空间中的实际结果。
 
 ### Web API
 

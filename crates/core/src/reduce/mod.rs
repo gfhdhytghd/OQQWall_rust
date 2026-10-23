@@ -460,7 +460,8 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
         }
         ReviewEvent::ReviewRefreshRequested { review_id }
         | ReviewEvent::ReviewRerenderRequested { review_id }
-        | ReviewEvent::ReviewSelectAllRequested { review_id } => {
+        | ReviewEvent::ReviewSelectAllRequested { review_id }
+        | ReviewEvent::ReviewCommentAdded { review_id, .. } => {
             if let Some(meta) = state.reviews.get_mut(review_id) {
                 meta.needs_republish = true;
             }
@@ -571,8 +572,7 @@ fn reduce_review(state: &mut StateView, event: &ReviewEvent) {
                 }
             }
         }
-        ReviewEvent::ReviewCommentAdded { .. }
-        | ReviewEvent::ReviewSubmitterNoticeRequested { .. }
+        ReviewEvent::ReviewSubmitterNoticeRequested { .. }
         | ReviewEvent::ReviewReplyRequested { .. }
         | ReviewEvent::ReviewExpandRequested { .. }
         | ReviewEvent::ReviewDisplayRequested { .. }

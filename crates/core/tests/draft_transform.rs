@@ -209,6 +209,7 @@ fn labels(draft: &Draft) -> Vec<String> {
         .iter()
         .map(|block| match block {
             DraftBlock::Paragraph { text } => format!("p:{}", text),
+            DraftBlock::Comment { text } => format!("comment:{}", text),
             DraftBlock::Attachment { kind, .. } if *kind == MediaKind::Image => "img".to_string(),
             DraftBlock::Attachment { .. } => "attachment".to_string(),
             DraftBlock::Reply { .. } => "reply".to_string(),

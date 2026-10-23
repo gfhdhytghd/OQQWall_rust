@@ -140,6 +140,42 @@ mod tests {
     }
 
     #[test]
+    fn comments_survive_snapshot_roundtrip_without_changing_old_block_tags() {
+        use oqqwall_rust_core::{Draft, DraftBlock, Id128};
+        // The original Paragraph and Forward tags stay at 0 and 5.
+        let old_paragraph = [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, b'x'];
+        assert_eq!(
+            bincode::deserialize::<DraftBlock>(&old_paragraph).unwrap(),
+            DraftBlock::Paragraph { text: "x".into() }
+        );
+        let old_forward = [5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            bincode::deserialize::<DraftBlock>(&old_forward).unwrap(),
+            DraftBlock::Forward { items: vec![] }
+        );
+        let data_dir = temp_data_dir("comments-snapshot");
+        let store = SnapshotStore::open(&data_dir).unwrap();
+        let mut state = StateView::default();
+        state.drafts.insert(
+            Id128(10),
+            Draft {
+                blocks: vec![
+                    DraftBlock::Paragraph {
+                        text: "正文".into(),
+                    },
+                    DraftBlock::Comment {
+                        text: "已核实\n多行评论".into(),
+                    },
+                ],
+            },
+        );
+        let snapshot = Snapshot::new(123, None, state);
+        store.write(&snapshot).unwrap();
+        assert_eq!(store.load().unwrap().unwrap().state, snapshot.state);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
     fn write_uses_versioned_snapshot_record() {
         let data_dir = temp_data_dir("versioned-snapshot");
         let store = SnapshotStore::open(&data_dir).unwrap();
